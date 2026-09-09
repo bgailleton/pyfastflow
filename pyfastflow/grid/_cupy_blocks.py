@@ -34,35 +34,9 @@ Author: B.G (08/2026)
 
 import math
 
-from ..core.context.builder import HelperBuilder
-from ..core.pool.base import new_uid
+from ..core import freeze_helper as _helper, new_uid
 
 _SQRT2 = math.sqrt(2.0)
-
-
-def _helper(template, *, helpers=None):
-    """
-    One private/public HelperBuilder: PARAM slots are declared implicitly by
-    every `$ctx.NAME.get(...)$`/`$ctx.NAME.set_node(...)$` span contract.py
-    derives from `template`'s own text, so - unlike the closure surface -
-    there is no separate params= list here; wire_param() still has to be
-    called explicitly (a slot is never inferred, only checked against), so
-    this derives the PARAM names straight from the same Contract ingest()
-    itself is about to derive, wires each one, then composes every entry of
-    `helpers` and ingests. The one assembly every block below goes through.
-
-    Author: B.G (08/2026)
-    """
-    from ..core.context.contract import extract_cupy_contract
-
-    b = HelperBuilder()
-    for chain in extract_cupy_contract(template).chains:
-        if (not helpers) or chain[0] not in helpers:
-            b.wire_param(chain[0])
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
 
 
 def build_group(group, *, topology, boundary, nodata, outlet):
@@ -382,13 +356,13 @@ __device__ void {t}_neighbour_and_distance(int i, int k, int* j_out, float* d_ou
         helpers={"neighbour": neighbour, "dist_from_k": dist_from_k},
     )
 
-    group.wire_helper("neighbour").compose("neighbour", neighbour)
-    group.wire_helper("neighbour_raw").compose("neighbour_raw", neighbour_raw)
-    group.wire_helper("nodata").compose("nodata", nodata_fn)
-    group.wire_helper("is_active").compose("is_active", is_active)
-    group.wire_helper("can_out").compose("can_out", can_out)
-    group.wire_helper("dist_from_k").compose("dist_from_k", dist_from_k)
-    group.wire_helper("dist_between_nodes").compose("dist_between_nodes", dist_between)
-    group.wire_helper("is_on_edge").compose("is_on_edge", is_on_edge)
-    group.wire_helper("which_edge").compose("which_edge", which_edge)
-    group.wire_helper("neighbour_and_distance").compose("neighbour_and_distance", neighbour_and_distance)
+    group.compose("neighbour", neighbour)
+    group.compose("neighbour_raw", neighbour_raw)
+    group.compose("nodata", nodata_fn)
+    group.compose("is_active", is_active)
+    group.compose("can_out", can_out)
+    group.compose("dist_from_k", dist_from_k)
+    group.compose("dist_between_nodes", dist_between)
+    group.compose("is_on_edge", is_on_edge)
+    group.compose("which_edge", which_edge)
+    group.compose("neighbour_and_distance", neighbour_and_distance)

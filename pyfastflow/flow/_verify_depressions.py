@@ -63,6 +63,7 @@ Run:
 Author: B.G (07/2026)
 """
 
+import os
 import sys
 from collections import deque
 
@@ -76,6 +77,12 @@ SIDE = 1024
 BLOCK = 256
 
 COMBOS = (("vanilla", "carve"), ("vanilla", "jump"), ("optimized", "carve"), ("optimized", "jump"))
+
+
+def _progress(message: str) -> None:
+    """Emit opt-in phase markers when diagnosing a long GPU stress run."""
+    if os.environ.get("PFF_VERIFY_PROGRESS"):
+        print(f"[progress] {message}", file=sys.stderr, flush=True)
 
 
 def make_noisy_terrain(nx: int, ny: int, seed: int) -> np.ndarray:
@@ -201,7 +208,7 @@ def _label_only_sequence(backend, deps, grid_params, n_flat, rec, rec_jump, bid,
 
     Author: B.G (08/2026)
     """
-    from ..core.context.sequence import SequenceBuilder
+    from ..core import SequenceBuilder
     from . import _bind_grid_everywhere, _bind_if_present
 
     # vanilla now labels from the carried basin_route (seeded here from rec),
@@ -210,12 +217,12 @@ def _label_only_sequence(backend, deps, grid_params, n_flat, rec, rec_jump, bid,
 
     sb = SequenceBuilder()
     if is_route:
-        sb.compose("seed", deps["copy_field"])
-        sb.compose("label_basins", deps["label_basins"])
+        sb.add("seed", deps["copy_field"])
+        sb.add("label_basins", deps["label_basins"])
         sb.step("seed")
         sb.step("label_basins")
     else:
-        sb.compose("label_basins", deps["label_basins"])
+        sb.add("label_basins", deps["label_basins"])
         sb.step("label_basins")
     frozen = sb.freeze()
     bound = frozen.build()
@@ -234,8 +241,11 @@ def _label_only_sequence(backend, deps, grid_params, n_flat, rec, rec_jump, bid,
     _bind_grid_everywhere(bound, grid_params)
 
     if backend == "cupy":
-        return bound.compile(backend, grid=((n_flat + BLOCK - 1) // BLOCK,), block=(BLOCK,))
-    return bound.compile(backend)
+        compiled = bound.compile(backend)
+    else:
+        compiled = bound.compile(backend)
+    bound.close()
+    return compiled
 
 
 def run(backend: str):
@@ -255,19 +265,12 @@ def run(backend: str):
     elif backend != "cupy":
         raise ValueError(f"unknown backend {backend!r}")
 
-    from ..core.context.backends import backend_classes
+    from ..core import Backend
     from ..grid import make_grid_group, make_grid_parameters
-    from . import make_depression_solver, make_depressions, make_receivers
+    from . import bind_depression_solver, make_depression_solver, make_depressions, make_receivers
 
-    _bk = backend_classes(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
+    _bk = Backend.from_name(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
     i32, i64, f32, u8 = dtypes["i32"], dtypes["i64"], dtypes["f32"], dtypes["u8"]
-
-    if backend == "taichi":
-        from ..core.pool.taichi_pool import TaichiPool as PoolCls
-    elif backend == "quadrants":
-        from ..core.pool.quadrants_pool import QuadrantsPool as PoolCls
-    else:
-        from ..core.pool.cupy_pool import CupyPool as PoolCls
 
     closure = backend in ("taichi", "quadrants")
     nx = ny = SIDE
@@ -280,9 +283,9 @@ def run(backend: str):
     def download(handle):
         return handle.to_numpy()
 
-    pool = PoolCls()
-    grid = make_grid_group(backend, topology="D8", boundary="normal", outlet="edge")
-    grid_params = make_grid_parameters(backend, pool, nx, ny, DX, topology="D8", outlet="edge")
+    pool = _bk.pool()
+    grid = make_grid_group(_bk, topology="D8", boundary="normal", outlet="edge")
+    grid_params = make_grid_parameters(_bk, pool, nx, ny, DX, topology="D8", outlet="edge")
 
     z = pool.get_data(f32, (n,))
     rec = pool.get_data(i32, (n,))
@@ -300,33 +303,38 @@ def run(backend: str):
     basin_route = pool.get_data(i32, (n,))
     b_rcv = pool.get_data(i32, (n,))
 
-    ndep_p = ParamCls("NDEP", dtype=i32, mode="scalar", value=0, pool=pool)
+    ndep_p = ParamCls("NDEP", dtype="i32", mode="scalar", value=0, pool=pool)
 
-    recv = make_receivers(backend, grid, topology="D8", mode="steepest")
+    recv = make_receivers(_bk, grid, topology="D8", mode="steepest")
     recv_bound = recv["receivers"].build()
     recv_bound.bind_leaf(grid_params)
-    recv_bound.bind("z", z.data)
-    recv_bound.bind("rec", rec.data)
-    recv_launch = {"grid": ((n + BLOCK - 1) // BLOCK,), "block": (BLOCK,)} if not closure else {}
+    recv_bound.bind("z", z)
+    recv_bound.bind("rec", rec)
+    recv_launch = {}
     recv_kernel = recv_bound.compile(backend)
 
     buffers = dict(
-        rec=rec.data, z=z.data, bid=bid.data, rec_jump=rec_jump.data, z_prime=z_prime.data,
-        is_border=is_border.data, basin_saddle=basin_saddle.data, basin_saddlenode=basin_saddlenode.data,
-        outlet=outlet.data, rerouted=rerouted.data, tag=tag.data, tag_alt=tag_alt.data,
-        rec_scratch=rec_scratch.data, basin_route=basin_route.data, b_rcv=b_rcv.data,
+        rec=rec, z=z, bid=bid, rec_jump=rec_jump, z_prime=z_prime,
+        is_border=is_border, basin_saddle=basin_saddle, basin_saddlenode=basin_saddlenode,
+        outlet=outlet, rerouted=rerouted, tag=tag, tag_alt=tag_alt,
+        rec_scratch=rec_scratch, basin_route=basin_route, b_rcv=b_rcv,
     )
 
     solvers = {}
     labellers = {}
     for method, reroute in COMBOS:
-        deps = make_depressions(backend, grid, ndep_p, method=method, reroute=reroute, n_flat=n)
-        solvers[(method, reroute)] = make_depression_solver(
-            backend, deps, grid_params, method=method, reroute=reroute, n_flat=n, block_size=BLOCK, **buffers
+        deps = make_depressions(_bk, grid, ndep_p, method=method, reroute=reroute, n_flat=n)
+        frozen, _ = make_depression_solver(
+            _bk, deps, grid_params, method=method, reroute=reroute, n_flat=n, block_size=BLOCK,
         )
+        bound = bind_depression_solver(
+            frozen, grid_params, ndep_p=ndep_p, method=method, reroute=reroute, **buffers,
+        )
+        solvers[(method, reroute)] = bound.compile(backend, **recv_launch)
+        bound.close()
         if reroute == "carve":
             labellers[method] = _label_only_sequence(
-                backend, deps, grid_params, n, rec.data, rec_jump.data, bid.data, basin_route.data
+                backend, deps, grid_params, n, rec, rec_jump, bid, basin_route
             )
 
     terrains = (
@@ -347,6 +355,7 @@ def run(backend: str):
         for method, seq in labellers.items():
             twice = []
             for _ in range(2):
+                _progress(f"{backend} {terrain_name} label {method} run {len(twice) + 1}")
                 upload(rec, rec0.astype(np.int32))
                 seq()
                 twice.append(download(bid).astype(np.int64))
@@ -362,6 +371,7 @@ def run(backend: str):
             method, reroute = combo
             runs = []
             for _ in range(2):
+                _progress(f"{backend} {terrain_name} solve {method}/{reroute} run {len(runs) + 1}")
                 upload(rec, rec0.astype(np.int32))
                 upload(rerouted, np.zeros(n, dtype=np.uint8))
                 solvers[combo]()
@@ -384,9 +394,15 @@ def run(backend: str):
             rows.append((terrain_name, f"rec_{reroute}", "vanilla_vs_optimized", None,
                          {"rec_mismatch": int(np.count_nonzero(a != b))}))
 
+    for _solver in solvers.values():  # release each compiled solver's hold on NDEP (Unit 6)
+        _solver.close()
+    for _labeller in labellers.values():
+        _labeller.close()
+    recv_kernel.close()
+    recv_bound.close()
     ndep_p.destroy()
     for h in (z, rec, rec_scratch, rec_jump, bid, z_prime, is_border, basin_saddle,
-              basin_saddlenode, outlet, tag, tag_alt, rerouted):
+              basin_saddlenode, outlet, tag, tag_alt, rerouted, basin_route, b_rcv):
         pool.release_data(h)
     return n, rows
 

@@ -26,7 +26,7 @@ an actual Parameter object (bound.py's bind() checks `isinstance(obj,
 Parameter)`) and there is deliberately no atomic accessor on Parameter's
 device_view. The Parameter objects `make_reduce` hands back to its own caller
 (`sum_param`, ...) still exist and still own that same storage
-(`sum_p.get().data` IS the array bound to the "acc" DATA address) - reduce's
+(`sum_p.handle().array` IS the array bound to the "acc" DATA address) - reduce's
 own caller reads them exactly as before; only the device-side wiring differs.
 
 `ctx.bk` supplies `bit_cast`/`select`/`cast`/`atomic_min`/`atomic_max` and the
@@ -37,8 +37,7 @@ this is the sanctioned way to add an intrinsic, and the extension itself).
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import GroupBuilder, HelperBuilder, KernelBuilder
-from ..core.context.slot import SlotKind
+from ..core import GroupBuilder, RoutineBuilder, freeze_helper as _helper, freeze_kernel as _kernel
 
 # ---------------------------------------------------------------------------
 # bitpack: pack(f, i) -> i64, unpack_value(p) -> f32, unpack_index(p) -> i32
@@ -82,24 +81,6 @@ def _unpack_index_tmpl(ctx, packed):
     return ctx.bk.bit_cast(i_enc, ctx.bk.i32)
 
 
-def _helper(template, *, params=(), helpers=None):
-    """
-    One private/public HelperBuilder: wire_param() every name in `params`,
-    compose() every (name, frozen) pair in `helpers` under that same name,
-    then ingest(template). Identical assembly to grid/_closure_blocks.py's
-    own `_helper`.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_bitpack_group() -> "FrozenGroup":
     """
     pack(f, i) -> i64, unpack_value(p) -> f32, unpack_index(p) -> i32: the
@@ -118,9 +99,9 @@ def build_bitpack_group() -> "FrozenGroup":
     unpack_index = _helper(_unpack_index_tmpl, helpers={"_UNPACKRAW": unpack_raw})
 
     group = GroupBuilder()
-    group.wire_helper("pack").compose("pack", pack)
-    group.wire_helper("unpack_value").compose("unpack_value", unpack_value)
-    group.wire_helper("unpack_index").compose("unpack_index", unpack_index)
+    group.compose("pack", pack)
+    group.compose("unpack_value", unpack_value)
+    group.compose("unpack_index", unpack_index)
     return group.freeze()
 
 
@@ -160,8 +141,8 @@ def build_math_group() -> "FrozenGroup":
     nextafter = _helper(_nextafter_tmpl)
 
     group = GroupBuilder()
-    group.wire_helper("atan").compose("atan", atan)
-    group.wire_helper("nextafter").compose("nextafter", nextafter)
+    group.compose("atan", atan)
+    group.compose("nextafter", nextafter)
     return group.freeze()
 
 
@@ -215,10 +196,7 @@ def build_elementwise(backend: str, backend_mod) -> dict:
             A[i] *= scalar
 
     def _mk(template, names):
-        b = KernelBuilder()
-        for name in names:
-            b.wire_data(name)
-        return b.ingest(template)
+        return KernelBuilder(template).freeze()
 
     return {
         "swap": _mk(swap_tmpl, ["array1", "array2"]),
@@ -254,25 +232,6 @@ def _slope_dir_tmpl(ctx, z, i, k):
     return slope
 
 
-def _find_param_paths(frozen, leaf_name: str, prefix: tuple = ()) -> list:
-    """Every relative dotted path under `frozen`'s composed subtree whose PARAM slot is named `leaf_name` - see grid/__init__.py's own `_find_param_paths` (identical)."""
-    paths = []
-    if leaf_name in frozen.slots.names(SlotKind.PARAM):
-        paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
-        paths.extend(_find_param_paths(child, leaf_name, prefix + (name,)))
-    return paths
-
-
-def _share_leaf(group: GroupBuilder, canonical: str) -> None:
-    """Declare every occurrence of PARAM `canonical` in `group`'s composed subtree shared with its own top-level slot - see grid/__init__.py's own `_share_leaf` (identical)."""
-    paths = []
-    for name, child in group.composed.items():
-        paths.extend(_find_param_paths(child, canonical, (name,)))
-    if paths:
-        group.share(canonical, *paths)
-
-
 def build_slope_group(grid) -> "FrozenGroup":
     """
     sumslope_downstream(z, i): sum of (z[i]-z[j])/dx over every downstream
@@ -291,18 +250,13 @@ def build_slope_group(grid) -> "FrozenGroup":
 
     Author: B.G (08/2026)
     """
-    sumslope_downstream = HelperBuilder().compose("grid", grid).ingest(_sumslope_downstream_tmpl)
-    slope_dir = HelperBuilder().compose("grid", grid).ingest(_slope_dir_tmpl)
+    sumslope_downstream = HelperBuilder(_sumslope_downstream_tmpl).compose("grid", grid).freeze()
+    slope_dir = HelperBuilder(_slope_dir_tmpl).compose("grid", grid).freeze()
 
     group = GroupBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        group.wire_param(name)
-    group.wire_helper("sumslope_downstream").compose("sumslope_downstream", sumslope_downstream)
-    group.wire_helper("slope_dir").compose("slope_dir", slope_dir)
-
-    for name in grid_param_names:
-        _share_leaf(group, name)
+    group.compose("sumslope_downstream", sumslope_downstream)
+    group.compose("slope_dir", slope_dir)
+    group.share_identical("sumslope_downstream.grid", as_="grid")
 
     return group.freeze()
 
@@ -396,18 +350,6 @@ def _make_read_count_tmpl(T, n):
     return read_count_tmpl
 
 
-def _kernel(template, *, data=(), params=(), helpers=None):
-    b = KernelBuilder()
-    for d in data:
-        b.wire_data(d)
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_scan_routine(backend: str, backend_mod, n: int, work_size: int):
     """
     The Blelloch up-sweep/down-sweep FrozenRoutine (routine.py) over a
@@ -428,30 +370,28 @@ def build_scan_routine(backend: str, backend_mod, n: int, work_size: int):
 
     Author: B.G (08/2026)
     """
-    from ..core.context.routine import RoutineBuilder
-
     T = _tensor_annotation(backend_mod, backend)
 
     rb = RoutineBuilder()
-    rb.compose("copy_in", _kernel(_make_copy_input_to_work_tmpl(T, n, work_size), data=["src", "work"]))
+    rb.step("copy_in", _kernel(_make_copy_input_to_work_tmpl(T, n, work_size), data=["src", "work"]))
 
     stride = 1
     i = 0
     while stride < work_size:
-        rb.compose(f"upsweep{i}", _kernel(_make_upsweep_tmpl(T, work_size, stride), data=["work"]))
+        rb.step(f"upsweep{i}", _kernel(_make_upsweep_tmpl(T, work_size, stride), data=["work"]))
         stride *= 2
         i += 1
 
-    rb.compose("zero_root", _kernel(_make_set_root_zero_tmpl(T, work_size - 1), data=["work"]))
+    rb.step("zero_root", _kernel(_make_set_root_zero_tmpl(T, work_size - 1), data=["work"]))
 
     stride = work_size // 2
     j = 0
     while stride > 0:
-        rb.compose(f"downsweep{j}", _kernel(_make_downsweep_tmpl(T, work_size, stride), data=["work"]))
+        rb.step(f"downsweep{j}", _kernel(_make_downsweep_tmpl(T, work_size, stride), data=["work"]))
         stride //= 2
         j += 1
 
-    rb.compose("inclusive_copy", _kernel(_make_inclusive_and_copy_tmpl(T, n), data=["inp", "work", "out"]))
+    rb.step("inclusive_copy", _kernel(_make_inclusive_and_copy_tmpl(T, n), data=["inp", "work", "out"]))
 
     return rb.freeze()
 

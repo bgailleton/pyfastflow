@@ -70,9 +70,7 @@ Author: B.G (08/2026)
 
 import numpy as np
 
-from ..core.context.backends import backend_classes
-from ..core.context.builder import GroupBuilder, share_leaf
-from ..core.context.frozen import FrozenGroup, FrozenHelper
+from ..core import Backend, FrozenGroup, FrozenHelper, GroupBuilder, require_backend, share_leaf
 
 _KINDS = frozenset({"white", "perlin"})
 _MODES = ("const", "scalar")
@@ -107,7 +105,7 @@ def permutation_table(seed: int) -> np.ndarray:
     return np.concatenate([perm, perm])
 
 
-def _blocks_for(backend: str):
+def _blocks_for(be: Backend):
     """
     The private block module implementing make_noise_group's device code for
     one backend name: the closure blocks (shared by Taichi and Quadrants) or
@@ -115,12 +113,12 @@ def _blocks_for(backend: str):
 
     Author: B.G (08/2026)
     """
-    if backend in ("taichi", "quadrants"):
+    if be.family == "closure":
         from . import _closure_blocks as blocks
-    elif backend == "cupy":
+    elif be.family == "cupy":
         from . import _cupy_blocks as blocks
     else:
-        raise ValueError(f"make_noise_group: unknown backend {backend!r}, expected 'taichi', 'quadrants' or 'cupy'")
+        raise ValueError(f"make_noise_group: unsupported backend family {be.family!r}")
     return blocks
 
 
@@ -129,7 +127,7 @@ def _check_kind(kind: str) -> None:
         raise ValueError(f"make_noise_group: kind must be one of {sorted(_KINDS)}, got {kind!r}")
 
 
-def make_noise_group(backend: str, *, kind: str = "perlin") -> FrozenGroup:
+def make_noise_group(be: Backend, *, kind: str = "perlin") -> FrozenGroup:
     """
     Build one noise's structure: a FrozenGroup wiring `NX` (always) and `NY`
     (Perlin only), plus whatever value params `kind` needs, as its own
@@ -159,21 +157,22 @@ def make_noise_group(backend: str, *, kind: str = "perlin") -> FrozenGroup:
 
     Author: B.G (08/2026)
     """
+    be = require_backend(be)
     _check_kind(kind)
-    blocks = _blocks_for(backend)
+    blocks = _blocks_for(be)
 
     group = GroupBuilder()
-    group.wire_param("NX")
-    group.wire_param("AMPLITUDE")
+    group.param("NX")
+    group.param("AMPLITUDE")
     if kind == "white":
-        group.wire_param("SEED")
+        group.param("SEED")
     else:
-        group.wire_param("NY")
-        group.wire_param("PERM")
-        group.wire_param("FX")
-        group.wire_param("FY")
-        group.wire_param("OCTAVES")
-        group.wire_param("PERSISTENCE")
+        group.param("NY")
+        group.param("PERM")
+        group.param("FX")
+        group.param("FY")
+        group.param("OCTAVES")
+        group.param("PERSISTENCE")
 
     blocks.build_group(group, kind=kind)
 
@@ -192,7 +191,7 @@ def make_noise_group(backend: str, *, kind: str = "perlin") -> FrozenGroup:
     return group.freeze()
 
 
-def make_hash_u32(backend: str) -> FrozenHelper:
+def make_hash_u32(be: Backend) -> FrozenHelper:
     """
     The standalone hash_u32(x) FrozenHelper make_noise_group's white-noise
     chain is built on - no Parameters, no grid, no pool. A caller that only
@@ -211,12 +210,12 @@ def make_hash_u32(backend: str) -> FrozenHelper:
 
     Author: B.G (08/2026)
     """
-    blocks = _blocks_for(backend)
+    blocks = _blocks_for(require_backend(be))
     return blocks.build_hash_u32()
 
 
 def make_noise_parameters(
-    backend: str,
+    be: Backend,
     pool,
     *,
     kind: str = "perlin",
@@ -294,26 +293,27 @@ def make_noise_parameters(
         if mode not in _MODES:
             raise ValueError(f"make_noise_parameters: {label} must be 'const' or 'scalar', got {mode!r}")
 
-    _bk = backend_classes(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
+    be = require_backend(be)
+    ParamCls = be.ParameterCls
 
     amplitude_p = ParamCls(
-        "NOISE_AMPLITUDE", dtype=dtypes["f32"], mode=amplitude_mode, value=float(amplitude), pool=pool
+        "NOISE_AMPLITUDE", dtype="f32", mode=amplitude_mode, value=float(amplitude), pool=pool
     )
 
     if kind == "white":
-        seed_p = ParamCls("NOISE_SEED", dtype=dtypes["u32"], mode=seed_mode, value=int(seed), pool=pool)
+        seed_p = ParamCls("NOISE_SEED", dtype="u32", mode=seed_mode, value=int(seed), pool=pool)
         return {"AMPLITUDE": amplitude_p, "SEED": seed_p}
 
     perm_p = ParamCls(
-        "NOISE_PERM", dtype=dtypes["i32"], mode="field", value=permutation_table(seed), pool=pool, n_flat=512
+        "NOISE_PERM", dtype="i32", mode="field", value=permutation_table(seed), pool=pool, shape=(512,)
     )
     fx = float(frequency_x if frequency_x is not None else frequency)
     fy = float(frequency_y if frequency_y is not None else frequency)
-    frequency_x_p = ParamCls("NOISE_FX", dtype=dtypes["f32"], mode=frequency_mode, value=fx, pool=pool)
-    frequency_y_p = ParamCls("NOISE_FY", dtype=dtypes["f32"], mode=frequency_mode, value=fy, pool=pool)
-    octaves_p = ParamCls("NOISE_OCTAVES", dtype=dtypes["i32"], mode=octaves_mode, value=int(octaves), pool=pool)
+    frequency_x_p = ParamCls("NOISE_FX", dtype="f32", mode=frequency_mode, value=fx, pool=pool)
+    frequency_y_p = ParamCls("NOISE_FY", dtype="f32", mode=frequency_mode, value=fy, pool=pool)
+    octaves_p = ParamCls("NOISE_OCTAVES", dtype="i32", mode=octaves_mode, value=int(octaves), pool=pool)
     persistence_p = ParamCls(
-        "NOISE_PERSISTENCE", dtype=dtypes["f32"], mode=persistence_mode, value=float(persistence), pool=pool
+        "NOISE_PERSISTENCE", dtype="f32", mode=persistence_mode, value=float(persistence), pool=pool
     )
     return {
         "AMPLITUDE": amplitude_p,

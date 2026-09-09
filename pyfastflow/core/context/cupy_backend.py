@@ -45,10 +45,10 @@ what keeps a function's own accesses provably non-aliasing to the compiler,
 the same guarantee a `__restrict__` kernel argument used to carry - reading
 `pf_params.p_<idx>` directly, span by span, would lose it.
 
-A const parameter can also be used bare, outside any span, in which case it
-arrives as a `#define`. Only names the source actually mentions are defined,
-which keeps macros for common identifiers - N, DIM, EPS, min - from silently
-rewriting unrelated code in the translation unit.
+A const parameter is reached only through a `$...$` span, like every other
+parameter - spans are the only grammar. A const's span expands to its CUDA
+literal in place; there is no `#define` (a macro for a common identifier - N,
+DIM, EPS, min - would risk silently rewriting unrelated code in the unit).
 
 One `cp.RawModule` is built per compilation unit: the constant block, every
 `__device__` helper the unit reaches (each emitted once, however many call
@@ -260,29 +260,46 @@ class CupyParameter(Parameter):
     Author: B.G (07/2026)
     """
 
-    def __init__(self, name: str, *, dtype, mode: str, value, pool, n_flat: int | None = None):
+    _BACKEND_NAME = "cupy"
+
+    def __init__(self, name: str, *, dtype, mode: str, value, pool, shape: tuple = (), n_flat: int | None = None):
         """
         Declare and initialize one parameter. "scalar"/"field" modes allocate
         pooled storage immediately via `pool`; "const" stays a plain python
-        value, read bare in a template body as a #define.
+        value, expanded to its CUDA literal wherever a `$...$` span reads it.
 
         Parameters
         ----------
         name : str
-        dtype : numpy dtype
+        dtype : str or numpy dtype
+            Short dtype tag (``"f32"``, ``"i32"``, ...) or the temporary
+            numpy dtype spelling accepted during the feature migration.
         mode : str
             "const", "scalar" or "field".
         value : Any
             Initial value.
         pool : DataPool
             Backing store for "scalar"/"field" modes.
+        shape : tuple, optional
+            Field storage shape. Field parameters require a non-empty shape.
         n_flat : int, optional
-            Required for "field" mode - the number of nodes.
+            Temporary compatibility spelling for ``shape=(n_flat,)``.
 
         Author: B.G (07/2026)
         """
         if mode not in MODES:
             raise ValueError(f"{name}: mode must be one of {sorted(MODES)}, got {mode!r}")
+        if isinstance(dtype, str):
+            try:
+                dtype = {"i32": np.int32, "i64": np.int64, "f32": np.float32,
+                         "u8": np.uint8, "u32": np.uint32}[dtype]
+            except KeyError as exc:
+                raise ValueError(f"{name}: unknown dtype tag {dtype!r}") from exc
+        shape = tuple(shape)
+        if n_flat is not None:
+            if shape:
+                raise ValueError(f"{name}: pass shape= or n_flat=, not both")
+            shape = (int(n_flat),)
 
         super().__init__()
         self.name = name
@@ -295,13 +312,13 @@ class CupyParameter(Parameter):
         if mode == "scalar":
             self._handle = pool.get_data(dtype, ())
         elif mode == "field":
-            if n_flat is None:
-                raise ValueError(f"{name}: field mode requires n_flat")
-            self._handle = pool.get_data(dtype, (n_flat,))
+            if not shape:
+                raise ValueError(f"{name}: field mode requires shape=(...)")
+            self._handle = pool.get_data(dtype, shape)
 
         self._store(value)
 
-    def get(self):
+    def _host_value(self):
         """
         The python value for const mode, the backing CupyDataHandle otherwise.
 
@@ -317,7 +334,8 @@ class CupyParameter(Parameter):
         Author: B.G (07/2026)
         """
         if self.mode == "const":
-            raise ValueError(
+            from .errors import ParameterError
+            raise ParameterError(
                 f"{self.name}: const parameter is immutable; build a new Parameter and "
                 f"replace() it into the bag, then recompile"
             )
@@ -334,7 +352,7 @@ class CupyParameter(Parameter):
         if self.mode == "const":
             self._const_value = np.dtype(self.dtype).type(value).item()
         elif self.mode == "scalar":
-            self._handle.data[...] = value
+            self._handle.array[...] = value
         else:  # field
             arr = np.asarray(value, dtype=self.dtype).reshape(-1)
             self._handle.from_numpy(arr)
@@ -346,11 +364,12 @@ class CupyParameter(Parameter):
         Author: B.G (07/2026)
         """
         if self.mode == "const":
-            raise ValueError(f"{self.name}: const parameter is read-only")
+            from .errors import ParameterError
+            raise ParameterError(f"{self.name}: const parameter is read-only")
         if self.mode == "scalar":
-            self._handle.data[...] = value
+            self._handle.array[...] = value
         else:  # field
-            self._handle.data[node] = value
+            self._handle.array[node] = value
 
     def read(self):
         """
@@ -362,21 +381,22 @@ class CupyParameter(Parameter):
         if self.mode == "const":
             return self._const_value
         if self.mode == "field":
-            raise ValueError(
+            from .errors import ParameterError
+            raise ParameterError(
                 f"{self.name}: read() is for scalar/const only; a field is not meant to be "
                 f"read back to the host as a whole"
             )
-        return np.dtype(self.dtype).type(self._handle.data.get()).item()
+        return np.dtype(self.dtype).type(self._handle.array.get()).item()
 
     def destroy(self) -> None:
         """
         Return any pooled storage to the pool. const mode owns none, so this
-        is a no-op there.
+        is a no-op there. Raises ParameterError while a bound object still holds
+        this Parameter (see Parameter._assert_unbound).
 
         Author: B.G (07/2026)
         """
+        self._assert_unbound("destroy")
         if self._handle is not None:
             self._pool.release_data(self._handle)
             self._handle = None
-
-

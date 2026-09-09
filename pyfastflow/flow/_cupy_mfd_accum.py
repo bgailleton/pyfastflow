@@ -72,8 +72,7 @@ Author: B.G (08/2026)
 
 import cupy as cp
 
-from ..core.context.builder import KernelBuilder
-from ..core.pool.base import new_uid
+from ..core import KernelBuilder, new_uid
 
 
 def persistent_grid_block(*, blocks_per_sm: int = 2, threads: int = 256) -> tuple:
@@ -107,7 +106,7 @@ def init_frontier_mfd(indegree_data, frontier_data) -> int:
     """
     Host-side frontier compaction: writes the flat indices of every cell
     with indegree 0 into the front of `frontier_data` (a raw cupy ndarray,
-    e.g. a DataHandle's `.data`) and returns how many there were - the
+    e.g. a DataHandle's `.array`) and returns how many there were - the
     `count[p]` the caller must then store before the first launch.
 
     Plain cupy indexing, not a kernel: `cp.nonzero` has no equivalent
@@ -180,27 +179,20 @@ def build_persistent_mfd(
     t = f"pm{new_uid()}"
 
     q_init = (
-        KernelBuilder()
-        .compose("grid", grid)
-        .wire_param("SOURCE")
-        .wire_data("accum")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_q_init(float* accum) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     accum[i] = $ctx.grid.nodata(i)$ ? 0.0f : $ctx.SOURCE.get(i)$;
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )
 
     accum = (
-        KernelBuilder()
-        .compose("grid", grid)
-        .wire_data("frontier0").wire_data("frontier1").wire_data("count").wire_data("barrier")
-        .wire_data("dirs").wire_data("mfd_w").wire_data("accum").wire_data("indegree")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_persistent_mfd(
     int* __restrict__ frontier0, int* __restrict__ frontier1,
@@ -280,8 +272,9 @@ extern "C" __global__ void {t}_persistent_mfd(
         p = 1 - p;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )
 
     return {"q_init": q_init, "accum": accum}

@@ -83,9 +83,7 @@ hops or finding a root id.
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import KernelBuilder
-from ..core.context.frozen import FrozenKernel
-from ..core.pool.base import new_uid
+from ..core import FrozenKernel, KernelBuilder, new_uid
 
 
 def build_hops_init(*, n_flat: int) -> FrozenKernel:
@@ -110,9 +108,7 @@ def build_hops_init(*, n_flat: int) -> FrozenKernel:
     """
     t = f"gfh{new_uid()}"
     return (
-        KernelBuilder()
-        .wire_data("parent").wire_data("filled").wire_data("dist").wire_data("anc")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_hops_init(const int* parent, const float* filled, float* dist, int* anc) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -126,8 +122,7 @@ extern "C" __global__ void {t}_hops_init(const int* parent, const float* filled,
     }}
     anc[i] = p;
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
 
@@ -174,9 +169,7 @@ def build_hops_jump(*, n_flat: int) -> FrozenKernel:
     """
     t = f"gfj{new_uid()}"
     return (
-        KernelBuilder()
-        .wire_data("dist_in").wire_data("anc_in").wire_data("dist_out").wire_data("anc_out")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_hops_jump(
     const float* dist_in, const int* anc_in, float* dist_out, int* anc_out)
@@ -192,6 +185,5 @@ extern "C" __global__ void {t}_hops_jump(
         anc_out[i] = a;
     }}
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )

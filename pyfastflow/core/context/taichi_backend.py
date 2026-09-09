@@ -25,4 +25,6 @@ class TaichiParameter(ClosureBackendParameter):
     Author: B.G (07/2026)
     """
 
+    _BACKEND_NAME = "taichi"
+
     _backend = ti

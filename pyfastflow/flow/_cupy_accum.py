@@ -28,9 +28,7 @@ establishes for this same reason.
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import HelperBuilder, KernelBuilder
-from ..core.context.sequence import SequenceBuilder
-from ..core.pool.base import new_uid
+from ..core import HelperBuilder, KernelBuilder, SequenceBuilder, new_uid
 
 
 def build_ping_pong_helpers():
@@ -41,7 +39,7 @@ def build_ping_pong_helpers():
 
     Author: B.G (08/2026)
     """
-    get_src = HelperBuilder().wire_param("ITER").ingest(
+    get_src = HelperBuilder(
         """
 __device__ int pf_get_src(const int* src, int tid) {
     int entry = src[tid];
@@ -51,15 +49,15 @@ __device__ int pf_get_src(const int* src, int tid) {
     return flip;
 }
 """
-    )
-    update_src = HelperBuilder().wire_param("ITER").ingest(
+    ).freeze()
+    update_src = HelperBuilder(
         """
 __device__ void pf_update_src(int* src, int tid, int flip) {
     int it = $ctx.ITER.get(0)$;
     src[tid] = (flip ? 1 : -1) * (it + 1);
 }
 """
-    )
+    ).freeze()
     return get_src, update_src
 
 
@@ -94,10 +92,7 @@ def build_atomic(*, n_flat: int):
     """
     t = f"pa{new_uid()}"
     q_init = (
-        KernelBuilder()
-        .wire_param("SOURCE")
-        .wire_data("q")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_q_init(float* q) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -105,7 +100,7 @@ extern "C" __global__ void {t}_q_init(float* q) {{
     q[i] = $ctx.SOURCE.get(i)$;
 }}
 """
-        )
+        , domain=n_flat).freeze()
     )
     # wi is re-read from `SOURCE`, not from q[i]: q[i] is a live accumulation
     # target every other thread may already be atomic-adding into by the
@@ -118,11 +113,7 @@ extern "C" __global__ void {t}_q_init(float* q) {{
     # accum_downstream_atomic_kernel and the closure-backend port, which
     # both re-read the weight function/Parameter directly for this reason.
     accum = (
-        KernelBuilder()
-        .wire_param("SOURCE")
-        .wire_data("rec")
-        .wire_data("q")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_accum_downstream_atomic(const int* rec, float* q) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -139,7 +130,7 @@ extern "C" __global__ void {t}_accum_downstream_atomic(const int* rec, float* q)
     atomicAdd(&q[j], wi);
 }}
 """
-        )
+        , domain=n_flat).freeze()
     )
     return {"q_init": q_init, "accum": accum}
 
@@ -170,11 +161,9 @@ def build_rake_compress(*, n_neighbours: int, logn: int, n_flat: int):
 
     Every kernel here launches over an n_flat-sized index space except the
     single-thread iteration bookkeeping steps ("reset_iteration",
-    "bump_iteration", "decrement_iteration"), composed with their own
-    `launch={"grid": 1, "block": 1}` override (sequence.py's
-    compose(..., launch=...)) - the sequence-level `compile(backend,
-    grid=..., block=...)` call the caller eventually makes supplies the
-    n_flat-sized default every other step falls back to.
+    "bump_iteration", "decrement_iteration"). Each kernel owns its domain
+    and optional block size, so sequence compilation needs no per-step launch
+    overrides.
 
     Parameters
     ----------
@@ -193,7 +182,7 @@ def build_rake_compress(*, n_neighbours: int, logn: int, n_flat: int):
 
     get_src, update_src = build_ping_pong_helpers()
 
-    zero_init = KernelBuilder().wire_data("ndonors").wire_data("ndonors_alt").wire_data("src").ingest(
+    zero_init = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_zero_init(int* ndonors, int* ndonors_alt, int* src) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -202,47 +191,42 @@ extern "C" __global__ void {t}_zero_init(int* ndonors, int* ndonors_alt, int* sr
     ndonors_alt[i] = 0;
     src[i] = 0;
 }}
-"""
-    )
-    reset_iteration = KernelBuilder().wire_param("ITER").ingest(
+""", domain=n_flat).freeze()
+    reset_iteration = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_reset_iteration() {{
     $ctx.ITER.set_node(0, 0)$;
 }}
-"""
-    )
-    decrement_iteration = KernelBuilder().wire_param("ITER").ingest(
+""", domain=1, block=1).freeze()
+    decrement_iteration = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_decrement_iteration() {{
     int cur = $ctx.ITER.get(0)$;
     $ctx.ITER.set_node(0, cur - 1)$;
 }}
-"""
-    )
+""", domain=1, block=1).freeze()
     # Unlike the closure backends (rake_compress_accum's own second
     # top-level `for` loop bumps ITER, ordered after the rake pass as a
     # separate offloaded task for free), cupy has no such guarantee inside
     # one `__global__` - a genuinely separate, single-thread launch is
     # required after every rake pass, mirroring the closure/cupy split
     # build_atomic already has for its own barrier reason.
-    bump_iteration = KernelBuilder().wire_param("ITER").ingest(
+    bump_iteration = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_bump_iteration() {{
     int cur = $ctx.ITER.get(0)$;
     $ctx.ITER.set_node(0, cur + 1)$;
 }}
-"""
-    )
-    q_init = KernelBuilder().wire_param("SOURCE").wire_data("q").ingest(
+""", domain=1, block=1).freeze()
+    q_init = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_q_init(float* q) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     q[i] = $ctx.SOURCE.get(i)$;
 }}
-"""
-    )
-    receivers_to_donors = KernelBuilder().wire_data("rec").wire_data("donors").wire_data("ndonors").ingest(
+""", domain=n_flat).freeze()
+    receivers_to_donors = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_receivers_to_donors(const int* rec, int* donors, int* ndonors) {{
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -253,17 +237,9 @@ extern "C" __global__ void {t}_receivers_to_donors(const int* rec, int* donors, 
         donors[rcv * {NN} + old_val] = tid;
     }}
 }}
-"""
-    )
+""", domain=n_flat).freeze()
     rake_compress_accum = (
-        KernelBuilder()
-        .wire_param("ITER")
-        .compose("get_src", get_src)
-        .compose("update_src", update_src)
-        .share("ITER", "get_src.ITER", "update_src.ITER")
-        .wire_data("donors").wire_data("ndonors").wire_data("q").wire_data("src")
-        .wire_data("donors_alt").wire_data("ndonors_alt").wire_data("q_alt")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_rake_compress_accum(int* donors, int* ndonors, float* q, int* src,
                                          int* donors_alt, int* ndonors_alt, float* q_alt) {{
@@ -293,10 +269,8 @@ extern "C" __global__ void {t}_rake_compress_accum(int* donors, int* ndonors, fl
                 q_added = flip ? q_alt[tid] : q[tid];
             }}
             worked = 1;
-
             float q_val = flip_donor ? q_alt[did] : q[did];
             q_added += q_val;
-
             if (ndnr_val == 0) {{
                 todo -= 1;
                 if (todo > i) {{
@@ -310,7 +284,6 @@ extern "C" __global__ void {t}_rake_compress_accum(int* donors, int* ndonors, fl
         }}
         i += 1;
     }}
-
     if (worked) {{
         if (flip) {{
             ndonors[tid] = todo;
@@ -328,14 +301,15 @@ extern "C" __global__ void {t}_rake_compress_accum(int* donors, int* ndonors, fl
         $ctx.update_src(src, tid, flip)$;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .param("ITER")
+        .compose("get_src", get_src)
+        .compose("update_src", update_src)
+        .share("ITER", "get_src.ITER", "update_src.ITER")
+        .freeze()
     )
     fuse_accum_buffers = (
-        KernelBuilder()
-        .compose("get_src", get_src)
-        .wire_data("q").wire_data("src").wire_data("q_alt")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_fuse_accum_buffers(float* q, int* src, float* q_alt) {{
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -344,8 +318,9 @@ extern "C" __global__ void {t}_fuse_accum_buffers(float* q, int* src, float* q_a
         q[tid] = q_alt[tid];
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("get_src", get_src)
+        .freeze()
     )
 
     kernels = {
@@ -359,16 +334,15 @@ extern "C" __global__ void {t}_fuse_accum_buffers(float* q, int* src, float* q_a
         "fuse_accum_buffers": fuse_accum_buffers,
     }
 
-    single = {"grid": 1, "block": 1}
     sb = SequenceBuilder()
-    sb.compose("zero_init", zero_init)
-    sb.compose("reset_iteration", reset_iteration, launch=single)
-    sb.compose("q_init", q_init)
-    sb.compose("receivers_to_donors", receivers_to_donors)
-    sb.compose("rake_step", rake_compress_accum)
-    sb.compose("bump_iteration", bump_iteration, launch=single)
-    sb.compose("decrement_iteration", decrement_iteration, launch=single)
-    sb.compose("fuse_accum_buffers", fuse_accum_buffers)
+    sb.add("zero_init", zero_init)
+    sb.add("reset_iteration", reset_iteration)
+    sb.add("q_init", q_init)
+    sb.add("receivers_to_donors", receivers_to_donors)
+    sb.add("rake_step", rake_compress_accum)
+    sb.add("bump_iteration", bump_iteration)
+    sb.add("decrement_iteration", decrement_iteration)
+    sb.add("fuse_accum_buffers", fuse_accum_buffers)
 
     sb.step("zero_init")
     sb.step("reset_iteration")
@@ -414,37 +388,32 @@ def build_pointer_jump_push(*, rounds: int, n_flat: int):
     Author: B.G (08/2026)
     """
     t = f"pj{new_uid()}"
-    q_init = KernelBuilder().wire_param("SOURCE").wire_data("q").ingest(
+    q_init = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_q_init(float* q) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     q[i] = $ctx.SOURCE.get(i)$;
 }}
-"""
-    )
-    copy_rec_to_work = KernelBuilder().wire_data("rec").wire_data("work").ingest(
+""", domain=n_flat).freeze()
+    copy_rec_to_work = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_copy_rec_to_work(const int* rec, int* work) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     work[i] = rec[i];
 }}
-"""
-    )
-    step_copy = KernelBuilder().wire_data("q_curr").wire_data("q_next").ingest(
+""", domain=n_flat).freeze()
+    step_copy = KernelBuilder(
         f"""
 extern "C" __global__ void {t}_step_copy(const float* q_curr, float* q_next) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     q_next[i] = q_curr[i];
 }}
-"""
-    )
+""", domain=n_flat).freeze()
     step_core = (
-        KernelBuilder()
-        .wire_data("rec_curr").wire_data("rec_next").wire_data("q_curr").wire_data("q_next")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_step_core(const int* rec_curr, int* rec_next, const float* q_curr, float* q_next) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -460,8 +429,7 @@ extern "C" __global__ void {t}_step_core(const int* rec_curr, int* rec_next, con
         rec_next[i] = (grandparent == parent) ? i : grandparent;
     }}
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
     kernels = {
@@ -472,12 +440,12 @@ extern "C" __global__ void {t}_step_core(const int* rec_curr, int* rec_next, con
     }
 
     sb = SequenceBuilder()
-    sb.compose("q_init", q_init)
-    sb.compose("copy_rec_to_work", copy_rec_to_work)
-    sb.compose("step_a_copy", step_copy)
-    sb.compose("step_a_core", step_core)
-    sb.compose("step_b_copy", step_copy)
-    sb.compose("step_b_core", step_core)
+    sb.add("q_init", q_init)
+    sb.add("copy_rec_to_work", copy_rec_to_work)
+    sb.add("step_a_copy", step_copy)
+    sb.add("step_a_core", step_core)
+    sb.add("step_b_copy", step_copy)
+    sb.add("step_b_core", step_core)
 
     sb.step("q_init")
     sb.step("copy_rec_to_work")

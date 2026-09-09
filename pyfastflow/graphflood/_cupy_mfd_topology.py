@@ -51,30 +51,8 @@ into the live ring. Live cells never route _into_ a nodata cell -
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import KernelBuilder
-from ..core.context.frozen import FrozenKernel
-from ..core.context.slot import SlotKind
-from ..core.pool.base import new_uid
+from ..core import FrozenKernel, KernelBuilder, new_uid
 from ..flow._cupy_receivers import build_distance_slope_helpers
-
-
-def _find_param_paths(frozen, leaf_name: str, prefix: tuple = ()) -> list:
-    """Every relative dotted path under `frozen`'s composed subtree whose PARAM slot is named `leaf_name`."""
-    paths = []
-    if leaf_name in frozen.slots.names(SlotKind.PARAM):
-        paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
-        paths.extend(_find_param_paths(child, leaf_name, prefix + (name,)))
-    return paths
-
-
-def _share_leaf(builder, canonical: str) -> None:
-    """Declare every occurrence of PARAM `canonical` in `builder`'s composed subtree shared with its own top-level slot."""
-    paths = []
-    for name, child in builder.composed.items():
-        paths.extend(_find_param_paths(child, canonical, (name,)))
-    if paths:
-        builder.share(canonical, *paths)
 
 
 def build_mfd_topology(*, grid, n_flat: int, topology: str, diagonal_partition_correction: bool) -> dict:
@@ -146,36 +124,21 @@ extern "C" __global__ void {t}_mfd_dirs_weights(const float* filled, const float
 }}
 """
 
-    dirs_weights_kb = KernelBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        dirs_weights_kb.wire_param(name)
+    dirs_weights_kb = KernelBuilder(dirs_weights_body, domain=n_flat)
     dirs_weights_kb.compose("grid", grid).compose("slope", slope)
-    dirs_weights_kb.wire_data("filled").wire_data("dist").wire_data("dirs").wire_data("mfd_w")
-    for name in grid_param_names:
-        _share_leaf(dirs_weights_kb, name)
+    dirs_weights_kb.share_identical("grid")
 
     indegree_reset: FrozenKernel = (
-        KernelBuilder()
-        .wire_data("indegree")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_mfd_indegree_reset(int* indegree) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     indegree[i] = 0;
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
-    indegree_count_kb = KernelBuilder()
-    for name in grid_param_names:
-        indegree_count_kb.wire_param(name)
-    indegree_count_kb.compose("grid", grid)
-    indegree_count_kb.wire_data("dirs").wire_data("indegree")
-    for name in grid_param_names:
-        _share_leaf(indegree_count_kb, name)
     indegree_count_body = f"""
 extern "C" __global__ void {t}_mfd_indegree_count(const unsigned char* dirs, int* indegree) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -189,9 +152,11 @@ extern "C" __global__ void {t}_mfd_indegree_count(const unsigned char* dirs, int
     }}
 }}
 """
+    indegree_count_kb = KernelBuilder(indegree_count_body, domain=n_flat)
+    indegree_count_kb.compose("grid", grid)
 
     return {
-        "dirs_weights": dirs_weights_kb.ingest(dirs_weights_body),
+        "dirs_weights": dirs_weights_kb.freeze(),
         "indegree_reset": indegree_reset,
-        "indegree_count": indegree_count_kb.ingest(indegree_count_body),
+        "indegree_count": indegree_count_kb.freeze(),
     }

@@ -38,7 +38,7 @@ Author: B.G (08/2026)
 import importlib
 import math
 
-from ..core.context.builder import HelperBuilder, KernelBuilder
+from ..core import KernelBuilder, freeze_helper as _helper
 
 _DEG2RAD = math.pi / 180.0
 _HALF_PI = math.pi / 2.0
@@ -93,23 +93,6 @@ def _at_tmpl(ctx, z, i):
     return max(0.0, min(1.0, hillshade_value))
 
 
-def _helper(template, *, params=(), helpers=None):
-    """
-    One private/public HelperBuilder: wire_param() every name in `params`,
-    compose() every (name, frozen) pair in `helpers` under that same name,
-    then ingest(template). Mirrors grid/_closure_blocks.py's own `_helper`.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_group(group, *, grid, k_top, k_left, k_right, k_bottom):
     """
     Compose `at(z, i)` (and its private `grad_x`/`grad_y`) onto `group` (a
@@ -129,7 +112,7 @@ def build_group(group, *, grid, k_top, k_left, k_right, k_bottom):
         params=["AZIMUTH", "ALTITUDE", "ZFACTOR"],
         helpers={"grad_x": grad_x, "grad_y": grad_y},
     )
-    group.wire_helper("at").compose("at", at)
+    group.compose("at", at)
 
 
 def _make_hillshade_kernel_tmpl(backend: str):
@@ -154,4 +137,4 @@ def build_kernel(hillshade_group, *, backend: str):
     Author: B.G (08/2026)
     """
     tmpl = _make_hillshade_kernel_tmpl(backend)
-    return KernelBuilder().wire_data("z").wire_data("out").compose("hillshade", hillshade_group).ingest(tmpl)
+    return KernelBuilder(tmpl).compose("hillshade", hillshade_group).freeze()

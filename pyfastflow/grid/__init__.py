@@ -71,16 +71,14 @@ Author: B.G (08/2026)
 
 import numpy as np
 
-from ..core.context.backends import backend_classes
-from ..core.context.builder import GroupBuilder, share_leaf
-from ..core.context.frozen import FrozenGroup
+from ..core import Backend, FrozenGroup, GroupBuilder, require_backend, share_leaf
 
 _TOPOLOGIES = {"D4": 4, "D8": 8}
 _BOUNDARIES = frozenset({"normal", "periodic_EW", "periodic_NS"})
 _OUTLETS = frozenset({"edge", "mask"})
 
 
-def _blocks_for(backend: str):
+def _blocks_for(be: Backend):
     """
     The private block module implementing make_grid_group's device code for
     one backend name: the closure blocks (shared by Taichi and Quadrants) or
@@ -88,12 +86,12 @@ def _blocks_for(backend: str):
 
     Author: B.G (08/2026)
     """
-    if backend in ("taichi", "quadrants"):
+    if be.family == "closure":
         from . import _closure_blocks as blocks
-    elif backend == "cupy":
+    elif be.family == "cupy":
         from . import _cupy_blocks as blocks
     else:
-        raise ValueError(f"make_grid_group: unknown backend {backend!r}, expected 'taichi', 'quadrants' or 'cupy'")
+        raise ValueError(f"make_grid_group: unsupported backend family {be.family!r}")
     return blocks
 
 
@@ -107,7 +105,7 @@ def _check_config(topology: str, boundary: str, outlet: str) -> None:
 
 
 def make_grid_group(
-    backend: str,
+    be: Backend,
     *,
     topology: str = "D8",
     boundary: str = "normal",
@@ -129,8 +127,8 @@ def make_grid_group(
 
     Parameters
     ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
+    be : Backend
+        Backend selecting the closure or cupy block family.
     topology : str, optional
         "D4" or "D8" (default). Picks block variants at build time.
     boundary : str, optional
@@ -151,18 +149,19 @@ def make_grid_group(
 
     Author: B.G (08/2026)
     """
+    be = require_backend(be)
     _check_config(topology, boundary, outlet)
-    blocks = _blocks_for(backend)
+    blocks = _blocks_for(be)
 
     group = GroupBuilder()
-    group.wire_param("NX")
-    group.wire_param("NY")
-    group.wire_param("DX")
-    group.wire_param("N_NEIGHBOURS")
+    group.param("NX")
+    group.param("NY")
+    group.param("DX")
+    group.param("N_NEIGHBOURS")
     if nodata:
-        group.wire_param("NODATA_MASK")
+        group.param("NODATA_MASK")
     if outlet == "mask":
-        group.wire_param("OUTLET_MASK")
+        group.param("OUTLET_MASK")
 
     blocks.build_group(group, topology=topology, boundary=boundary, nodata=nodata, outlet=outlet)
 
@@ -178,7 +177,7 @@ def make_grid_group(
 
 
 def make_grid_parameters(
-    backend: str,
+    be: Backend,
     pool,
     nx: int,
     ny: int,
@@ -218,8 +217,8 @@ def make_grid_parameters(
 
     Parameters
     ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
+    be : Backend
+        Backend whose Parameter class owns the returned values.
     pool : Pool
         Device-buffer pool backing scalar/field-mode Parameters.
     nx, ny : int
@@ -250,6 +249,7 @@ def make_grid_parameters(
 
     Author: B.G (08/2026)
     """
+    be = require_backend(be)
     _check_config(topology, "normal", outlet)
     if nx_mode not in ("const", "scalar"):
         raise ValueError(f"make_grid_parameters: nx_mode must be 'const' or 'scalar', got {nx_mode!r}")
@@ -258,26 +258,26 @@ def make_grid_parameters(
     if dx_mode not in ("const", "scalar", "field"):
         raise ValueError(f"make_grid_parameters: dx_mode must be 'const', 'scalar' or 'field', got {dx_mode!r}")
 
-    _bk = backend_classes(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
+    ParamCls = be.ParameterCls
     n_flat = int(nx) * int(ny)
 
-    nx_p = ParamCls("GRID_NX", dtype=dtypes["i32"], mode=nx_mode, value=int(nx), pool=pool)
-    ny_p = ParamCls("GRID_NY", dtype=dtypes["i32"], mode=ny_mode, value=int(ny), pool=pool)
+    nx_p = ParamCls("GRID_NX", dtype="i32", mode=nx_mode, value=int(nx), pool=pool)
+    ny_p = ParamCls("GRID_NY", dtype="i32", mode=ny_mode, value=int(ny), pool=pool)
 
     if dx_mode == "field":
         dx_p = ParamCls(
             "GRID_DX",
-            dtype=dtypes["f32"],
+            dtype="f32",
             mode="field",
             value=np.full(n_flat, dx, dtype=np.float32),
             pool=pool,
-            n_flat=n_flat,
+            shape=(n_flat,),
         )
     else:
-        dx_p = ParamCls("GRID_DX", dtype=dtypes["f32"], mode=dx_mode, value=float(dx), pool=pool)
+        dx_p = ParamCls("GRID_DX", dtype="f32", mode=dx_mode, value=float(dx), pool=pool)
 
     n_neighbours_p = ParamCls(
-        "GRID_NNEIGHBOURS", dtype=dtypes["i32"], mode="const", value=_TOPOLOGIES[topology], pool=pool
+        "GRID_NNEIGHBOURS", dtype="i32", mode="const", value=_TOPOLOGIES[topology], pool=pool
     )
 
     params = {"NX": nx_p, "NY": ny_p, "DX": dx_p, "N_NEIGHBOURS": n_neighbours_p}
@@ -285,21 +285,21 @@ def make_grid_parameters(
     if nodata:
         params["NODATA_MASK"] = ParamCls(
             "GRID_NODATA_MASK",
-            dtype=dtypes["u8"],
+            dtype="u8",
             mode="field",
             value=np.zeros(n_flat, dtype=np.uint8),
             pool=pool,
-            n_flat=n_flat,
+            shape=(n_flat,),
         )
 
     if outlet == "mask":
         params["OUTLET_MASK"] = ParamCls(
             "GRID_OUTLET_MASK",
-            dtype=dtypes["u8"],
+            dtype="u8",
             mode="field",
             value=np.zeros(n_flat, dtype=np.uint8),
             pool=pool,
-            n_flat=n_flat,
+            shape=(n_flat,),
         )
 
     return params

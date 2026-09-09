@@ -10,8 +10,9 @@ caller can recombine them into its own kernel or routine rather than being
 stuck with only the compiled receivers kernel. A caller `.build()`s the
 member it wants, binds its PARAM/DATA addresses, `.compile()`s:
 
-    grid = make_grid_group("taichi", topology="D8")
-    recv = make_receivers("taichi", grid, topology="D8", mode="steepest")
+    be = Backend.from_name("taichi")
+    grid = make_grid_group(be, topology="D8")
+    recv = make_receivers(be, grid, topology="D8", mode="steepest")
     bound = recv["receivers"].build()
     bound.bind_leaf(grid_params)  # NX/NY/DX/N_NEIGHBOURS - see below
     bound.bind("z", z_field)
@@ -80,11 +81,11 @@ with no variant code, since every template reads `source.get(i)`) - there is
 no Need indirection anywhere in this stack:
 
     source_p = TaichiParameter("SOURCE", dtype=ti.f32, mode="const", value=1.0, pool=pool)
-    accum = make_accumulation("taichi", grid, method="atomic", n_flat=n_flat)
+    accum = make_accumulation(be, grid, method="atomic", n_flat=n_flat)
     bound = accum["accum"].build()
     bound.bind("SOURCE", source_p)
-    bound.bind("rec", rec.data)
-    bound.bind("q", q.data)
+    bound.bind("rec", rec)
+    bound.bind("q", q)
     accum_kernel = bound.compile("taichi")
     accum_kernel()
 
@@ -142,7 +143,7 @@ no Need indirection anywhere in this stack:
     addresses.
 
 Both factories return {"sequence": SequenceBuilder, **kernel_builders} - a
-Bag, not a compiled object (these factories export builders, not compiled
+dict, not a compiled object (these factories export builders, not compiled
 kernels - see CLAUDE.md). The caller `.freeze()`s (or lets `.compile()`
 freeze implicitly - SequenceBuilder has no separate freeze() call exposed
 here beyond what `.build()`/`.compile()` already do internally), `.build()`s,
@@ -178,7 +179,7 @@ make_depressions: the depression-handling factory, on the builder/frozen/
 bound stack. Two orthogonal build flags:
 
     ndep_p = TaichiParameter("NDEP", dtype=ti.i32, mode="scalar", value=0, pool=pool)
-    deps = make_depressions("taichi", grid, ndep_p, method="vanilla", reroute="carve", n_flat=n_flat)
+    deps = make_depressions(be, grid, ndep_p, method="vanilla", reroute="carve", n_flat=n_flat)
 
 `method` ("vanilla"|"optimized") picks how basins are labelled and, for
 reroute="carve", how the carve itself runs; `reroute` ("carve"|"jump") picks
@@ -193,7 +194,7 @@ is a caller-supplied data arg, never a bound field Parameter.
 Every buffer is n_flat-sized, since a per-basin array is indexed by basin id
 and basin id = pit index + 1 (bid/basin_saddlenode/outlet range over the
 same 0..n_flat-1 index space as every per-node buffer). Required data args,
-by Bag member:
+by dict key:
 
   "ndep":                the `ndep_p` scalar Parameter itself (bag.ndep.read())
   "depression_counter":   closure: (rec,) - accumulates into ndep_p, bound
@@ -202,7 +203,7 @@ by Bag member:
                           there, which registers it read-only in the
                           constant block (see compile_cupy.py's
                           _register_ptr), so the caller instead
-                          passes `ndep_p.get().data` positionally, same as
+                          passes `ndep_p.handle().array` positionally, same as
                           `rec` - see build_depression_counter in
                           _cupy_depressions.py. Either way the caller must
                           ndep_p.set(0) before each launch (mirrors
@@ -241,14 +242,8 @@ i64 atomic_min is a CAS loop (CUDA has no native atomicMin over signed long
 long) - see _cupy_depressions.py's build_atomic_min_ll.
 
 make_depressions builds the routines/kernels only. make_depression_solver
-wraps that Bag into the outer host-driven loop the algorithm needs, as a
-compiled Sequence:
-
-    solver = make_depression_solver(
-        "taichi", deps, method="vanilla", reroute="carve",
-        rec=rec.data, z=z.data, bid=bid.data, ...)
-    solver()
-    solver.last_trip_counts   # passes the loop actually took
+builds the outer host-driven loop as a FrozenSequence. Callers bind live
+DataHandles to the returned sequence and compile it for their Backend.
 
     depression_counter -> ndep;  ndep == 0 -> nothing to do
     loop max_times = ceil(log2(max(2, ndep))) + 2:
@@ -282,17 +277,14 @@ Author: B.G (07/2026)
 import math
 from importlib import import_module
 
-from ..core.context.bag import Bag
-from ..core.context.backends import backend_classes
-from ..core.context.host_block import HostBlockBuilder
-from ..core.context.sequence import SequenceBuilder
+from ..core import Backend, HostBlockBuilder, SequenceBuilder, require_backend
 from ..noise import make_hash_u32
 
 _MODES = frozenset({"steepest", "stochastic"})
 _ACCUM_METHODS = frozenset({"atomic", "rake_compress", "pointer_jump_push"})
 
 
-def _blocks_for(backend: str, section: str):
+def _blocks_for(be: Backend, section: str):
     """
     The private block module implementing one flow section's device code
     for one backend name - e.g. ("cupy", "depressions") -> _cupy_depressions.
@@ -303,17 +295,17 @@ def _blocks_for(backend: str, section: str):
 
     Author: B.G (07/2026)
     """
-    if backend in ("taichi", "quadrants"):
+    if be.family == "closure":
         prefix = "_closure"
-    elif backend == "cupy":
+    elif be.family == "cupy":
         prefix = "_cupy"
     else:
-        raise ValueError(f"unknown backend {backend!r}, expected 'taichi', 'quadrants' or 'cupy'")
+        raise ValueError(f"unsupported backend family {be.family!r}")
     return import_module(f".{prefix}_{section}", __package__)
 
 
 def make_receivers(
-    backend: str,
+    be: Backend,
     grid,
     *,
     topology: str = "D8",
@@ -365,13 +357,14 @@ def make_receivers(
     if topology not in ("D4", "D8"):
         raise ValueError(f"make_receivers: topology must be 'D4' or 'D8', got {topology!r}")
 
-    blocks = _blocks_for(backend, "receivers")
-    hash_u32 = make_hash_u32(backend) if mode == "stochastic" else None
+    be = require_backend(be)
+    blocks = _blocks_for(be, "receivers")
+    hash_u32 = make_hash_u32(be) if mode == "stochastic" else None
 
-    if backend in ("taichi", "quadrants"):
-        backend_mod = backend_classes(backend).module
+    if be.family == "closure":
+        backend_mod = be.module
         return blocks.build_receivers(
-            backend=backend,
+            backend=be.name,
             backend_mod=backend_mod,
             grid=grid,
             hash_u32=hash_u32,
@@ -391,7 +384,7 @@ def make_receivers(
 
 
 def make_accumulation(
-    backend: str,
+    be: Backend,
     grid,
     source=None,
     *,
@@ -485,7 +478,7 @@ def make_accumulation(
 
     Returns
     -------
-    dict or Bag
+    dict
         Structure depends on `method` - see above.
 
     Raises
@@ -497,22 +490,22 @@ def make_accumulation(
 
     Author: B.G (08/2026)
     """
+    be = require_backend(be)
     if method == "atomic":
         if n_flat is None:
             raise ValueError(
                 "make_accumulation: method='atomic' requires n_flat explicitly - "
                 "grid is a bare FrozenGroup with no bound values to read it off"
             )
-        blocks = _blocks_for(backend, "accum")
-        if backend in ("taichi", "quadrants"):
-            backend_mod = backend_classes(backend).module
-            return {"accum": blocks.build_atomic(backend=backend, backend_mod=backend_mod, n_flat=int(n_flat))}
+        blocks = _blocks_for(be, "accum")
+        if be.family == "closure":
+            return {"accum": blocks.build_atomic(backend=be.name, backend_mod=be.module, n_flat=int(n_flat))}
         return blocks.build_atomic(n_flat=int(n_flat))
 
     if method == "persistent_mfd":
-        if backend != "cupy":
+        if be.family != "cupy":
             raise ValueError(
-                f"make_accumulation: method='persistent_mfd' is cupy-only (got backend={backend!r}) - "
+                f"make_accumulation: method='persistent_mfd' is cupy-only (got backend={be.name!r}) - "
                 "see _cupy_mfd_accum.py's module docstring for why there is no closure-backend equivalent"
             )
         if n_flat is None:
@@ -543,14 +536,14 @@ def make_accumulation(
     # itself, at the addresses each module's build_rake_compress/
     # build_pointer_jump_push docstring enumerates, after `.build()` - exactly
     # like make_receivers' `rand_unit.SEED`.
-    blocks = _blocks_for(backend, "accum")
+    blocks = _blocks_for(be, "accum")
     if n_flat is None:
         raise ValueError(
             f"make_accumulation: method={method!r} requires n_flat explicitly - "
             "grid is a bare FrozenGroup with no bound values to read it off"
         )
     n_flat_resolved = int(n_flat)
-    closure = backend in ("taichi", "quadrants")
+    closure = be.family == "closure"
 
     logn = math.ceil(math.log2(n_flat_resolved)) + 1
 
@@ -561,9 +554,8 @@ def make_accumulation(
                 "grid is a bare FrozenGroup with no bound values to read it off"
             )
         if closure:
-            backend_mod = backend_classes(backend).module
             sb, kernels = blocks.build_rake_compress(
-                backend=backend, backend_mod=backend_mod, n_neighbours=int(n_neighbours), logn=logn,
+                backend=be.name, backend_mod=be.module, n_neighbours=int(n_neighbours), logn=logn,
             )
         else:
             sb, kernels = blocks.build_rake_compress(n_neighbours=int(n_neighbours), logn=logn, n_flat=n_flat_resolved)
@@ -572,14 +564,13 @@ def make_accumulation(
         if rounds % 2 != 0:
             rounds += 1
         if closure:
-            backend_mod = backend_classes(backend).module
-            sb, kernels = blocks.build_pointer_jump_push(backend=backend, backend_mod=backend_mod, rounds=rounds)
+            sb, kernels = blocks.build_pointer_jump_push(backend=be.name, backend_mod=be.module, rounds=rounds)
         else:
             sb, kernels = blocks.build_pointer_jump_push(rounds=rounds, n_flat=n_flat_resolved)
 
     out = dict(kernels)
     out["sequence"] = sb
-    return Bag(out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +582,7 @@ _DEP_REROUTES = frozenset({"carve", "jump"})
 
 
 def make_depressions(
-    backend: str,
+    be: Backend,
     grid,
     depression_counter_p,
     *,
@@ -606,7 +597,7 @@ def make_depressions(
     builder.py, frozen.py, bound.py, routine.py). Keys: "ndep_p" (the
     caller's own Parameter, passed straight through), "copy_field",
     "depression_counter" (FrozenKernel, data args (rec, ndep) - `ndep` bound
-    to `depression_counter_p.get().data`, reset with `.set(0)` before each
+    to `depression_counter_p.handle().array`, reset with `.set(0)` before each
     launch), "label_basins" (FrozenKernel for method="optimized" on closure
     backends, FrozenRoutine otherwise - see _closure_depressions.py's/
     _cupy_depressions.py's own build_basin_labelling_* docstrings for the
@@ -673,21 +664,22 @@ def make_depressions(
     if reroute not in _DEP_REROUTES:
         raise ValueError(f"make_depressions: reroute must be one of {sorted(_DEP_REROUTES)}, got {reroute!r}")
 
-    backend_mod = backend_classes(backend).module
-    blocks = _blocks_for(backend, "depressions")
+    be = require_backend(be)
+    backend_mod = be.module
+    blocks = _blocks_for(be, "depressions")
     n_flat_resolved = int(n_flat)
-    closure = backend in ("taichi", "quadrants")
+    closure = be.family == "closure"
     logn = math.ceil(math.log2(n_flat_resolved)) + 1
 
     from ..ops import make_bitpack_group
 
-    bitpack = make_bitpack_group(backend)
+    bitpack = make_bitpack_group(be)
 
     out: dict = {"ndep_p": depression_counter_p}
 
     if closure:
-        copy_field = blocks.build_copy_field(backend=backend, backend_mod=backend_mod)
-        depression_counter = blocks.build_depression_counter(backend=backend, backend_mod=backend_mod, grid=grid)
+        copy_field = blocks.build_copy_field(backend=be.name, backend_mod=backend_mod)
+        depression_counter = blocks.build_depression_counter(backend=be.name, backend_mod=backend_mod, grid=grid)
     else:
         copy_field = blocks.build_copy_field(n_flat=n_flat_resolved)
         depression_counter = blocks.build_depression_counter(grid=grid, n_flat=n_flat_resolved)
@@ -702,10 +694,10 @@ def make_depressions(
     # saddle->pit walk requires to terminate. See _closure_depressions.py.
     if closure:
         lb_rb, lb_kernels = blocks.build_basin_labelling_route(
-            backend=backend, backend_mod=backend_mod, grid=grid, logn=logn,
+            backend=be.name, backend_mod=backend_mod, grid=grid, logn=logn,
         )
         out["merge_basin_route"] = blocks.build_merge_basin_route(
-            backend=backend, backend_mod=backend_mod, bitpack=bitpack,
+            backend=be.name, backend_mod=backend_mod, bitpack=bitpack,
         )
     else:
         lb_rb, lb_kernels = blocks.build_basin_labelling_route(
@@ -720,7 +712,7 @@ def make_depressions(
 
     # saddlesort - shared, unchanged by `method`
     if closure:
-        ss_rb, ss_kernels = blocks.build_saddlesort(backend=backend, backend_mod=backend_mod, grid=grid, bitpack=bitpack)
+        ss_rb, ss_kernels = blocks.build_saddlesort(backend=be.name, backend_mod=backend_mod, grid=grid, bitpack=bitpack)
     else:
         ss_rb, ss_kernels = blocks.build_saddlesort(grid=grid, bitpack=bitpack, n_flat=n_flat_resolved)
     out["saddlesort"] = ss_rb.freeze()
@@ -732,7 +724,7 @@ def make_depressions(
         if method == "vanilla":
             if closure:
                 rr_rb, rr_kernels = blocks.build_reroute_carve_vanilla(
-                    backend=backend, backend_mod=backend_mod, bitpack=bitpack, copy_field=copy_field, logn=logn,
+                    backend=be.name, backend_mod=backend_mod, bitpack=bitpack, copy_field=copy_field, logn=logn,
                 )
             else:
                 rr_rb, rr_kernels = blocks.build_reroute_carve_vanilla(
@@ -743,12 +735,12 @@ def make_depressions(
                 out[f"reroute_{name}"] = kb
         else:  # optimized
             if closure:
-                out["reroute"] = blocks.build_reroute_carve_optimized(backend=backend, backend_mod=backend_mod, bitpack=bitpack, n_flat=n_flat_resolved)
+                out["reroute"] = blocks.build_reroute_carve_optimized(backend=be.name, backend_mod=backend_mod, bitpack=bitpack, n_flat=n_flat_resolved)
             else:
                 out["reroute"] = blocks.build_reroute_carve_optimized(bitpack=bitpack, n_flat=n_flat_resolved)
     else:  # jump
         if closure:
-            out["reroute"] = blocks.build_reroute_jump(backend=backend, backend_mod=backend_mod, bitpack=bitpack)
+            out["reroute"] = blocks.build_reroute_jump(backend=be.name, backend_mod=backend_mod, bitpack=bitpack)
         else:
             rr_rb, rr_kernels = blocks.build_reroute_jump(bitpack=bitpack, n_flat=n_flat_resolved)
             out["reroute"] = rr_rb.freeze()
@@ -782,12 +774,11 @@ def _bind_grid_everywhere(bound, grid_params: dict) -> None:
     varies by `method`/`reroute`/backend - see _closure_depressions.py's/
     _cupy_depressions.py's own build_* docstrings).
 
-    Not expressed via bound.py's own `bind_leaf`/`bind_pattern`: the match
+    Not expressed via bound.py's own `bind_leaf`: the match
     here is "second-to-last segment is literally 'grid'", independent of
     address depth (`label_basins.grid.NX` and, in principle,
     some_step.some_helper.grid.NX alike) - `bind_leaf`'s `prefix` only
-    restricts by leading segments, and `bind_pattern`'s wildcard grammar
-    requires a fixed total address length, neither of which can express "the
+    restricts by leading segments and therefore cannot express "the
     second-to-last segment, whatever the leading depth". A plain unprefixed
     `bind_leaf(grid_params)` would happen to give the same result today
     (nothing outside a grid occurrence is ever named NX/NY/DX/N_NEIGHBOURS/
@@ -808,33 +799,19 @@ def _require(label: str, **buffers):
         raise ValueError(f"make_depression_solver: {label} requires {missing}")
 
 
-def make_depression_solver(
-    backend: str,
+def _build_depression_solver_sequence(
+    be: Backend,
     deps: dict,
     grid_params: dict,
     *,
     method: str = "vanilla",
     reroute: str = "carve",
-    rec=None,
-    z=None,
-    bid=None,
-    rec_jump=None,
-    z_prime=None,
-    is_border=None,
-    basin_saddle=None,
-    basin_saddlenode=None,
-    outlet=None,
-    rerouted=None,
-    tag=None,
-    tag_alt=None,
-    rec_scratch=None,
-    basin_route=None,
-    b_rcv=None,
     n_flat: int,
     block_size: int = 256,
 ):
     """
-    Compile the outer depression-resolution loop over a dict from
+    Construct the inert depression-routing sequence for the public solver
+    factory.
     make_depressions, as a compiled Sequence (sequence.py) - see the
     module docstring for its shape:
 
@@ -843,37 +820,11 @@ def make_depression_solver(
             label_basins; saddlesort; reroute; zero_ndep(); depression_counter()
 
     `method`/`reroute` must be the ones `deps` was built with; they decide
-    which buffers are required and how they map onto each step's DATA
-    addresses (`_bind_by_leaf`, above - a data buffer is bound wherever its
-    argument NAME occurs anywhere in the composed tree, regardless of how
-    many real launches that step split into per backend). Every buffer is a
-    raw device buffer (a DataHandle's `.data`), n_flat-sized,
-    caller-allocated - this factory allocates nothing.
+    which DATA addresses its explicit binding helper fills. The frozen result
+    carries no live buffers.
 
-    `grid_params` is the `make_grid_parameters` dict (../grid/__init__.py)
-    backing the same grid `make_depressions` composed - every "grid.<NAME>"
-    occurrence anywhere in this sequence's composed tree is bound to
-    `grid_params[<NAME>]` (`_bind_grid_everywhere`).
-
-    Required in every combination: `rec` (the authoritative receiver buffer,
-    read at entry, resolved on return), `z`, `bid`, `rec_jump`, `z_prime`,
-    `is_border`, `basin_saddle`, `basin_saddlenode`, `outlet`. reroute="jump"
-    and method="vanilla"+reroute="carve" additionally need `rerouted`; that
-    same vanilla carve additionally needs `tag`, `tag_alt` and `rec_scratch`.
-    `rerouted` is zeroed by the jump reroute itself but not by the carve one -
-    a caller wanting it to mean "rerouted by this call" zeroes it beforehand.
-
-    `n_flat` is required (it sets cupy's launch dimensions and is otherwise
-    unused - taichi/quadrants range over the buffers themselves, but every
-    KernelBuilder in `deps` was itself already built against this same
-    `n_flat`, see make_depressions).
-
-    Parameters
-    ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
-    deps : dict
-        A make_depressions() result.
+    Live DATA and grid Parameters are supplied later to
+    :func:`bind_depression_solver`; ``deps`` supplies every frozen child.
     grid_params : dict
         The make_grid_parameters() dict backing the same grid.
     method : str, optional
@@ -907,17 +858,6 @@ def make_depression_solver(
         raise ValueError(f"make_depression_solver: method must be one of {sorted(_DEP_METHODS)}, got {method!r}")
     if reroute not in _DEP_REROUTES:
         raise ValueError(f"make_depression_solver: reroute must be one of {sorted(_DEP_REROUTES)}, got {reroute!r}")
-    _require(
-        "every combination", rec=rec, z=z, bid=bid, rec_jump=rec_jump, z_prime=z_prime,
-        is_border=is_border, basin_saddle=basin_saddle, basin_saddlenode=basin_saddlenode,
-        outlet=outlet, b_rcv=b_rcv,
-    )
-    if reroute == "jump" or (reroute == "carve" and method == "vanilla"):
-        _require("reroute='jump' or method='vanilla'+reroute='carve'", rerouted=rerouted)
-    if reroute == "carve" and method == "vanilla":
-        _require("method='vanilla', reroute='carve'", tag=tag, tag_alt=tag_alt, rec_scratch=rec_scratch)
-    _require("depression routing", basin_route=basin_route)
-
     ndep_p = deps["ndep_p"]
 
     def _zero_ndep_tmpl(ctx):
@@ -932,23 +872,23 @@ def make_depression_solver(
     def _resolved_tmpl(ctx):
         return int(ctx.NDEP.read()) == 0
 
-    zero_ndep_hb = HostBlockBuilder().wire_param("NDEP").ingest(_zero_ndep_tmpl)
-    entry_passes_hb = HostBlockBuilder().wire_param("NDEP").ingest(_entry_passes_tmpl)
-    resolved_hb = HostBlockBuilder().wire_param("NDEP").ingest(_resolved_tmpl)
+    zero_ndep_hb = HostBlockBuilder(_zero_ndep_tmpl).freeze()
+    entry_passes_hb = HostBlockBuilder(_entry_passes_tmpl).freeze()
+    resolved_hb = HostBlockBuilder(_resolved_tmpl).freeze()
 
     sb = SequenceBuilder()
-    sb.compose("zero_ndep", zero_ndep_hb)
-    sb.compose("depression_counter", deps["depression_counter"])
-    sb.compose("label_basins", deps["label_basins"])
-    sb.compose("saddlesort", deps["saddlesort"])
-    sb.compose("reroute", deps["reroute"])
-    sb.compose("entry_passes", entry_passes_hb)
-    sb.compose("resolved", resolved_hb)
+    sb.add("zero_ndep", zero_ndep_hb)
+    sb.add("depression_counter", deps["depression_counter"])
+    sb.add("label_basins", deps["label_basins"])
+    sb.add("saddlesort", deps["saddlesort"])
+    sb.add("reroute", deps["reroute"])
+    sb.add("entry_passes", entry_passes_hb)
+    sb.add("resolved", resolved_hb)
     # carry basin identity across rounds (both methods): seed basin_route = rec
     # once, then merge each resolved basin into its receiver every round (OG
     # loop) - the forest guarantee both carve variants rely on.
-    sb.compose("init_basin_route", deps["copy_field"])
-    sb.compose("merge", deps["merge_basin_route"])
+    sb.add("init_basin_route", deps["copy_field"])
+    sb.add("merge", deps["merge_basin_route"])
 
     sb.step("zero_ndep")
     sb.step("depression_counter")
@@ -959,70 +899,167 @@ def make_depression_solver(
         until="resolved",
     )
 
-    frozen = sb.freeze()
-    bound = frozen.build()
+    return sb.freeze(), {"NDEP": ndep_p}
 
+
+def bind_depression_solver(
+    frozen, grid_params: dict, *, ndep_p, method: str, reroute: str,
+    rec, z, bid, rec_jump, z_prime, is_border, basin_saddle,
+    basin_saddlenode, outlet, rerouted=None, tag=None, tag_alt=None,
+    rec_scratch=None, basin_route=None, b_rcv=None,
+):
+    """Bind live :class:`DataHandle` objects to a frozen depression sequence.
+
+    This deliberately performs no compilation.  The caller owns the returned
+    bound sequence and selects its launch configuration at ``.compile()``.
+    """
+    _require("every combination", rec=rec, z=z, bid=bid, rec_jump=rec_jump,
+             z_prime=z_prime, is_border=is_border, basin_saddle=basin_saddle,
+             basin_saddlenode=basin_saddlenode, outlet=outlet, b_rcv=b_rcv,
+             basin_route=basin_route)
+    if reroute == "jump" or (reroute == "carve" and method == "vanilla"):
+        _require("reroute data", rerouted=rerouted)
+    if reroute == "carve" and method == "vanilla":
+        _require("vanilla carve data", tag=tag, tag_alt=tag_alt, rec_scratch=rec_scratch)
+    bound = frozen.build()
     for name in ("zero_ndep", "entry_passes", "resolved"):
         bound.bind((name, "NDEP"), ndep_p)
     bound.bind(("depression_counter", "rec"), rec)
-    bound.bind(("depression_counter", "ndep"), ndep_p.get().data)
-
-    # label_basins: leaf-name binding copes with "vanilla" (a FrozenRoutine,
-    # basin_id_init/propagate_iter_K/propagate_basin_final) and "optimized"
-    # (a bare FrozenKernel on closure, a 3-step FrozenRoutine on cupy)
-    # uniformly. copy_field's own generic "src"/"dst" leaves are ambiguous
-    # across occurrences, so that one path is bound explicitly.
-    # route labelling: contract steps use `rec_jump`, label uses `basin_route`;
-    # both bound to the carried basin_route buffer.
-    bound.bind_leaf(
-        {"rec_jump": basin_route, "basin_route": basin_route, "bid": bid},
-        prefix=("label_basins",),
-    )
+    bound.bind(("depression_counter", "ndep"), ndep_p.handle())
+    bound.bind_leaf({"rec_jump": basin_route, "basin_route": basin_route, "bid": bid}, prefix=("label_basins",))
     bound.bind(("init_basin_route", "src"), rec)
     bound.bind(("init_basin_route", "dst"), basin_route)
     bound.bind_leaf({"outlet": outlet, "basin_route": basin_route}, prefix=("merge",))
-
-    bound.bind_leaf(
-        {
-            "bid": bid, "z": z, "z_prime": z_prime, "is_border": is_border,
-            "basin_saddle": basin_saddle, "basin_saddlenode": basin_saddlenode,
-            "outlet": outlet, "b_rcv": b_rcv,
-        },
-        prefix=("saddlesort",),
-    )
-
+    bound.bind_leaf({"bid": bid, "z": z, "z_prime": z_prime, "is_border": is_border,
+                     "basin_saddle": basin_saddle, "basin_saddlenode": basin_saddlenode,
+                     "outlet": outlet, "b_rcv": b_rcv}, prefix=("saddlesort",))
     if reroute == "carve" and method == "vanilla":
-        # NOTE the naming: build_reroute_carve_vanilla's own "rec" data name is
-        # the routine's actively pointer-jumped internal chain - bound to the
-        # caller's rec_scratch, not the caller's real rec - and its own
-        # "rec_work" is free mid-routine scratch space, bound to the caller's
-        # REAL rec buffer (safe: it holds no meaningful graph until the very
-        # last copy_field step writes the finalised result back into it from
-        # rec_scratch). See make_depressions' own docstring, "Buffer naming".
-        leaf_map = {
-            "tag": tag, "tag_alt": tag_alt, "rec": rec_scratch, "rec_work": rec, "bid": bid,
-            "saddlenode": basin_saddlenode, "outlet": outlet, "rerouted": rerouted, "rec_orig": rec_jump,
-        }
-        bound.bind_leaf(leaf_map, prefix=("reroute",))
+        bound.bind_leaf({"tag": tag, "tag_alt": tag_alt, "rec": rec_scratch,
+                         "rec_work": rec, "bid": bid, "saddlenode": basin_saddlenode,
+                         "outlet": outlet, "rerouted": rerouted, "rec_orig": rec_jump}, prefix=("reroute",))
         _bind_if_present(bound, ("reroute", "copy_recwork_to_rec", "src"), rec)
         _bind_if_present(bound, ("reroute", "copy_recwork_to_rec", "dst"), rec_scratch)
         _bind_if_present(bound, ("reroute", "copy_recwork_to_recjump", "src"), rec)
         _bind_if_present(bound, ("reroute", "copy_recwork_to_recjump", "dst"), rec_jump)
         _bind_if_present(bound, ("reroute", "copy_rec_to_recwork", "src"), rec_scratch)
         _bind_if_present(bound, ("reroute", "copy_rec_to_recwork", "dst"), rec)
-    elif reroute == "carve":  # optimized
+    elif reroute == "carve":
         bound.bind_leaf({"rec": rec, "basin_saddlenode": basin_saddlenode, "outlet": outlet}, prefix=("reroute",))
-    else:  # jump
-        bound.bind_leaf({"rec": rec, "outlet": outlet, "rerouted": rerouted}, prefix=("reroute",))
-
-    _bind_grid_everywhere(bound, grid_params)
-
-    grid_dims = ((int(n_flat) + block_size - 1) // block_size,), (block_size,)
-    if backend == "cupy":
-        compiled = bound.compile(backend, grid=grid_dims[0], block=grid_dims[1])
     else:
-        compiled = bound.compile(backend)
-    return compiled
+        bound.bind_leaf({"rec": rec, "outlet": outlet, "rerouted": rerouted}, prefix=("reroute",))
+    _bind_grid_everywhere(bound, grid_params)
+    return bound
+
+
+def depression_binding_plan(frozen, *, method: str, reroute: str) -> dict[str, str]:
+    """Return Program's declarative binding map for a depression solver.
+
+    This is the structural counterpart of :func:`bind_depression_solver`: it
+    records program-value names, never receives live Parameters or handles and
+    never compiles.  Program remains the sole bind/compile owner.
+    """
+    bound = frozen.build()
+    plan: dict[str, str] = {}
+    try:
+        addrs = bound.addresses()
+
+        def put(addr, value):
+            if tuple(addr) in addrs:
+                plan[".".join(addr)] = value
+
+        def leaf(prefix, values):
+            p = tuple(prefix)
+            for addr in addrs:
+                if addr[:len(p)] == p and addr[-1] in values:
+                    plan[".".join(addr)] = values[addr[-1]]
+
+        for name in ("zero_ndep", "entry_passes", "resolved"):
+            put((name, "NDEP"), "ndep")
+        put(("depression_counter", "rec"), "rec")
+        put(("depression_counter", "ndep"), "ndep.handle")
+        leaf(("label_basins",), {"rec_jump": "basin_route", "basin_route": "basin_route", "bid": "bid"})
+        put(("init_basin_route", "src"), "rec")
+        put(("init_basin_route", "dst"), "basin_route")
+        leaf(("merge",), {"outlet": "outlet", "basin_route": "basin_route"})
+        leaf(("saddlesort",), {"bid": "bid", "z": "z", "z_prime": "z_prime", "is_border": "is_border", "basin_saddle": "basin_saddle", "basin_saddlenode": "basin_saddlenode", "outlet": "outlet", "b_rcv": "b_rcv"})
+        if reroute == "carve" and method == "vanilla":
+            leaf(("reroute",), {"tag": "tag", "tag_alt": "tag_alt", "rec": "rec_scratch", "rec_work": "rec", "bid": "bid", "saddlenode": "basin_saddlenode", "outlet": "outlet", "rerouted": "rerouted", "rec_orig": "rec_jump"})
+            put(("reroute", "copy_recwork_to_rec", "src"), "rec")
+            put(("reroute", "copy_recwork_to_rec", "dst"), "rec_scratch")
+            put(("reroute", "copy_recwork_to_recjump", "src"), "rec")
+            put(("reroute", "copy_recwork_to_recjump", "dst"), "rec_jump")
+            put(("reroute", "copy_rec_to_recwork", "src"), "rec_scratch")
+            put(("reroute", "copy_rec_to_recwork", "dst"), "rec")
+        elif reroute == "carve":
+            leaf(("reroute",), {"rec": "rec", "basin_saddlenode": "basin_saddlenode", "outlet": "outlet"})
+        else:
+            leaf(("reroute",), {"rec": "rec", "outlet": "outlet", "rerouted": "rerouted"})
+        for addr in addrs:
+            if len(addr) >= 2 and addr[-2] == "grid":
+                plan[".".join(addr)] = "grid"
+        return plan
+    finally:
+        bound.close()
+
+
+def bind_fill_reconstruct_solver(
+    frozen, grid_params: dict, *, z, filled, parent, frontier, counters,
+    queued_gen, pass_p, active_p,
+):
+    """Bind live :class:`DataHandle` objects to a frozen reconstruction sequence."""
+    _require("fill reconstruction", z=z, filled=filled, parent=parent,
+             frontier=frontier, counters=counters, queued_gen=queued_gen,
+             pass_p=pass_p, active_p=active_p)
+    bound = frozen.build()
+    zpf = {"z": z, "filled": filled, "parent": parent}
+    for step in ("init_filled", "sweep_row_lr", "sweep_row_rl", "sweep_col_tb", "sweep_col_bt"):
+        bound.bind_leaf(zpf, prefix=(step,))
+    bound.bind_leaf({"z": z, "filled": filled, "frontier": frontier, "counters": counters}, prefix=("frontier_init",))
+    bound.bind_leaf({"z": z, "filled": filled, "parent": parent, "frontier": frontier,
+                     "counters": counters, "queued_gen": queued_gen}, prefix=("relax",))
+    bound.bind(("relax", "active"), active_p.handle())
+    bound.bind(("relax", "P"), pass_p)
+    bound.bind(("zero_pass", "P"), pass_p)
+    bound.bind(("bump_pass", "P"), pass_p)
+    bound.bind(("zero_active", "ACTIVE"), active_p)
+    bound.bind(("converged", "ACTIVE"), active_p)
+    _bind_grid_everywhere(bound, grid_params)
+    return bound
+
+
+def make_fill_reconstruct_solver(
+    be: Backend, deps: dict, grid_params: dict, *, pass_p, active_p,
+    n_flat: int, nx: int, ny: int, block_size: int = 256,
+    max_passes: int | None = None,
+):
+    """Build the reconstruction solver and return ``(FrozenSequence, params)``.
+
+    Callers own and bind all DATA handles; only the two host-loop Parameters
+    are returned in ``params``.
+    """
+    be = require_backend(be)
+    return _build_fill_reconstruct_sequence(
+        be, deps, grid_params, pass_p=pass_p, active_p=active_p,
+        n_flat=n_flat, nx=nx, ny=ny, block_size=block_size,
+        max_passes=max_passes,
+    )
+
+
+def make_depression_solver(
+    be: Backend, deps: dict, grid_params: dict, *, method: str = "vanilla",
+    reroute: str = "carve", n_flat: int, block_size: int = 256,
+):
+    """Build the depression solver and return ``(FrozenSequence, params)``.
+
+    DATA is deliberately absent from this factory: callers bind live
+    ``DataHandle`` objects to the returned sequence before compiling it.
+    The result contains no live DATA binding and can be reused safely.
+    """
+    be = require_backend(be)
+    return _build_depression_solver_sequence(
+        be, deps, grid_params, method=method, reroute=reroute,
+        n_flat=n_flat, block_size=block_size,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1074,7 @@ def make_depression_solver(
 
 
 def make_fill_reconstruct(
-    backend: str,
+    be: Backend,
     grid,
     *,
     nx: int,
@@ -1079,17 +1116,18 @@ def make_fill_reconstruct(
 
     Author: B.G (08/2026)
     """
-    backend_mod = backend_classes(backend).module
-    blocks = _blocks_for(backend, "reconstruct")
+    be = require_backend(be)
+    backend_mod = be.module
+    blocks = _blocks_for(be, "reconstruct")
     n_flat_resolved = int(nx) * int(ny)
-    closure = backend in ("taichi", "quadrants")
+    closure = be.family == "closure"
 
     if closure:
-        init_filled = blocks.build_fill_reconstruct_init(backend=backend, backend_mod=backend_mod, grid=grid)
-        sweeps = blocks.build_fill_reconstruct_sweeps(backend=backend, backend_mod=backend_mod, nx=nx, ny=ny)
-        frontier_init = blocks.build_fill_reconstruct_frontier_init(backend=backend, backend_mod=backend_mod)
+        init_filled = blocks.build_fill_reconstruct_init(backend=be.name, backend_mod=backend_mod, grid=grid)
+        sweeps = blocks.build_fill_reconstruct_sweeps(backend=be.name, backend_mod=backend_mod, nx=nx, ny=ny)
+        frontier_init = blocks.build_fill_reconstruct_frontier_init(backend=be.name, backend_mod=backend_mod)
         relax = blocks.build_fill_reconstruct_relax(
-            backend=backend, backend_mod=backend_mod, grid=grid, n_flat=n_flat_resolved,
+            backend=be.name, backend_mod=backend_mod, grid=grid, n_flat=n_flat_resolved,
         )
     else:
         init_filled = blocks.build_fill_reconstruct_init(grid=grid, n_flat=n_flat_resolved)
@@ -1103,19 +1141,13 @@ def make_fill_reconstruct(
     return out
 
 
-def make_fill_reconstruct_solver(
-    backend: str,
+def _build_fill_reconstruct_sequence(
+    be: Backend,
     deps: dict,
     grid_params: dict,
     *,
-    z=None,
-    filled=None,
-    parent=None,
-    frontier=None,
-    counters=None,
-    queued_gen=None,
-    pass_p=None,
-    active_p=None,
+    pass_p,
+    active_p,
     n_flat: int,
     nx: int,
     ny: int,
@@ -1123,8 +1155,8 @@ def make_fill_reconstruct_solver(
     max_passes: int | None = None,
 ):
     """
-    Compile the reconstruction-fill outer loop over a dict from
-    make_fill_reconstruct, as a compiled Sequence (sequence.py):
+    Construct the inert reconstruction-fill outer loop over a dict from
+    make_fill_reconstruct:
 
         init_filled; sweep_row_lr; sweep_row_rl; sweep_col_tb; sweep_col_bt;
         frontier_init -> counters[0]
@@ -1144,9 +1176,8 @@ def make_fill_reconstruct_solver(
     A `converged` host block reads it back with `.read()` after each
     iteration; the loop stops once a pass pushes nothing.
 
-    Every buffer is a raw device buffer (a DataHandle's `.data`),
-    caller-allocated - this factory allocates nothing, matching
-    make_depression_solver. Required: `z` (n_flat,), `filled` (n_flat,),
+    The binding helper receives caller-owned DataHandles: `z` (n_flat,),
+    `filled` (n_flat,),
     `parent` (n_flat,) i32 - `filled`/`parent` need no caller-side init,
     `init_filled` seeds both; `frontier` (2*n_flat,) i32 - the two ping-pong
     halves combined into one buffer (see make_fill_reconstruct's module
@@ -1169,43 +1200,11 @@ def make_fill_reconstruct_solver(
     measured ~0.6x that ratio in
     experimental/LM/fill_reconstruct_optimised.py.
 
-    Parameters
-    ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
-    deps : dict
-        A make_fill_reconstruct() result.
-    grid_params : dict
-        Unused - accepted for call-site parity with make_depression_solver
-        (relax's own `grid` PARAM addresses are bound directly via
-        `_bind_grid_everywhere`).
-    z, filled, parent, frontier, counters, queued_gen : DataHandle
-        Required buffers - see above for shapes and caller-side init needs.
-    pass_p, active_p : Parameter
-        Required caller-allocated scalar i32 Parameters - see above.
-    n_flat, nx, ny : int
-        Required.
-    block_size : int, optional
-        cupy CUDA block size (default 256); unused on taichi/quadrants.
-    max_passes : int, optional
-        Defaults to `4 * max(nx, ny)`.
+    The result is an inert FrozenSequence; :func:`bind_fill_reconstruct_solver`
+    supplies the live DATA and grid Parameter bindings.
 
-    Returns
-    -------
-    CompiledSequence
-        Takes no arguments.
-
-    Raises
-    ------
-    ValueError
-        If a required buffer/Parameter is missing.
-
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
-    _require(
-        "make_fill_reconstruct_solver", z=z, filled=filled, parent=parent,
-        frontier=frontier, counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
-    )
     if max_passes is None:
         max_passes = 4 * max(int(nx), int(ny))
 
@@ -1221,23 +1220,23 @@ def make_fill_reconstruct_solver(
     def _converged_tmpl(ctx):
         return int(ctx.ACTIVE.read()) == 0
 
-    zero_pass_hb = HostBlockBuilder().wire_param("P").ingest(_zero_pass_tmpl)
-    bump_pass_hb = HostBlockBuilder().wire_param("P").ingest(_bump_pass_tmpl)
-    zero_active_hb = HostBlockBuilder().wire_param("ACTIVE").ingest(_zero_active_tmpl)
-    converged_hb = HostBlockBuilder().wire_param("ACTIVE").ingest(_converged_tmpl)
+    zero_pass_hb = HostBlockBuilder(_zero_pass_tmpl).freeze()
+    bump_pass_hb = HostBlockBuilder(_bump_pass_tmpl).freeze()
+    zero_active_hb = HostBlockBuilder(_zero_active_tmpl).freeze()
+    converged_hb = HostBlockBuilder(_converged_tmpl).freeze()
 
     sb = SequenceBuilder()
-    sb.compose("init_filled", deps["init_filled"])
-    sb.compose("sweep_row_lr", deps["sweep_row_lr"])
-    sb.compose("sweep_row_rl", deps["sweep_row_rl"])
-    sb.compose("sweep_col_tb", deps["sweep_col_tb"])
-    sb.compose("sweep_col_bt", deps["sweep_col_bt"])
-    sb.compose("frontier_init", deps["frontier_init"])
-    sb.compose("zero_pass", zero_pass_hb)
-    sb.compose("relax", deps["relax"])
-    sb.compose("bump_pass", bump_pass_hb)
-    sb.compose("zero_active", zero_active_hb)
-    sb.compose("converged", converged_hb)
+    sb.add("init_filled", deps["init_filled"])
+    sb.add("sweep_row_lr", deps["sweep_row_lr"])
+    sb.add("sweep_row_rl", deps["sweep_row_rl"])
+    sb.add("sweep_col_tb", deps["sweep_col_tb"])
+    sb.add("sweep_col_bt", deps["sweep_col_bt"])
+    sb.add("frontier_init", deps["frontier_init"])
+    sb.add("zero_pass", zero_pass_hb)
+    sb.add("relax", deps["relax"])
+    sb.add("bump_pass", bump_pass_hb)
+    sb.add("zero_active", zero_active_hb)
+    sb.add("converged", converged_hb)
 
     sb.step("init_filled")
     sb.step("sweep_row_lr")
@@ -1248,26 +1247,4 @@ def make_fill_reconstruct_solver(
     sb.step("zero_pass")
     sb.loop(body=["zero_active", "relax", "bump_pass"], max_times=int(max_passes), until="converged")
 
-    frozen = sb.freeze()
-    bound = frozen.build()
-
-    zpf = {"z": z, "filled": filled, "parent": parent}
-    for step in ("init_filled", "sweep_row_lr", "sweep_row_rl", "sweep_col_tb", "sweep_col_bt"):
-        bound.bind_leaf(zpf, prefix=(step,))
-    bound.bind_leaf({"z": z, "filled": filled, "frontier": frontier, "counters": counters}, prefix=("frontier_init",))
-    bound.bind_leaf(
-        {"z": z, "filled": filled, "parent": parent, "frontier": frontier, "counters": counters, "queued_gen": queued_gen},
-        prefix=("relax",),
-    )
-    bound.bind(("relax", "active"), active_p.get().data)
-    bound.bind(("relax", "P"), pass_p)
-    bound.bind(("zero_pass", "P"), pass_p)
-    bound.bind(("bump_pass", "P"), pass_p)
-    bound.bind(("zero_active", "ACTIVE"), active_p)
-    bound.bind(("converged", "ACTIVE"), active_p)
-    _bind_grid_everywhere(bound, grid_params)
-
-    grid_dims = ((int(n_flat) + block_size - 1) // block_size,), (block_size,)
-    if backend == "cupy":
-        return bound.compile(backend, grid=grid_dims[0], block=grid_dims[1])
-    return bound.compile(backend)
+    return sb.freeze(), {"P": pass_p, "ACTIVE": active_p}

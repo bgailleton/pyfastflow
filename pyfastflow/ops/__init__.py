@@ -43,7 +43,7 @@ have no block-level reduction primitive this wraps.
 `make_scan`'s returned Parameter (`Scan.count_param`) is handed back bare,
 not wrapped in anything - there is no Need-shaped wrapper in this stack to
 reach for; a caller wanting it bound into its own KernelBuilder does so
-exactly like any other Parameter (`kb.wire_param("count"); bound.bind(
+exactly like any other Parameter (`kb.param("count"); bound.bind(
 "count", scan.count_param)`). `make_reduce`'s returned handles
 (`Reduce.{sum,min,max,argmin}_data`) are bare DataHandles instead, not
 Parameters - see "Reduce's DATA-not-PARAM accumulator" below for why a
@@ -89,10 +89,10 @@ Author: B.G (08/2026)
 
 import numpy as np
 
-from ..core.context.backends import backend_classes
+from ..core import Backend, require_backend
 
 
-def _blocks_for(backend: str):
+def _blocks_for(be: Backend):
     """
     The private block module implementing one of this package's factories
     for a given backend name: the closure blocks (shared by Taichi and
@@ -100,16 +100,16 @@ def _blocks_for(backend: str):
 
     Author: B.G (08/2026)
     """
-    if backend in ("taichi", "quadrants"):
+    if be.family == "closure":
         from . import _closure_blocks as blocks
-    elif backend == "cupy":
+    elif be.family == "cupy":
         from . import _cupy_blocks as blocks
     else:
-        raise ValueError(f"ops: unknown backend {backend!r}, expected 'taichi', 'quadrants' or 'cupy'")
+        raise ValueError(f"ops: unsupported backend family {be.family!r}")
     return blocks
 
 
-def make_bitpack_group(backend: str) -> "FrozenGroup":
+def make_bitpack_group(be: Backend) -> "FrozenGroup":
     """
     pack(f, i) -> i64, unpack_value(p) -> f32, unpack_index(p) -> i32: pack a
     float and an int32 index into one i64 so that an atomic_min over the
@@ -129,10 +129,10 @@ def make_bitpack_group(backend: str) -> "FrozenGroup":
 
     Author: B.G (08/2026)
     """
-    return _blocks_for(backend).build_bitpack_group()
+    return _blocks_for(require_backend(be)).build_bitpack_group()
 
 
-def make_math_group(backend: str) -> "FrozenGroup":
+def make_math_group(be: Backend) -> "FrozenGroup":
     """
     atan(x) and nextafter(x, y) (f32), filling in for the two functions
     Taichi/Quadrants/CUDA device code has no direct equivalent for - composed
@@ -149,10 +149,10 @@ def make_math_group(backend: str) -> "FrozenGroup":
 
     Author: B.G (08/2026)
     """
-    return _blocks_for(backend).build_math_group()
+    return _blocks_for(require_backend(be)).build_math_group()
 
 
-def make_elementwise(backend: str, *, n: "int | None" = None) -> dict:
+def make_elementwise(be: Backend, *, n: "int | None" = None) -> dict:
     """
     swap, add_B_to_A, add_B_to_weighted_A, weighted_mean_B_in_A, arange,
     multiply_by_scalar over a flat buffer, as unbuilt FrozenKernels - call
@@ -187,16 +187,16 @@ def make_elementwise(backend: str, *, n: "int | None" = None) -> dict:
 
     Author: B.G (08/2026)
     """
-    blocks = _blocks_for(backend)
-    if backend == "cupy":
+    be = require_backend(be)
+    blocks = _blocks_for(be)
+    if be.family == "cupy":
         if n is None:
             raise ValueError("make_elementwise: cupy requires n (the buffer length)")
         return blocks.build_elementwise(n)
-    backend_mod = backend_classes(backend).module
-    return blocks.build_elementwise(backend, backend_mod)
+    return blocks.build_elementwise(be.name, be.module)
 
 
-def make_slope_group(backend: str, grid: "FrozenGroup") -> "FrozenGroup":
+def make_slope_group(be: Backend, grid: "FrozenGroup") -> "FrozenGroup":
     """
     sumslope_downstream(z, i): sum of (z[i]-z[j])/dx over every downstream
     neighbour of i. slope_dir(z, i, k): the signed slope towards neighbour k,
@@ -218,10 +218,10 @@ def make_slope_group(backend: str, grid: "FrozenGroup") -> "FrozenGroup":
 
     Author: B.G (08/2026)
     """
-    return _blocks_for(backend).build_slope_group(grid)
+    return _blocks_for(require_backend(be)).build_slope_group(grid)
 
 
-def make_block_reduce_group(backend: str, *, block_size: int = 128) -> "FrozenGroup":
+def make_block_reduce_group(be: Backend, *, block_size: int = 128) -> "FrozenGroup":
     """
     cupy only: `sum(val)`, one cub::BlockReduce<float, 128>::Sum() per
     calling CUDA block - composed under the name "sum". Raises on Taichi/
@@ -249,8 +249,9 @@ def make_block_reduce_group(backend: str, *, block_size: int = 128) -> "FrozenGr
 
     Author: B.G (08/2026)
     """
-    if backend != "cupy":
-        raise ValueError(f"make_block_reduce_group: only supported on cupy, got {backend!r}")
+    be = require_backend(be)
+    if be.family != "cupy":
+        raise ValueError(f"make_block_reduce_group: only supported on cupy, got {be.name!r}")
     from . import _cupy_blocks as blocks
 
     return blocks.build_block_reduce_group(block_size=block_size)
@@ -297,7 +298,7 @@ class Scan:
         return int(self.count_param.read())
 
 
-def make_scan(backend: str, pool, n: int) -> Scan:
+def make_scan(be: Backend, pool, n: int) -> Scan:
     """
     Build one Scan over i32 buffers of length `n`.
 
@@ -322,81 +323,82 @@ def make_scan(backend: str, pool, n: int) -> Scan:
 
     Author: B.G (08/2026)
     """
-    _bk = backend_classes(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
-    blocks = _blocks_for(backend)
+    be = require_backend(be)
+    ParamCls, dtypes = be.ParameterCls, be.dtypes
+    blocks = _blocks_for(be)
 
-    if backend == "cupy":
+    if be.family == "cupy":
         import cupy as cp
 
         scan_out_h = pool.get_data(np.int32, (n,))
-        count_p = ParamCls("SCAN_COUNT", dtype=dtypes["i32"], mode="scalar", value=0, pool=pool)
+        count_p = ParamCls("SCAN_COUNT", dtype="i32", mode="scalar", value=0, pool=pool)
 
         routine_frozen = blocks.build_count_and_scatter_routine(n)
         bound = routine_frozen.build()
-        bound.bind("read_count.scan_out", scan_out_h.data)
+        bound.bind("read_count.scan_out", scan_out_h)
         bound.bind("read_count.COUNT", count_p)
-        bound.bind("scatter.flags", scan_out_h.data)  # placeholder, swapped every .compact() call
-        bound.bind("scatter.scan_out", scan_out_h.data)
-        bound.bind("scatter.ids", scan_out_h.data)  # placeholder, swapped every .compact() call
-        compiled_routine = bound.compile("cupy")
+        bound.bind("scatter.flags", scan_out_h)  # placeholder, swapped every .compact() call
+        bound.bind("scatter.scan_out", scan_out_h)
+        bound.bind("scatter.ids", scan_out_h)  # placeholder, swapped every .compact() call
+        compiled_routine = bound.compile(be)
 
         def inclusive_fn(input_handle, output_handle):
-            cp.cumsum(input_handle.data, out=output_handle.data)
+            cp.cumsum(input_handle.array, out=output_handle.array)
 
         def compact_fn(flags_handle, ids_handle):
-            cp.cumsum(flags_handle.data, out=scan_out_h.data)
-            compiled_routine.swap("scatter.flags", flags_handle.data)
-            compiled_routine.swap("scatter.ids", ids_handle.data)
+            cp.cumsum(flags_handle.array, out=scan_out_h.array)
+            compiled_routine.swap("scatter.flags", flags_handle)
+            compiled_routine.swap("scatter.ids", ids_handle)
             compiled_routine()
             return int(count_p.read())
 
         return Scan(inclusive_fn, compact_fn, count_p)
 
     # Taichi / Quadrants
-    backend_mod = backend_classes(backend).module
+    backend_mod = be.module
     work_size = blocks.next_pow2(n)
     work_h = pool.get_data(dtypes["i32"], (work_size,))
     scan_out_scratch = pool.get_data(dtypes["i32"], (n,))
-    count_p = ParamCls("SCAN_COUNT", dtype=dtypes["i32"], mode="scalar", value=0, pool=pool)
+    count_p = ParamCls("SCAN_COUNT", dtype="i32", mode="scalar", value=0, pool=pool)
 
-    routine_frozen = blocks.build_scan_routine(backend, backend_mod, n, work_size)
+    routine_frozen = blocks.build_scan_routine(be.name, backend_mod, n, work_size)
     bound = routine_frozen.build()
     for name in routine_frozen.order:
-        bound.bind(f"{name}.work", work_h.data)
-    bound.bind("copy_in.src", work_h.data)  # placeholder, swapped every call
-    bound.bind("inclusive_copy.inp", work_h.data)  # placeholder, swapped every call
-    bound.bind("inclusive_copy.out", work_h.data)  # placeholder, swapped every call
-    compiled_routine = bound.compile(backend)
+        bound.bind(f"{name}.work", work_h)
+    bound.bind("copy_in.src", work_h)  # placeholder, swapped every call
+    bound.bind("inclusive_copy.inp", work_h)  # placeholder, swapped every call
+    bound.bind("inclusive_copy.out", work_h)  # placeholder, swapped every call
+    compiled_routine = bound.compile(be)
 
-    read_count_frozen, scatter_frozen = blocks.build_count_and_scatter_kernels(backend, backend_mod, n)
+    read_count_frozen, scatter_frozen = blocks.build_count_and_scatter_kernels(be.name, backend_mod, n)
     read_count_bound = read_count_frozen.build()
-    read_count_bound.bind("scan_out", scan_out_scratch.data)
+    read_count_bound.bind("scan_out", scan_out_scratch)
     read_count_bound.bind("COUNT", count_p)
-    read_count_compiled = read_count_bound.compile(backend)
+    read_count_compiled = read_count_bound.compile(be)
 
     scatter_bound = scatter_frozen.build()
-    scatter_bound.bind("flags", scan_out_scratch.data)  # placeholder, swapped every .compact() call
-    scatter_bound.bind("scan_out", scan_out_scratch.data)
-    scatter_bound.bind("ids", scan_out_scratch.data)  # placeholder, swapped every .compact() call
-    scatter_compiled = scatter_bound.compile(backend)
+    scatter_bound.bind("flags", scan_out_scratch)  # placeholder, swapped every .compact() call
+    scatter_bound.bind("scan_out", scan_out_scratch)
+    scatter_bound.bind("ids", scan_out_scratch)  # placeholder, swapped every .compact() call
+    scatter_compiled = scatter_bound.compile(be)
 
     def inclusive_fn(input_handle, output_handle):
-        compiled_routine.swap("copy_in.src", input_handle.data)
-        compiled_routine.swap("inclusive_copy.inp", input_handle.data)
-        compiled_routine.swap("inclusive_copy.out", output_handle.data)
+        compiled_routine.swap("copy_in.src", input_handle)
+        compiled_routine.swap("inclusive_copy.inp", input_handle)
+        compiled_routine.swap("inclusive_copy.out", output_handle)
         compiled_routine()
 
     def compact_fn(flags_handle, ids_handle):
-        compiled_routine.swap("copy_in.src", flags_handle.data)
-        compiled_routine.swap("inclusive_copy.inp", flags_handle.data)
-        compiled_routine.swap("inclusive_copy.out", scan_out_scratch.data)
+        compiled_routine.swap("copy_in.src", flags_handle)
+        compiled_routine.swap("inclusive_copy.inp", flags_handle)
+        compiled_routine.swap("inclusive_copy.out", scan_out_scratch)
         compiled_routine()
         read_count_compiled()
         count = int(count_p.read())
         if count <= 0:
             return 0
-        scatter_compiled.swap("flags", flags_handle.data)
-        scatter_compiled.swap("ids", ids_handle.data)
+        scatter_compiled.swap("flags", flags_handle)
+        scatter_compiled.swap("ids", ids_handle)
         scatter_compiled()
         return count
 
@@ -471,7 +473,7 @@ class Reduce:
         return self._host["argmin"]()
 
 
-def make_reduce(backend: str, pool, n: int) -> Reduce:
+def make_reduce(be: Backend, pool, n: int) -> Reduce:
     """
     Build one Reduce over f32 buffers of length `n`.
 
@@ -500,9 +502,10 @@ def make_reduce(backend: str, pool, n: int) -> Reduce:
 
     Author: B.G (08/2026)
     """
-    dtypes = backend_classes(backend).dtypes
+    be = require_backend(be)
+    dtypes = be.dtypes
 
-    if backend == "cupy":
+    if be.family == "cupy":
         import cupy as cp
 
         sum_h = pool.get_data(dtypes["f32"], ())
@@ -511,29 +514,29 @@ def make_reduce(backend: str, pool, n: int) -> Reduce:
         argmin_h = pool.get_data(np.int64, ())
 
         def run_sum(handle):
-            sum_h.data[...] = cp.sum(handle.data)
+            sum_h.array[...] = cp.sum(handle.array)
 
         def run_min(handle):
-            min_h.data[...] = cp.min(handle.data)
+            min_h.array[...] = cp.min(handle.array)
 
         def run_max(handle):
-            max_h.data[...] = cp.max(handle.data)
+            max_h.array[...] = cp.max(handle.array)
 
         def run_argmin(handle):
-            argmin_h.data[...] = cp.argmin(handle.data).astype(cp.int64)
+            argmin_h.array[...] = cp.argmin(handle.array).astype(cp.int64)
 
         run = {"sum": run_sum, "min": run_min, "max": run_max, "argmin": run_argmin}
         host = {
-            "sum": lambda: float(sum_h.data.get()),
-            "min": lambda: float(min_h.data.get()),
-            "max": lambda: float(max_h.data.get()),
-            "argmin": lambda: int(argmin_h.data.get()),
+            "sum": lambda: float(sum_h.array.get()),
+            "min": lambda: float(min_h.array.get()),
+            "max": lambda: float(max_h.array.get()),
+            "argmin": lambda: int(argmin_h.array.get()),
         }
         return Reduce(sum_h, min_h, max_h, argmin_h, run, host)
 
     # Taichi / Quadrants
-    backend_mod = backend_classes(backend).module
-    blocks = _blocks_for(backend)
+    backend_mod = be.module
+    blocks = _blocks_for(be)
 
     sum_h = pool.get_data(dtypes["f32"], ())
     min_h = pool.get_data(dtypes["f32"], ())
@@ -545,54 +548,54 @@ def make_reduce(backend: str, pool, n: int) -> Reduce:
 
     bitpack_group = blocks.build_bitpack_group()
     sum_frozen, min_frozen, max_frozen, argmin_frozen, argmin_unpack_frozen = blocks.build_reduce_kernels(
-        backend, backend_mod, bitpack_group, n
+        be.name, backend_mod, bitpack_group, n
     )
 
     sum_bound = sum_frozen.build()
-    sum_bound.bind("acc", sum_h.data)
-    sum_bound.bind("x", sum_h.data)  # placeholder, swapped every call
-    sum_compiled = sum_bound.compile(backend)
+    sum_bound.bind("acc", sum_h)
+    sum_bound.bind("x", sum_h)  # placeholder, swapped every call
+    sum_compiled = sum_bound.compile(be)
 
     min_bound = min_frozen.build()
-    min_bound.bind("acc", min_h.data)
-    min_bound.bind("x", min_h.data)  # placeholder, swapped every call
-    min_compiled = min_bound.compile(backend)
+    min_bound.bind("acc", min_h)
+    min_bound.bind("x", min_h)  # placeholder, swapped every call
+    min_compiled = min_bound.compile(be)
 
     max_bound = max_frozen.build()
-    max_bound.bind("acc", max_h.data)
-    max_bound.bind("x", max_h.data)  # placeholder, swapped every call
-    max_compiled = max_bound.compile(backend)
+    max_bound.bind("acc", max_h)
+    max_bound.bind("x", max_h)  # placeholder, swapped every call
+    max_compiled = max_bound.compile(be)
 
     argmin_bound = argmin_frozen.build()
-    argmin_bound.bind("acc", argmin_packed_h.data)
-    argmin_bound.bind("x", argmin_packed_h.data)  # placeholder, swapped every call
-    argmin_compiled = argmin_bound.compile(backend)
+    argmin_bound.bind("acc", argmin_packed_h)
+    argmin_bound.bind("x", argmin_packed_h)  # placeholder, swapped every call
+    argmin_compiled = argmin_bound.compile(be)
 
     argmin_unpack_bound = argmin_unpack_frozen.build()
-    argmin_unpack_bound.bind("packed_acc", argmin_packed_h.data)
-    argmin_unpack_bound.bind("out", argmin_h.data)
-    argmin_unpack_compiled = argmin_unpack_bound.compile(backend)
+    argmin_unpack_bound.bind("packed_acc", argmin_packed_h)
+    argmin_unpack_bound.bind("out", argmin_h)
+    argmin_unpack_compiled = argmin_unpack_bound.compile(be)
 
     _argmin_identity = _closure_pack_identity()
 
     def run_sum(handle):
         sum_h.from_numpy(np.array(0.0, dtype=np.float32))
-        sum_compiled.swap("x", handle.data)
+        sum_compiled.swap("x", handle)
         sum_compiled()
 
     def run_min(handle):
         min_h.from_numpy(np.array(float("inf"), dtype=np.float32))
-        min_compiled.swap("x", handle.data)
+        min_compiled.swap("x", handle)
         min_compiled()
 
     def run_max(handle):
         max_h.from_numpy(np.array(float("-inf"), dtype=np.float32))
-        max_compiled.swap("x", handle.data)
+        max_compiled.swap("x", handle)
         max_compiled()
 
     def run_argmin(handle):
         argmin_packed_h.from_numpy(np.array(_argmin_identity, dtype=np.int64))
-        argmin_compiled.swap("x", handle.data)
+        argmin_compiled.swap("x", handle)
         argmin_compiled()
         argmin_unpack_compiled()
 

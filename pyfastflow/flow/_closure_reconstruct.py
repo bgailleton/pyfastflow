@@ -11,7 +11,7 @@ time, on every backend, not just cupy.
 See _closure_receivers.py/_closure_accum.py/_closure_depressions.py for
 the other flow algorithms.
 
-`P` is a plain wired PARAM slot (`wire_param`, any mode) on `relax` - a
+`P` is a plain PARAM slot (any mode) on `relax` - a
 caller binds a Parameter there (mode "scalar", since the host bumps it
 between passes) after `.build()`, exactly like make_accumulation's `ITER`;
 there is no Need indirection anywhere in this stack. `grid` is the caller's
@@ -44,7 +44,7 @@ directly against this Taichi/Quadrants install before use here:
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import KernelBuilder
+from ..core import KernelBuilder
 from ._closure_shared import _tensor_annotation
 
 _POS_SENTINEL = 1.0e9
@@ -83,11 +83,7 @@ def build_fill_reconstruct_init(*, backend: str, backend_mod, grid):
                 filled[i] = _POS_SENTINEL
                 parent[i] = -1
 
-    return (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("z").wire_data("filled").wire_data("parent")
-        .ingest(init_filled_tmpl)
-    )
+    return KernelBuilder(init_filled_tmpl).compose("grid", grid).freeze()
 
 
 def build_fill_reconstruct_sweeps(*, backend: str, backend_mod, nx: int, ny: int):
@@ -163,7 +159,7 @@ def build_fill_reconstruct_sweeps(*, backend: str, backend_mod, nx: int, ny: int
                     parent[i] = down
 
     def _kb(tmpl):
-        return KernelBuilder().wire_data("z").wire_data("filled").wire_data("parent").ingest(tmpl)
+        return KernelBuilder(tmpl).freeze()
 
     return {
         "row_lr": _kb(sweep_row_lr_tmpl),
@@ -201,9 +197,7 @@ def build_fill_reconstruct_frontier_init(*, backend: str, backend_mod):
                 pos = ctx.bk.atomic_add(counters[0], 1)
                 frontier[pos] = i
 
-    return KernelBuilder().wire_data("z").wire_data("filled").wire_data("frontier").wire_data("counters").ingest(
-        frontier_init_tmpl
-    )
+    return KernelBuilder(frontier_init_tmpl).freeze()
 
 
 def build_fill_reconstruct_relax(*, backend: str, backend_mod, grid, n_flat: int):
@@ -221,7 +215,7 @@ def build_fill_reconstruct_relax(*, backend: str, backend_mod, grid, n_flat: int
     bumps it between passes); composes its own `grid` occurrence.
 
     `active` is the raw backing field of a caller's scalar Parameter
-    (`active_p.get().data`, same "concurrently mutated is DATA by
+    (`active_p.handle().array`, same "concurrently mutated is DATA by
     definition" classification as `counters`/`queued_gen` - see
     _closure_depressions.py's `build_depression_counter` for the identical
     pattern with `ndep`) - every push into the output frontier half also
@@ -283,9 +277,4 @@ def build_fill_reconstruct_relax(*, backend: str, backend_mod, grid, n_flat: int
                                 frontier[out_base + pos] = j
                                 ctx.bk.atomic_add(active[None], 1)
 
-    return (
-        KernelBuilder().wire_param("P").compose("grid", grid)
-        .wire_data("z").wire_data("filled").wire_data("parent")
-        .wire_data("frontier").wire_data("counters").wire_data("queued_gen").wire_data("active")
-        .ingest(relax_tmpl)
-    )
+    return KernelBuilder(relax_tmpl).compose("grid", grid).freeze()

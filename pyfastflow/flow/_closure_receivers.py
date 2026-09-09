@@ -39,8 +39,7 @@ Author: B.G (08/2026)
 
 import math
 
-from ..core.context.builder import HelperBuilder, KernelBuilder
-from ..core.context.slot import SlotKind
+from ..core import HelperBuilder, KernelBuilder, SlotKind, share_leaf
 from ._closure_shared import _tensor_annotation
 
 _SQRT2 = math.sqrt(2.0)
@@ -96,31 +95,6 @@ def _rand_unit_tmpl(ctx, i, k):
     return float(hashed) / 4294967296.0
 
 
-# ---------------------------------------------------------------------------
-# build-phase sharing (copied from ../ops/_closure_blocks.py, itself copied
-# from ../grid/__init__.py - see the module docstring)
-# ---------------------------------------------------------------------------
-
-
-def _find_param_paths(frozen, leaf_name: str, prefix: tuple = ()) -> list:
-    """Every relative dotted path under `frozen`'s composed subtree whose PARAM slot is named `leaf_name`."""
-    paths = []
-    if leaf_name in frozen.slots.names(SlotKind.PARAM):
-        paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
-        paths.extend(_find_param_paths(child, leaf_name, prefix + (name,)))
-    return paths
-
-
-def _share_leaf(builder, canonical: str) -> None:
-    """Declare every occurrence of PARAM `canonical` in `builder`'s composed subtree shared with its own top-level slot of the same name."""
-    paths = []
-    for name, child in builder.composed.items():
-        paths.extend(_find_param_paths(child, canonical, (name,)))
-    if paths:
-        builder.share(canonical, *paths)
-
-
 def build_distance_slope_helpers(grid, *, topology: str, diagonal_partition_correction: bool):
     """
     dist_from_k_corrected/dist_between_nodes_corrected/slope_from_values_k/
@@ -140,18 +114,18 @@ def build_distance_slope_helpers(grid, *, topology: str, diagonal_partition_corr
     dist_from_k_tmpl = _dist_from_k_corrected_tmpl if correct else _dist_from_k_tmpl
     dist_between_tmpl = _dist_between_nodes_corrected_tmpl if correct else _dist_between_nodes_tmpl
 
-    dist_from_k_corrected = HelperBuilder().compose("grid", grid).ingest(dist_from_k_tmpl)
-    dist_between_nodes_corrected = HelperBuilder().compose("grid", grid).ingest(dist_between_tmpl)
+    dist_from_k_corrected = HelperBuilder(dist_from_k_tmpl).compose("grid", grid).freeze()
+    dist_between_nodes_corrected = HelperBuilder(dist_between_tmpl).compose("grid", grid).freeze()
 
     slope_from_values_k = (
-        HelperBuilder()
+        HelperBuilder(_slope_from_values_k_tmpl)
         .compose("dist_from_k_corrected", dist_from_k_corrected)
-        .ingest(_slope_from_values_k_tmpl)
+        .freeze()
     )
     slope_between_nodes = (
-        HelperBuilder()
+        HelperBuilder(_slope_between_nodes_tmpl)
         .compose("dist_between_nodes_corrected", dist_between_nodes_corrected)
-        .ingest(_slope_between_nodes_tmpl)
+        .freeze()
     )
 
     return {
@@ -170,7 +144,7 @@ def build_rand_unit(hash_u32):
 
     Author: B.G (08/2026)
     """
-    return HelperBuilder().wire_param("SEED").compose("hash_u32", hash_u32).ingest(_rand_unit_tmpl)
+    return HelperBuilder(_rand_unit_tmpl).compose("hash_u32", hash_u32).freeze()
 
 
 def build_receivers(
@@ -318,21 +292,17 @@ def build_receivers(
                     r = j if better else r
                 rec[i] = r
 
-    kb = KernelBuilder()
+    kb = KernelBuilder(receivers_tmpl)
     grid_param_names = grid.slots.names(SlotKind.PARAM)
     for name in grid_param_names:
-        kb.wire_param(name)
+        kb.param(name)
     kb.compose("grid", grid)
     kb.compose("slope", slope)
     if mode == "stochastic":
         kb.compose("rand_unit", out["rand_unit"])
 
-    data_names = ["z"] + (["h"] if h_aware else []) + ["rec"]
-    for name in data_names:
-        kb.wire_data(name)
-
     for name in grid_param_names:
-        _share_leaf(kb, name)
+        share_leaf(kb, name)
 
-    out["receivers"] = kb.ingest(receivers_tmpl)
+    out["receivers"] = kb.freeze()
     return out

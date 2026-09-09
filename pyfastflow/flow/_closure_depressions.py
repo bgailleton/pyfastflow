@@ -54,8 +54,7 @@ loop for rake_compress_accum's per-round-identical body).
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import KernelBuilder
-from ..core.context.routine import RoutineBuilder
+from ..core import KernelBuilder, RoutineBuilder
 from ._closure_shared import _tensor_annotation
 
 
@@ -86,7 +85,7 @@ def build_copy_field(*, backend: str, backend_mod):
         for i in src:
             dst[i] = src[i]
 
-    return KernelBuilder().wire_data("src").wire_data("dst").ingest(copy_field_tmpl)
+    return KernelBuilder(copy_field_tmpl).freeze()
 
 
 def build_basin_id_init(*, backend: str, backend_mod, grid):
@@ -115,7 +114,7 @@ def build_basin_id_init(*, backend: str, backend_mod, grid):
         for i in bid:
             bid[i] = 0 if ctx.grid.can_out(i) else (i + 1)
 
-    return KernelBuilder().compose("grid", grid).wire_data("bid").ingest(basin_id_init_tmpl)
+    return KernelBuilder(basin_id_init_tmpl).compose("grid", grid).freeze()
 
 
 def build_propagate_basin_iter(*, backend: str, backend_mod):
@@ -143,7 +142,7 @@ def build_propagate_basin_iter(*, backend: str, backend_mod):
             if rec_jump[i] != rec_jump[rec_jump[i]]:
                 rec_jump[i] = rec_jump[rec_jump[i]]
 
-    return KernelBuilder().wire_data("rec_jump").ingest(propagate_basin_iter_tmpl)
+    return KernelBuilder(propagate_basin_iter_tmpl).freeze()
 
 
 def build_propagate_basin_final(*, backend: str, backend_mod):
@@ -171,7 +170,7 @@ def build_propagate_basin_final(*, backend: str, backend_mod):
         for i in bid:
             bid[i] = bid[rec_jump[i]]
 
-    return KernelBuilder().wire_data("bid").wire_data("rec_jump").ingest(propagate_basin_final_tmpl)
+    return KernelBuilder(propagate_basin_final_tmpl).freeze()
 
 
 def build_basin_labelling_vanilla(*, backend: str, backend_mod, grid, copy_field, logn: int):
@@ -223,11 +222,11 @@ def build_basin_labelling_vanilla(*, backend: str, backend_mod, grid, copy_field
     }
 
     rb = RoutineBuilder()
-    rb.compose("basin_id_init", basin_id_init)
-    rb.compose("copy_rec_to_recjump", copy_field)
+    rb.step("basin_id_init", basin_id_init)
+    rb.step("copy_rec_to_recjump", copy_field)
     for k in range(logn + 1):
-        rb.compose(f"propagate_iter_{k}", propagate_basin_iter)
-    rb.compose("propagate_basin_final", propagate_basin_final)
+        rb.step(f"propagate_iter_{k}", propagate_basin_iter)
+    rb.step("propagate_basin_final", propagate_basin_final)
 
     return rb, kernels
 
@@ -273,12 +272,7 @@ def build_basin_labelling_optimized(*, backend: str, backend_mod, grid, n_flat: 
             root = rec_jump[i]
             bid[i] = 0 if ctx.grid.can_out(root) else root + 1
 
-    return (
-        KernelBuilder()
-        .compose("grid", grid)
-        .wire_data("rec").wire_data("rec_jump").wire_data("bid")
-        .ingest(label_basins_walk_tmpl)
-    )
+    return KernelBuilder(label_basins_walk_tmpl).compose("grid", grid).freeze()
 
 
 def build_label_from_route(*, backend: str, backend_mod, grid):
@@ -299,11 +293,7 @@ def build_label_from_route(*, backend: str, backend_mod, grid):
             root = basin_route[i]
             bid[i] = 0 if ctx.grid.can_out(root) else root + 1
 
-    return (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("bid").wire_data("basin_route")
-        .ingest(label_from_route_tmpl)
-    )
+    return KernelBuilder(label_from_route_tmpl).compose("grid", grid).freeze()
 
 
 def build_basin_labelling_route(*, backend: str, backend_mod, grid, logn: int):
@@ -330,8 +320,8 @@ def build_basin_labelling_route(*, backend: str, backend_mod, grid, logn: int):
 
     rb = RoutineBuilder()
     for k in range(logn + 1):
-        rb.compose(f"contract_{k}", propagate_basin_iter)
-    rb.compose("label_from_route", label_from_route)
+        rb.step(f"contract_{k}", propagate_basin_iter)
+    rb.step("label_from_route", label_from_route)
 
     return rb, kernels
 
@@ -357,11 +347,7 @@ def build_merge_basin_route(*, backend: str, backend_mod, bitpack):
             p_rcv = ctx.bitpack.unpack_index(outlet[i])
             basin_route[i - 1] = p_rcv
 
-    return (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("outlet").wire_data("basin_route")
-        .ingest(merge_basin_route_tmpl)
-    )
+    return KernelBuilder(merge_basin_route_tmpl).compose("bitpack", bitpack).freeze()
 
 
 def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
@@ -497,39 +483,12 @@ def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
                 basin_saddle[i] = invalid_c
                 basin_saddlenode[i] = -1
 
-    border_zprime = (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("bid").wire_data("z").wire_data("z_prime").wire_data("is_border")
-        .ingest(border_zprime_tmpl)
-    )
-    init_saddle_outlet = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("basin_saddle").wire_data("outlet").wire_data("basin_saddlenode").wire_data("b_rcv")
-        .ingest(init_saddle_outlet_tmpl)
-    )
-    atomic_min_saddle = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("is_border").wire_data("z_prime").wire_data("basin_saddle")
-        .ingest(atomic_min_saddle_tmpl)
-    )
-    find_saddlenode = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("is_border").wire_data("z_prime")
-        .wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .ingest(find_saddlenode_tmpl)
-    )
-    atomic_min_outlet = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .wire_data("z").wire_data("outlet").wire_data("b_rcv")
-        .ingest(atomic_min_outlet_tmpl)
-    )
-    set_keep = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("b_rcv").wire_data("outlet")
-        .wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .ingest(set_keep_tmpl)
-    )
+    border_zprime = KernelBuilder(border_zprime_tmpl).compose("grid", grid).freeze()
+    init_saddle_outlet = KernelBuilder(init_saddle_outlet_tmpl).compose("bitpack", bitpack).freeze()
+    atomic_min_saddle = KernelBuilder(atomic_min_saddle_tmpl).compose("grid", grid).compose("bitpack", bitpack).freeze()
+    find_saddlenode = KernelBuilder(find_saddlenode_tmpl).compose("grid", grid).compose("bitpack", bitpack).freeze()
+    atomic_min_outlet = KernelBuilder(atomic_min_outlet_tmpl).compose("grid", grid).compose("bitpack", bitpack).freeze()
+    set_keep = KernelBuilder(set_keep_tmpl).compose("bitpack", bitpack).freeze()
 
     kernels = {
         "border_zprime": border_zprime,
@@ -541,12 +500,12 @@ def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
     }
 
     rb = RoutineBuilder()
-    rb.compose("border_zprime", border_zprime)
-    rb.compose("init_saddle_outlet", init_saddle_outlet)
-    rb.compose("atomic_min_saddle", atomic_min_saddle)
-    rb.compose("find_saddlenode", find_saddlenode)
-    rb.compose("atomic_min_outlet", atomic_min_outlet)
-    rb.compose("break_cycle", set_keep)
+    rb.step("border_zprime", border_zprime)
+    rb.step("init_saddle_outlet", init_saddle_outlet)
+    rb.step("atomic_min_saddle", atomic_min_saddle)
+    rb.step("find_saddlenode", find_saddlenode)
+    rb.step("atomic_min_outlet", atomic_min_outlet)
+    rb.step("break_cycle", set_keep)
 
     return rb, kernels
 
@@ -631,21 +590,9 @@ def build_reroute_carve_vanilla(*, backend: str, backend_mod, bitpack, copy_fiel
                 rec[saddlenode[i]] = node
                 rerouted[saddlenode[i]] = 1
 
-    init_reroute_carve = (
-        KernelBuilder().wire_data("tag").wire_data("tag_alt").wire_data("saddlenode")
-        .ingest(init_reroute_carve_tmpl)
-    )
-    iteration_reroute_carve = (
-        KernelBuilder()
-        .wire_data("tag").wire_data("tag_alt").wire_data("rec").wire_data("rec_work").wire_data("bid")
-        .ingest(iteration_reroute_carve_tmpl)
-    )
-    finalise_reroute_carve = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("rec_orig").wire_data("tag")
-        .wire_data("saddlenode").wire_data("outlet").wire_data("rerouted")
-        .ingest(finalise_reroute_carve_tmpl)
-    )
+    init_reroute_carve = KernelBuilder(init_reroute_carve_tmpl).freeze()
+    iteration_reroute_carve = KernelBuilder(iteration_reroute_carve_tmpl).freeze()
+    finalise_reroute_carve = KernelBuilder(finalise_reroute_carve_tmpl).compose("bitpack", bitpack).freeze()
 
     kernels = {
         "init_reroute_carve": init_reroute_carve,
@@ -654,13 +601,13 @@ def build_reroute_carve_vanilla(*, backend: str, backend_mod, bitpack, copy_fiel
     }
 
     rb = RoutineBuilder()
-    rb.compose("init_reroute_carve", init_reroute_carve)
-    rb.compose("copy_recwork_to_rec", copy_field)
-    rb.compose("copy_recwork_to_recjump", copy_field)
+    rb.step("init_reroute_carve", init_reroute_carve)
+    rb.step("copy_recwork_to_rec", copy_field)
+    rb.step("copy_recwork_to_recjump", copy_field)
     for k in range(logn + 1):
-        rb.compose(f"iteration_carve_{k}", iteration_reroute_carve)
-    rb.compose("finalise_reroute_carve", finalise_reroute_carve)
-    rb.compose("copy_rec_to_recwork", copy_field)
+        rb.step(f"iteration_carve_{k}", iteration_reroute_carve)
+    rb.step("finalise_reroute_carve", finalise_reroute_carve)
+    rb.step("copy_rec_to_recwork", copy_field)
 
     return rb, kernels
 
@@ -719,11 +666,7 @@ def build_reroute_carve_optimized(*, backend: str, backend_mod, bitpack, n_flat:
                 nxt = nnxt
                 guard += 1
 
-    return (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("basin_saddlenode").wire_data("outlet")
-        .ingest(carve_basins_serial_tmpl)
-    )
+    return KernelBuilder(carve_basins_serial_tmpl).compose("bitpack", bitpack).freeze()
 
 
 def build_reroute_jump(*, backend: str, backend_mod, bitpack):
@@ -767,11 +710,7 @@ def build_reroute_jump(*, backend: str, backend_mod, bitpack):
                 rec[i - 1] = rrec
                 rerouted[i - 1] = 1
 
-    return (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("outlet").wire_data("rerouted")
-        .ingest(reroute_jump_tmpl)
-    )
+    return KernelBuilder(reroute_jump_tmpl).compose("bitpack", bitpack).freeze()
 
 
 def build_depression_counter(*, backend: str, backend_mod, grid):
@@ -781,7 +720,7 @@ def build_depression_counter(*, backend: str, backend_mod, grid):
     caller must reset the backing scalar Parameter to 0 (`.set(0)`) before
     each launch - this kernel only accumulates, mirroring ops.Reduce.
     run_sum's own reset-then-launch pattern. `ndep` is wired as DATA (the raw
-    backing field, `ndep_p.get().data`), not PARAM - a genuinely concurrent
+    backing field, `ndep_p.handle().array`), not PARAM - a genuinely concurrent
     atomic accumulate needs the raw field, the same "concurrently mutated is
     DATA by definition" classification make_accumulation's own atomic `q`
     and ops.Reduce's own accumulators already use; PARAM access stays strict
@@ -809,8 +748,4 @@ def build_depression_counter(*, backend: str, backend_mod, grid):
             if rec[i] == i and not ctx.grid.can_out(i) and not ctx.grid.nodata(i):
                 ctx.bk.atomic_add(ndep[None], 1)
 
-    return (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("rec").wire_data("ndep")
-        .ingest(depression_counter_tmpl)
-    )
+    return KernelBuilder(depression_counter_tmpl).compose("grid", grid).freeze()

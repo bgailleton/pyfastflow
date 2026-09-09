@@ -35,8 +35,7 @@ is unchanged from the script - CUDA has it natively.
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import KernelBuilder
-from ..core.pool.base import new_uid
+from ..core import KernelBuilder, new_uid
 
 _POS_SENTINEL = 1.0e9
 
@@ -61,9 +60,7 @@ def build_fill_reconstruct_init(*, grid, n_flat: int):
     """
     t = f"pfi{new_uid()}"
     return (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("z").wire_data("filled").wire_data("parent")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_init_filled(const float* z, float* filled, int* parent) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,8 +73,9 @@ __global__ void {t}_init_filled(const float* z, float* filled, int* parent) {{
         parent[i] = -1;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )
 
 
@@ -102,8 +100,8 @@ def build_fill_reconstruct_sweeps(*, nx: int, ny: int):
     """
     t = f"pfs{new_uid()}"
 
-    def _kb(body):
-        return KernelBuilder().wire_data("z").wire_data("filled").wire_data("parent").ingest(body)
+    def _kb(body, domain):
+        return KernelBuilder(body, domain=domain).freeze()
 
     row_lr = _kb(
         f"""
@@ -121,8 +119,7 @@ __global__ void {t}_sweep_row_lr(const float* z, float* filled, int* parent) {{
         }}
     }}
 }}
-"""
-    )
+""", ny)
     row_rl = _kb(
         f"""
 __global__ void {t}_sweep_row_rl(const float* z, float* filled, int* parent) {{
@@ -139,8 +136,7 @@ __global__ void {t}_sweep_row_rl(const float* z, float* filled, int* parent) {{
         }}
     }}
 }}
-"""
-    )
+""", ny)
     col_tb = _kb(
         f"""
 __global__ void {t}_sweep_col_tb(const float* z, float* filled, int* parent) {{
@@ -156,8 +152,7 @@ __global__ void {t}_sweep_col_tb(const float* z, float* filled, int* parent) {{
         }}
     }}
 }}
-"""
-    )
+""", nx)
     col_bt = _kb(
         f"""
 __global__ void {t}_sweep_col_bt(const float* z, float* filled, int* parent) {{
@@ -173,8 +168,7 @@ __global__ void {t}_sweep_col_bt(const float* z, float* filled, int* parent) {{
         }}
     }}
 }}
-"""
-    )
+""", nx)
     return {"row_lr": row_lr, "row_rl": row_rl, "col_tb": col_tb, "col_bt": col_bt}
 
 
@@ -197,9 +191,7 @@ def build_fill_reconstruct_frontier_init(*, n_flat: int):
     """
     t = f"pff{new_uid()}"
     return (
-        KernelBuilder()
-        .wire_data("z").wire_data("filled").wire_data("frontier").wire_data("counters")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_frontier_init(const float* z, const float* filled, int* frontier, int* counters) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -209,8 +201,7 @@ __global__ void {t}_frontier_init(const float* z, const float* filled, int* fron
         frontier[pos] = i;
     }}
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
 
@@ -234,7 +225,7 @@ def build_fill_reconstruct_relax(*, grid, n_flat: int):
     bumps it between passes). Composes its own `grid` occurrence.
 
     `active` is the raw backing pointer of a caller's scalar Parameter
-    (`active_p.get().data`, same classification as `counters`/`queued_gen` -
+    (`active_p.handle().array`, same classification as `counters`/`queued_gen` -
     see _cupy_depressions.py's `build_depression_counter` for the identical
     pattern with `ndep`) - every push into the output frontier half also
     atomicAdds 1 into it, so a host block can read it back after this kernel
@@ -255,10 +246,7 @@ def build_fill_reconstruct_relax(*, grid, n_flat: int):
     """
     t = f"pfr{new_uid()}"
     return (
-        KernelBuilder().wire_param("P").compose("grid", grid)
-        .wire_data("z").wire_data("filled").wire_data("parent")
-        .wire_data("frontier").wire_data("counters").wire_data("queued_gen").wire_data("active")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_relax(const float* z, float* filled, int* parent, int* frontier,
                            int* counters, int* queued_gen, int* active) {{
@@ -303,6 +291,7 @@ __global__ void {t}_relax(const float* z, float* filled, int* parent, int* front
         }}
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )

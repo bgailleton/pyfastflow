@@ -22,28 +22,7 @@ same kernel - see grid/_cupy_blocks.py.
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import HelperBuilder
-from ..core.context.contract import extract_cupy_contract
-from ..core.pool.base import new_uid
-
-
-def _helper(template, *, helpers=None):
-    """
-    One private/public HelperBuilder: PARAM slots are declared implicitly by
-    every `$ctx.NAME.get(...)$`/`$ctx.NAME.set_node(...)$` span contract.py
-    derives from `template`'s own text - mirrors grid/_cupy_blocks.py's own
-    `_helper`.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for chain in extract_cupy_contract(template).chains:
-        if (not helpers) or chain[0] not in helpers:
-            b.wire_param(chain[0])
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
+from ..core import freeze_helper as _helper, new_uid
 
 
 def build_hash_u32():
@@ -86,7 +65,7 @@ def build_group(group, *, kind):
     row = _helper(f"__device__ int {t}_row(int i) {{ return i / $ctx.NX.get(0)$; }}")
     col = _helper(f"__device__ int {t}_col(int i) {{ return i % $ctx.NX.get(0)$; }}")
     hash_u32 = build_hash_u32()
-    group.wire_helper("hash_u32").compose("hash_u32", hash_u32)
+    group.compose("hash_u32", hash_u32)
 
     if kind == "white":
         white_unit = _helper(
@@ -112,8 +91,8 @@ __device__ float {t}_at(int i) {{
 """,
             helpers={"white_unit": white_unit},
         )
-        group.wire_helper("at").compose("at", at)
-        group.wire_helper("white_unit").compose("white_unit", white_unit)
+        group.compose("at", at)
+        group.compose("white_unit", white_unit)
         return
 
     fade = _helper(f"__device__ float {t}_fade(float t) {{ return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); }}")
@@ -205,5 +184,5 @@ __device__ float {t}_at(int i) {{
 """,
         helpers={"row": row, "col": col, "perlin_at": perlin_at},
     )
-    group.wire_helper("at").compose("at", at)
-    group.wire_helper("perlin_at").compose("perlin_at", perlin_at)
+    group.compose("at", at)
+    group.compose("perlin_at", perlin_at)

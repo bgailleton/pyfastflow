@@ -2,7 +2,7 @@
 Slot: one named place declared on a builder during the build phase, plus
 SlotGroup, the flat container that holds a builder's own set of them.
 
-This is the vocabulary wire_param()/wire_helper()/wire_data() (builder.py)
+This is the vocabulary used by builders (builder.py)
 speak in. A Slot carries a name and a kind - PARAM, HELPER or DATA - plus,
 for a DATA slot only, an optional dtype (see DataSlot). Nothing else: no
 mode, no backend concern. The kind says how the slot is reached once the
@@ -22,8 +22,8 @@ template is written:
           is composed or bound to this slot, likewise later.
   DATA    a trusted device call argument of the compiled kernel/helper's own
           signature, never reached through ctx at all - see the module
-          docstring of builder.py for why wire_data raises on a HelperBuilder.
-          An optional dtype declared at wire_data(name, dtype=...) time is
+          docstring of builder.py for why data() raises on a HelperBuilder.
+          An optional dtype declared at data(name, dtype=...) time is
           the one thing checked early: a wrong-dtype buffer is what corrupts
           a launch or segfaults silently. Where that check actually runs
           against a call-time value is bind/compile work; the dtype is only
@@ -53,6 +53,8 @@ Author: B.G (08/2026)
 from enum import Enum
 from typing import Iterator
 
+from .errors import PyFastFlowError
+
 
 class SlotKind(Enum):
     """
@@ -67,7 +69,7 @@ class SlotKind(Enum):
     DATA = "data"
 
 
-class BuildError(Exception):
+class BuildError(PyFastFlowError):
     """
     Base of every build-phase exception across the core - slot-namespace
     misuse, contract derivation/checking, frozen-object mutation, and the
@@ -87,6 +89,31 @@ class SlotGroupError(BuildError):
     never wired.
 
     Author: B.G (08/2026)
+    """
+
+
+class ProgramBuilderError(BuildError):
+    """
+    Raised by the ProgramBuilder build phase (program.py): a name reused
+    across the program's one flat namespace (dim/param/data/sequence), a name
+    that is not a valid python identifier, a shape referencing an undeclared
+    dim, or a malformed spec.
+
+    Author: B.G (09/2026)
+    """
+
+
+class ProgramError(PyFastFlowError):
+    """
+    Raised at program run time (program.py), after build: feeding a wrong
+    dtype or shape, a conflicting dim binding, touching a value before its
+    shapes have resolved, writing a const, or attaching a pool whose backend
+    does not match.
+
+    Not a BuildError - these are use-phase mistakes on a built program, not
+    recipe-construction mistakes.
+
+    Author: B.G (09/2026)
     """
 
 
@@ -115,7 +142,7 @@ class Slot:
 
 
 class ParamSlot(Slot):
-    """A PARAM slot - wire_param()'s own slot type. See the module docstring."""
+    """A PARAM slot. See the module docstring."""
 
     __slots__ = ()
 
@@ -124,7 +151,7 @@ class ParamSlot(Slot):
 
 
 class HelperSlot(Slot):
-    """A HELPER slot - wire_helper()'s own slot type. See the module docstring."""
+    """A HELPER slot. See the module docstring."""
 
     __slots__ = ()
 
@@ -134,11 +161,11 @@ class HelperSlot(Slot):
 
 class DataSlot(Slot):
     """
-    A DATA slot - wire_data()'s own slot type. See the module docstring.
+    A DATA slot. See the module docstring.
 
     `dtype` is optional: None means the slot stays open (any dtype accepted
     whenever it is eventually checked against a call-time value), anything
-    else declares a contract wire_data(name, dtype=...) callers can rely on
+    else declares a contract data(name, dtype=...) callers can rely on
     being validated downstream, at bind/compile time.
 
     Author: B.G (08/2026)

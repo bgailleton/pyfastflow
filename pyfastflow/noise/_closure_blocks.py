@@ -29,7 +29,7 @@ its surface.
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import HelperBuilder
+from ..core import freeze_helper as _helper
 
 # ---------------------------------------------------------------------------
 # shared: flat index -> row / column
@@ -163,23 +163,6 @@ def _at_perlin_tmpl(ctx, i):
     return out
 
 
-def _helper(template, *, params=(), helpers=None):
-    """
-    One private/public HelperBuilder: wire_param() every name in `params`,
-    compose() every (name, frozen) pair in `helpers` under that same name,
-    then ingest(template). Mirrors grid/_closure_blocks.py's own `_helper`.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_hash_u32():
     """
     The standalone hash_u32(x) FrozenHelper - no Parameters, so it can be
@@ -206,7 +189,7 @@ def build_group(group, *, kind):
     row = _helper(_row_tmpl, params=["NX"])
     col = _helper(_col_tmpl, params=["NX"])
     hash_u32 = build_hash_u32()
-    group.wire_helper("hash_u32").compose("hash_u32", hash_u32)
+    group.compose("hash_u32", hash_u32)
 
     if kind == "white":
         white_unit = _helper(
@@ -215,8 +198,8 @@ def build_group(group, *, kind):
             helpers={"_ROW": row, "_COL": col, "_HASH": hash_u32},
         )
         at = _helper(_at_white_tmpl, params=["AMPLITUDE"], helpers={"_WHITEUNIT": white_unit})
-        group.wire_helper("at").compose("at", at)
-        group.wire_helper("white_unit").compose("white_unit", white_unit)
+        group.compose("at", at)
+        group.compose("white_unit", white_unit)
         return
 
     fade = _helper(_fade_tmpl)
@@ -230,5 +213,5 @@ def build_group(group, *, kind):
         params=["NX", "NY", "FX", "FY", "OCTAVES", "PERSISTENCE", "AMPLITUDE"],
         helpers={"_ROW": row, "_COL": col, "_PERLINAT": perlin_at},
     )
-    group.wire_helper("at").compose("at", at)
-    group.wire_helper("perlin_at").compose("perlin_at", perlin_at)
+    group.compose("at", at)
+    group.compose("perlin_at", perlin_at)

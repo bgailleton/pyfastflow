@@ -83,12 +83,14 @@ Author: B.G (08/2026)
 
 from typing import Any
 
+from .errors import PyFastFlowError
+
 RESERVED_BK_NAME = "bk"
 """The reserved ctx member name for the backend-intrinsics namespace - see
 the module docstring. Never wirable as a slot, never composable as a root."""
 
 
-class BkError(Exception):
+class BkError(PyFastFlowError):
     """
     Raised by an unknown `ctx.bk.*` attribute - naming it and listing what is
     actually available, rather than letting a typo fall through to a bare

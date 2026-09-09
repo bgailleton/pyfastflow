@@ -23,7 +23,7 @@ import importlib
 import numpy as np
 import pytest
 
-from pyfastflow.core.context.backends import backend_classes
+from pyfastflow.core.context.backends import Backend
 from pyfastflow.flow._verify_depressions import make_noisy_terrain, peel_all_reached
 
 DX = 1.0
@@ -119,15 +119,17 @@ def _assert_resolved(g: np.ndarray, can_out: np.ndarray, nodata: np.ndarray, lab
 @pytest.mark.parametrize("boundary,nodata,custom_outlet", _CONFIGS, ids=_IDS)
 def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
     from pyfastflow.flow import (
-        make_depression_solver,
+        bind_depression_solver,
         make_depressions,
         make_fill_reconstruct,
+        bind_fill_reconstruct_solver,
+        make_depression_solver,
         make_fill_reconstruct_solver,
         make_receivers,
     )
     from pyfastflow.grid import make_grid_group, make_grid_parameters
 
-    bk = backend_classes(backend)
+    bk = Backend.from_name(backend)
     Param, dt = bk.ParameterCls, bk.dtypes
     i32, i64, f32, u8 = dt["i32"], dt["i64"], dt["f32"], dt["u8"]
     closure = backend in ("taichi", "quadrants")
@@ -138,8 +140,8 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
 
     pool = _pool_cls(backend)()
 
-    grid = make_grid_group(backend, topology="D8", boundary=boundary, nodata=nodata, outlet=outlet_cfg)
-    gp = make_grid_parameters(backend, pool, nx, ny, DX, topology="D8", nodata=nodata, outlet=outlet_cfg)
+    grid = make_grid_group(bk, topology="D8", boundary=boundary, nodata=nodata, outlet=outlet_cfg)
+    gp = make_grid_parameters(bk, pool, nx, ny, DX, topology="D8", nodata=nodata, outlet=outlet_cfg)
 
     z_np = make_noisy_terrain(nx, ny, SEED).copy()
     nodata_np = np.zeros(n, dtype=np.uint8)
@@ -163,12 +165,15 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
     z.from_numpy(z_np)
     rec = pool.get_data(i32, (n,))
 
-    recv = make_receivers(backend, grid, topology="D8", mode="steepest")
+    recv = make_receivers(bk, grid, topology="D8", mode="steepest")
     rb = recv["receivers"].build()
     rb.bind_leaf(gp)
-    rb.bind("z", z.data)
-    rb.bind("rec", rec.data)
-    rb.compile(backend)(**launch)
+    rb.bind("z", z)
+    rb.bind("rec", rec)
+    recv_kernel = rb.compile(backend)
+    recv_kernel(**launch)
+    recv_kernel.close()
+    rb.close()
     rec0 = rec.to_numpy().astype(np.int32)
 
     ndep_p = Param("NDEP", dtype=i32, mode="scalar", value=0, pool=pool)
@@ -185,55 +190,62 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
     pass_p = Param("PASS", dtype=i32, mode="scalar", value=0, pool=pool)
     active_p = Param("ACTIVE", dtype=i32, mode="scalar", value=0, pool=pool)
 
-    fr = make_fill_reconstruct(backend, grid, nx=nx, ny=ny)
-    fr_solver = make_fill_reconstruct_solver(
-        backend, fr, gp,
-        z=z.data, filled=filled.data, parent=parent.data, frontier=frontier.data,
-        counters=counters.data, queued_gen=queued_gen.data, pass_p=pass_p, active_p=active_p,
+    fr = make_fill_reconstruct(bk, grid, nx=nx, ny=ny)
+    fr_frozen, _ = make_fill_reconstruct_solver(
+        bk, fr, gp, pass_p=pass_p, active_p=active_p,
         n_flat=n, nx=nx, ny=ny, block_size=BLOCK, max_passes=max_passes,
     )
+    fr_bound = bind_fill_reconstruct_solver(
+        fr_frozen, gp, z=z, filled=filled, parent=parent, frontier=frontier,
+        counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
+    )
+    fr_solver = fr_bound.compile(backend, **launch)
+    fr_bound.close()
     fr_solver()
+    fr_solver.close()
     parent_np = parent.to_numpy().astype(np.int64)
     _assert_resolved(parent_np, can_out, nodata_np, "reconstruct")
 
     # device depression_counter on the reconstruct parent graph
-    dc_deps = make_depressions(backend, grid, ndep_p, method="vanilla", reroute="carve", n_flat=n)
+    dc_deps = make_depressions(bk, grid, ndep_p, method="vanilla", reroute="carve", n_flat=n)
     parent_scratch = pool.get_data(i32, (n,))
     parent_scratch.from_numpy(parent_np.astype(np.int32))
     dc = dc_deps["depression_counter"].build()
     dc.bind_leaf(gp)
-    dc.bind("rec", parent_scratch.data)
-    dc.bind("ndep", ndep_p.get().data)
+    dc.bind("rec", parent_scratch)
+    dc.bind("ndep", ndep_p.handle())
     ndep_p.set(0)
-    dc.compile(backend)(**launch)
+    dc_kernel = dc.compile(backend)
+    dc_kernel(**launch)
+    dc_kernel.close()
+    dc.close()
     assert int(ndep_p.read()) == 0, "reconstruct: device depression_counter != 0"
 
     # ---- carve, vanilla and optimized -----------------------------------
     carve_bufs = dict(
-        rec=rec.data, z=z.data,
-        bid=pool.get_data(i32, (n,)).data,
-        rec_jump=pool.get_data(i32, (n,)).data,
-        z_prime=pool.get_data(f32, (n,)).data,
-        is_border=pool.get_data(u8, (n,)).data,
-        basin_saddle=pool.get_data(i64, (n,)).data,
-        basin_saddlenode=pool.get_data(i32, (n,)).data,
-        outlet=pool.get_data(i64, (n,)).data,
-        rerouted=pool.get_data(u8, (n,)).data,
-        tag=pool.get_data(u8, (n,)).data,
-        tag_alt=pool.get_data(u8, (n,)).data,
-        rec_scratch=pool.get_data(i32, (n,)).data,
-        basin_route=pool.get_data(i32, (n,)).data,
-        b_rcv=pool.get_data(i32, (n,)).data,
+        rec=rec, z=z,
+        bid=pool.get_data(i32, (n,)), rec_jump=pool.get_data(i32, (n,)),
+        z_prime=pool.get_data(f32, (n,)), is_border=pool.get_data(u8, (n,)),
+        basin_saddle=pool.get_data(i64, (n,)), basin_saddlenode=pool.get_data(i32, (n,)),
+        outlet=pool.get_data(i64, (n,)), rerouted=pool.get_data(u8, (n,)),
+        tag=pool.get_data(u8, (n,)), tag_alt=pool.get_data(u8, (n,)),
+        rec_scratch=pool.get_data(i32, (n,)), basin_route=pool.get_data(i32, (n,)),
+        b_rcv=pool.get_data(i32, (n,)),
     )
 
     for method in ("vanilla", "optimized"):
         rec.from_numpy(rec0)
-        deps = make_depressions(backend, grid, ndep_p, method=method, reroute="carve", n_flat=n)
-        solver = make_depression_solver(
-            backend, deps, gp, method=method, reroute="carve",
-            n_flat=n, block_size=BLOCK, **carve_bufs,
+        deps = make_depressions(bk, grid, ndep_p, method=method, reroute="carve", n_flat=n)
+        deps_frozen, _ = make_depression_solver(
+            bk, deps, gp, method=method, reroute="carve", n_flat=n, block_size=BLOCK,
         )
+        deps_bound = bind_depression_solver(
+            deps_frozen, gp, ndep_p=ndep_p, method=method, reroute="carve", **carve_bufs,
+        )
+        solver = deps_bound.compile(backend, **launch)
+        deps_bound.close()
         solver()
+        solver.close()
         got = rec.to_numpy().astype(np.int64)
         _assert_resolved(got, can_out, nodata_np, f"carve/{method}")
         assert int(ndep_p.read()) == 0, f"carve/{method}: device depression_counter != 0"

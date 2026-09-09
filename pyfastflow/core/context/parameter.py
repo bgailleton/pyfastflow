@@ -28,8 +28,8 @@ Parameter       One named, typed value. Its `mode` says where the value lives:
                 construction), "scalar" (a single device cell, writable) or
                 "field" (a device array, one value per node, writable).
 KernelBuilder   The recipe for a launchable kernel: PARAM/HELPER/DATA slots
-                declared (`.compose()`/`.wire_data()`), a template ingested
-                (`.ingest()`), then frozen (`.build()` -> FrozenKernel) and
+                declared (`.compose()`/`.data()`), a template supplied at
+                construction, then frozen (`.freeze()` -> FrozenKernel) and
                 bound (`.build()`/`.bind()` -> BoundKernel) before
                 `.compile(backend)` emits the real ti.kernel/qd.kernel/CUDA
                 __global__.
@@ -52,14 +52,14 @@ Compiling something
 A template is written once, generically, with `ctx` as its first parameter -
 the tree it composes from, PARAM/HELPER slots reached as `ctx.name.get(i)`/
 `ctx.name(...)` - and turned into something callable in three phases: a
-KernelBuilder declares its slots and composes children (`.wire_data()`,
-`.compose()`, `.ingest()`), `.build()` freezes that recipe into an inert
+KernelBuilder declares its slots and composes children (`.data()`,
+`.compose()`), `.freeze()` freezes that recipe into an inert
 FrozenKernel, and `.build()` again (this time on the frozen object, via
 `.build()`'s own BoundKernel) plus `.bind()` fills every slot with a concrete
 Parameter/helper/data buffer before `.compile(backend)` emits the real
 ti.kernel/qd.kernel/CUDA source:
 
-    kernel = KernelBuilder().compose("phys", phys_group).wire_data("h_new", "h_old").ingest(update_height)
+    kernel = KernelBuilder(update_height).compose("phys", phys_group).freeze()
     bound = kernel.build()
     bound.bind(("phys", "dx"), dx_p)
     compiled = bound.compile("taichi")
@@ -186,6 +186,10 @@ class Parameter(ABC):
         """
         self._uid = new_uid()
         self._mode: str | None = None
+        # how many bound objects (compiled or not) currently hold this
+        # Parameter - _Bound.bind()/close() and compiled swap() keep it. destroy()
+        # refuses while non-zero. See the module docstring, "Lifetime".
+        self._bound_by = 0
 
     @property
     def uid(self) -> int:
@@ -200,6 +204,21 @@ class Parameter(ABC):
         Author: B.G (07/2026)
         """
         return self._uid
+
+    _BACKEND_NAME: str = None  # set by each concrete subclass
+
+    @property
+    def backend(self):
+        """
+        The `Backend` this Parameter belongs to (backends.py). `_Bound.bind()`
+        reads it to keep one bound object's Parameters/handles on a single
+        backend. Imported lazily to avoid a Parameter <-> Backend import cycle.
+
+        Author: B.G (09/2026)
+        """
+        from .backends import Backend
+
+        return Backend.from_name(self._BACKEND_NAME)
 
     @property
     def mode(self) -> str:
@@ -223,13 +242,53 @@ class Parameter(ABC):
         self._mode = value
 
     @abstractmethod
-    def get(self):
+    def _host_value(self):
         """
-        Host-side value: a python scalar for const mode, a DataHandle for scalar/field.
+        Internal host representation: a python scalar for const mode, a
+        DataHandle for scalar/field. The public surface is `value` for const
+        and `handle()` for stored parameters.
 
         Author: B.G (07/2026)
         """
         ...
+
+    def handle(self):
+        """
+        This parameter's DataHandle (scalar/field storage). Raises
+        ParameterError for a const parameter, which has no device storage - its
+        literal is the `value` property.
+
+        Author: B.G (09/2026)
+        """
+        from .errors import ParameterError
+
+        if self.mode == "const":
+            raise ParameterError(f"{self.name}: const has no handle() - it is a baked-in literal; use .value")
+        return self._host_value()
+
+    @property
+    def value(self):
+        """
+        A const parameter's python literal. Raises ParameterError for
+        scalar/field, whose value lives in device storage - use handle()/read().
+
+        Author: B.G (09/2026)
+        """
+        from .errors import ParameterError
+
+        if self.mode != "const":
+            raise ParameterError(f"{self.name}: .value is const-only; {self.mode!r} lives in storage - use handle()/read()")
+        return self._host_value()
+
+    def _assert_unbound(self, action: str) -> None:
+        """Raise ParameterError if a bound object still holds this Parameter - guards destroy(). See _bound_by."""
+        from .errors import ParameterError
+
+        if self._bound_by > 0:
+            raise ParameterError(
+                f"{self.name}: cannot {action} while still bound by {self._bound_by} object(s) - "
+                f"close() every Bound/compiled object holding it first"
+            )
 
     @abstractmethod
     def set(self, value) -> None:
@@ -295,5 +354,3 @@ class Parameter(ABC):
         Author: B.G (07/2026)
         """
         ...
-
-

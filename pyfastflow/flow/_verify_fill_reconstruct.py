@@ -139,19 +139,12 @@ def run(backend: str):
     elif backend != "cupy":
         raise ValueError(f"unknown backend {backend!r}")
 
-    from ..core.context.backends import backend_classes
+    from ..core import Backend
     from ..grid import make_grid_group, make_grid_parameters
-    from . import make_fill_reconstruct, make_fill_reconstruct_solver
+    from . import bind_fill_reconstruct_solver, make_fill_reconstruct, make_fill_reconstruct_solver
 
-    _bk = backend_classes(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
+    _bk = Backend.from_name(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
     i32, f32 = dtypes["i32"], dtypes["f32"]
-
-    if backend == "taichi":
-        from ..core.pool.taichi_pool import TaichiPool as PoolCls
-    elif backend == "quadrants":
-        from ..core.pool.quadrants_pool import QuadrantsPool as PoolCls
-    else:
-        from ..core.pool.cupy_pool import CupyPool as PoolCls
 
     nx = ny = SIDE
     n = nx * ny
@@ -163,9 +156,9 @@ def run(backend: str):
     def download(handle):
         return handle.to_numpy()
 
-    pool = PoolCls()
-    grid_group = make_grid_group(backend, topology="D8", boundary="normal", outlet="edge")
-    grid_params = make_grid_parameters(backend, pool, nx, ny, DX, topology="D8", outlet="edge")
+    pool = _bk.pool()
+    grid_group = make_grid_group(_bk, topology="D8", boundary="normal", outlet="edge")
+    grid_params = make_grid_parameters(_bk, pool, nx, ny, DX, topology="D8", outlet="edge")
 
     z = pool.get_data(f32, (n,))
     filled = pool.get_data(f32, (n,))
@@ -173,19 +166,23 @@ def run(backend: str):
     frontier = pool.get_data(i32, (2 * n,))
     queued_gen = pool.get_data(i32, (n,))
 
-    pass_p = ParamCls("PASS", dtype=i32, mode="scalar", value=0, pool=pool)
-    active_p = ParamCls("ACTIVE", dtype=i32, mode="scalar", value=0, pool=pool)
+    pass_p = ParamCls("PASS", dtype="i32", mode="scalar", value=0, pool=pool)
+    active_p = ParamCls("ACTIVE", dtype="i32", mode="scalar", value=0, pool=pool)
 
-    deps = make_fill_reconstruct(backend, grid_group, nx=nx, ny=ny)
+    deps = make_fill_reconstruct(_bk, grid_group, nx=nx, ny=ny)
     max_passes = 4 * max(nx, ny)
     counters = pool.get_data(i32, (max_passes + 2,))
 
-    solver = make_fill_reconstruct_solver(
-        backend, deps, grid_params,
-        z=z.data, filled=filled.data, parent=parent.data, frontier=frontier.data,
-        counters=counters.data, queued_gen=queued_gen.data, pass_p=pass_p, active_p=active_p,
+    frozen, _ = make_fill_reconstruct_solver(
+        _bk, deps, grid_params, pass_p=pass_p, active_p=active_p,
         n_flat=n, nx=nx, ny=ny, block_size=BLOCK, max_passes=max_passes,
     )
+    bound = bind_fill_reconstruct_solver(
+        frozen, grid_params, z=z, filled=filled, parent=parent, frontier=frontier,
+        counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
+    )
+    solver = bound.compile(backend, **({} if _bk.family == "closure" else {"grid": ((n + BLOCK - 1) // BLOCK,), "block": (BLOCK,)}))
+    bound.close()
 
     terrains = (
         ("smooth", make_smooth_terrain(nx, ny, SEED)),
@@ -209,6 +206,7 @@ def run(backend: str):
         checks["active_final"] = int(active_p.read())
         rows.append((terrain_name, checks))
 
+    solver.close()  # release the compiled sequence's hold on the Parameters (Unit 6)
     pass_p.destroy()
     active_p.destroy()
     for h in (z, filled, parent, frontier, queued_gen, counters):

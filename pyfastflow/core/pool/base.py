@@ -13,10 +13,12 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any
 
+from ..context.errors import PyFastFlowError
+
 _uid_counter = itertools.count()
 
 
-class PoolError(RuntimeError):
+class PoolError(PyFastFlowError):
     """
     Raised on a pool lifecycle misuse: releasing a foreign or already-free
     handle, or clearing a pool that still has handles in use.
@@ -52,16 +54,47 @@ class DataHandle(ABC):
         uid: Process-wide identity from the shared counter (new_uid()) - unique
             across every Parameter, Bag, Helper and DataHandle regardless of
             backend. Concrete handles set self._uid in their own __init__.
-        dtype: Backend-native or common dtype tag for this resource.
+        dtype: Short dtype tag (``"f32"``, ``"i32"``, ...).
+        backend_dtype: Backend-native dtype used only by pool allocation and
+            device compilation.
         shape: Resource dimensions. () for a scalar.
         in_use: True between acquire() and release().
 
     Author: B.G (07/2026)
     """
 
-    dtype: Any
+    dtype: str
+    backend_dtype: Any
     shape: tuple[int, ...]
     in_use: bool
+
+    _BACKEND_NAME: str = None  # set by each concrete handle subclass
+    # how many bound objects hold this handle directly (a DATA slot bound to the
+    # handle itself). bind()/close()/swap() keep it; release()/destroy() refuse
+    # while non-zero. A handle owned as a Parameter's storage is not counted
+    # here (the Parameter's own _bound_by guards that).
+    _bound_by = 0
+
+    def _assert_unbound(self, action: str) -> None:
+        """Raise PoolError if a bound object still holds this handle directly - guards release()/destroy(). See _bound_by."""
+        if self._bound_by > 0:
+            raise PoolError(
+                f"handle uid={getattr(self, '_uid', '?')}: cannot {action} while still bound by "
+                f"{self._bound_by} object(s) - close() every Bound/compiled object holding it first"
+            )
+
+    @property
+    def backend(self):
+        """
+        The `Backend` this handle belongs to (context.backends). Read by
+        `_Bound.bind()` to keep one bound object's storage on a single backend.
+        Imported lazily to avoid a pool <-> Backend import cycle.
+
+        Author: B.G (09/2026)
+        """
+        from ..context.backends import Backend
+
+        return Backend.from_name(self._BACKEND_NAME)
 
     @property
     def uid(self) -> int:
@@ -74,7 +107,7 @@ class DataHandle(ABC):
 
     @property
     @abstractmethod
-    def data(self):
+    def array(self):
         """
         Return the raw backend object (ti.field, np.ndarray, ...).
 

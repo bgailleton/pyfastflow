@@ -45,7 +45,7 @@ Both Taichi and Quadrants trace plain `abs()`/`min()` directly inside a
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import HelperBuilder
+from ..core import freeze_helper as _helper
 
 # ---------------------------------------------------------------------------
 # geometry
@@ -422,24 +422,6 @@ def _neighbour_and_distance_tmpl(ctx, i, k):
     return j, d
 
 
-def _helper(template, *, params=(), helpers=None):
-    """
-    One private/public HelperBuilder: wire_param() every name in `params`,
-    compose() every (name, frozen) pair in `helpers` under that same name,
-    then ingest(template). The one assembly every block below goes through,
-    so a new block does not repeat the wire/compose/ingest boilerplate.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_group(group, *, topology, boundary, nodata, outlet):
     """
     Compose every private block and public helper for a closure backend
@@ -561,13 +543,13 @@ def build_group(group, *, topology, boundary, nodata, outlet):
         helpers={"_NEIGHBOUR": neighbour, "_DISTFROMK": dist_from_k},
     )
 
-    group.wire_helper("neighbour").compose("neighbour", neighbour)
-    group.wire_helper("neighbour_raw").compose("neighbour_raw", neighbour_raw)
-    group.wire_helper("nodata").compose("nodata", nodata_fn)
-    group.wire_helper("is_active").compose("is_active", is_active)
-    group.wire_helper("can_out").compose("can_out", can_out)
-    group.wire_helper("dist_from_k").compose("dist_from_k", dist_from_k)
-    group.wire_helper("dist_between_nodes").compose("dist_between_nodes", dist_between)
-    group.wire_helper("is_on_edge").compose("is_on_edge", is_on_edge)
-    group.wire_helper("which_edge").compose("which_edge", which_edge)
-    group.wire_helper("neighbour_and_distance").compose("neighbour_and_distance", neighbour_and_distance)
+    group.compose("neighbour", neighbour)
+    group.compose("neighbour_raw", neighbour_raw)
+    group.compose("nodata", nodata_fn)
+    group.compose("is_active", is_active)
+    group.compose("can_out", can_out)
+    group.compose("dist_from_k", dist_from_k)
+    group.compose("dist_between_nodes", dist_between)
+    group.compose("is_on_edge", is_on_edge)
+    group.compose("which_edge", which_edge)
+    group.compose("neighbour_and_distance", neighbour_and_distance)

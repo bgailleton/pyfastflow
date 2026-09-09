@@ -108,7 +108,7 @@ class ClosureBackendParameter(Parameter):
 
     _backend: ClassVar[Any]
 
-    def __init__(self, name: str, *, dtype, mode: str, value, pool, n_flat: int | None = None):
+    def __init__(self, name: str, *, dtype, mode: str, value, pool, shape: tuple = (), n_flat: int | None = None):
         """
         Declare one parameter and give it its initial value.
 
@@ -118,15 +118,19 @@ class ClosureBackendParameter(Parameter):
         Parameters
         ----------
         name : str
-        dtype : ti.* or qd.* dtype
+        dtype : str or ti.* / qd.* dtype
+            Short dtype tag (``"f32"``, ``"i32"``, ...) or the temporary
+            backend-native spelling accepted during the feature migration.
         mode : str
             One of MODES ("const", "scalar", "field").
         value : Any
             Initial value.
         pool : Pool
             Device-buffer pool backing scalar/field storage.
+        shape : tuple, optional
+            Field storage shape. Field parameters require a non-empty shape.
         n_flat : int, optional
-            Node count, required for field mode.
+            Temporary compatibility spelling for ``shape=(n_flat,)``.
 
         Raises
         ------
@@ -138,6 +142,16 @@ class ClosureBackendParameter(Parameter):
         """
         if mode not in MODES:
             raise ValueError(f"{name}: mode must be one of {sorted(MODES)}, got {mode!r}")
+        if isinstance(dtype, str):
+            try:
+                dtype = getattr(self._backend, dtype)
+            except AttributeError as exc:
+                raise ValueError(f"{name}: unknown dtype tag {dtype!r}") from exc
+        shape = tuple(shape)
+        if n_flat is not None:
+            if shape:
+                raise ValueError(f"{name}: pass shape= or n_flat=, not both")
+            shape = (int(n_flat),)
 
         super().__init__()
         self.name = name
@@ -151,9 +165,9 @@ class ClosureBackendParameter(Parameter):
         if mode == "scalar":
             self._handle = pool.get_data(dtype, ())
         elif mode == "field":
-            if n_flat is None:
-                raise ValueError(f"{name}: field mode requires n_flat")
-            self._handle = pool.get_data(dtype, (n_flat,))
+            if not shape:
+                raise ValueError(f"{name}: field mode requires shape=(...)")
+            self._handle = pool.get_data(dtype, shape)
 
         self._store(value)
 
@@ -174,7 +188,7 @@ class ClosureBackendParameter(Parameter):
             return np.int64
         return np.float32
 
-    def get(self):
+    def _host_value(self):
         """
         The python value for const mode, the backing DataHandle otherwise.
 
@@ -195,7 +209,9 @@ class ClosureBackendParameter(Parameter):
         Author: B.G (07/2026)
         """
         if self.mode == "const":
-            raise ValueError(
+            from .errors import ParameterError
+
+            raise ParameterError(
                 f"{self.name}: const parameter is immutable; build a new Parameter and "
                 f"replace() it into the bag, then recompile"
             )
@@ -212,10 +228,10 @@ class ClosureBackendParameter(Parameter):
         if self.mode == "const":
             self._const_value = self._numpy_dtype(self.dtype)(value).item()
         elif self.mode == "scalar":
-            self._handle.data[None] = value
+            self._handle.array[None] = value
         else:  # field
             arr = np.asarray(value, dtype=self._numpy_dtype(self.dtype)).reshape(-1)
-            self._handle.data.from_numpy(arr)
+            self._handle.array.from_numpy(arr)
 
     def set_node(self, node, value) -> None:
         """
@@ -229,11 +245,13 @@ class ClosureBackendParameter(Parameter):
         Author: B.G (07/2026)
         """
         if self.mode == "const":
-            raise ValueError(f"{self.name}: const parameter is read-only")
+            from .errors import ParameterError
+
+            raise ParameterError(f"{self.name}: const parameter is read-only")
         if self.mode == "scalar":
-            self._handle.data[None] = value
+            self._handle.array[None] = value
         else:  # field
-            self._handle.data[node] = value
+            self._handle.array[node] = value
 
     def read(self):
         """
@@ -249,19 +267,23 @@ class ClosureBackendParameter(Parameter):
         if self.mode == "const":
             return self._const_value
         if self.mode == "field":
-            raise ValueError(
+            from .errors import ParameterError
+
+            raise ParameterError(
                 f"{self.name}: read() is for scalar/const only; a field is not meant to be "
                 f"read back to the host as a whole"
             )
-        return self._numpy_dtype(self.dtype)(self._handle.data.to_numpy()).item()
+        return self._numpy_dtype(self.dtype)(self._handle.array.to_numpy()).item()
 
     def destroy(self) -> None:
         """
         Return any pooled storage to the pool. const mode owns none, so this
-        is a no-op there.
+        is a no-op there. Raises ParameterError while a bound object still holds
+        this Parameter (see Parameter._assert_unbound).
 
         Author: B.G (07/2026)
         """
+        self._assert_unbound("destroy")
         if self._handle is not None:
             self._pool.release_data(self._handle)
             self._handle = None
@@ -300,7 +322,7 @@ class ClosureBackendParameter(Parameter):
         backend = self._backend
         mode = self.mode
         value = self._const_value
-        handle = self._handle.data if self._handle is not None else None
+        handle = self._handle.array if self._handle is not None else None
 
         def get_template(node):
             if STATIC(MODE == "const"):

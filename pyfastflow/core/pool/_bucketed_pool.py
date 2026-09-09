@@ -23,19 +23,20 @@ class BucketedPool(Pool):
         self._buckets: dict[tuple[Any, tuple[int, ...]], list[DataHandle]] = {}
 
     def get_data(self, dtype, shape) -> DataHandle:
-        key = (dtype, tuple(shape))
+        backend_dtype = self._handle_cls.normalize_dtype(dtype)
+        key = (backend_dtype, tuple(shape))
         bucket = self._buckets.setdefault(key, [])
         for handle in bucket:
             if not handle.in_use:
                 handle.acquire()
                 return handle
-        handle = self._handle_cls(dtype, key[1])
+        handle = self._handle_cls(backend_dtype, key[1])
         handle.acquire()
         bucket.append(handle)
         return handle
 
     def release_data(self, handle: DataHandle) -> None:
-        bucket = self._buckets.get((handle.dtype, tuple(handle.shape)), [])
+        bucket = self._buckets.get((handle.backend_dtype, tuple(handle.shape)), [])
         if not any(h is handle for h in bucket):
             raise PoolError(
                 f"release_data: handle uid={handle.uid} (dtype={handle.dtype}, "

@@ -6,7 +6,7 @@ stack (../core/context/builder.py, frozen.py, bound.py, sequence.py). See
 _closure_receivers.py/_closure_depressions.py/_closure_reconstruct.py for
 the other flow algorithms.
 
-`SOURCE`/`ITER` are plain wired PARAM slots (`wire_param`, any mode - const,
+`SOURCE`/`ITER` are plain PARAM slots (any mode - const,
 scalar or field, uniformly), never a Need: a caller binds a Parameter to
 each address on the built SequenceBuilder after `.build()`, exactly as
 make_receivers' `rand_unit.SEED` already does - there is no Need indirection
@@ -59,8 +59,7 @@ old add_swap - the two fixed bindings already encode both directions.
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import HelperBuilder, KernelBuilder
-from ..core.context.sequence import SequenceBuilder
+from ..core import HelperBuilder, KernelBuilder, SequenceBuilder
 from ._closure_shared import _tensor_annotation
 
 
@@ -98,8 +97,8 @@ def build_ping_pong_helpers():
 
     Author: B.G (08/2026)
     """
-    get_src = HelperBuilder().wire_param("ITER").ingest(_get_src_tmpl)
-    update_src = HelperBuilder().wire_param("ITER").ingest(_update_src_tmpl)
+    get_src = HelperBuilder(_get_src_tmpl).freeze()
+    update_src = HelperBuilder(_update_src_tmpl).freeze()
     return get_src, update_src
 
 
@@ -155,13 +154,7 @@ def build_atomic(*, backend: str, backend_mod, n_flat: int):
                 guard += 1
             ctx.bk.atomic_add(q[j], wi)
 
-    return (
-        KernelBuilder()
-        .wire_param("SOURCE")
-        .wire_data("rec")
-        .wire_data("q")
-        .ingest(accum_downstream_atomic_tmpl)
-    )
+    return KernelBuilder(accum_downstream_atomic_tmpl).freeze()
 
 
 def build_rake_compress(*, backend: str, backend_mod, n_neighbours: int, logn: int):
@@ -188,7 +181,7 @@ def build_rake_compress(*, backend: str, backend_mod, n_neighbours: int, logn: i
     "fuse_accum_buffers.get_src.ITER" (the same Parameter at all six ITER
     addresses - see the module docstring for why share() does not collapse
     any of them here). DATA addresses: this sequence's own {step}.{arg}
-    for every kernel's own wire_data name (see each template below).
+    for every kernel's own DATA name (see each template below).
 
     Parameters
     ----------
@@ -296,34 +289,21 @@ def build_rake_compress(*, backend: str, backend_mod, n_neighbours: int, logn: i
             if ctx.get_src(src, tid):
                 q[tid] = q_alt[tid]
 
-    zero_init = (
-        KernelBuilder()
-        .wire_data("ndonors").wire_data("ndonors_alt").wire_data("src")
-        .ingest(zero_init_tmpl)
-    )
-    reset_iteration = KernelBuilder().wire_param("ITER").ingest(reset_iteration_tmpl)
-    decrement_iteration = KernelBuilder().wire_param("ITER").ingest(decrement_iteration_tmpl)
-    q_init = KernelBuilder().wire_param("SOURCE").wire_data("q").ingest(q_init_tmpl)
-    receivers_to_donors = (
-        KernelBuilder()
-        .wire_data("rec").wire_data("donors").wire_data("ndonors")
-        .ingest(receivers_to_donors_tmpl)
-    )
+    zero_init = KernelBuilder(zero_init_tmpl).freeze()
+    reset_iteration = KernelBuilder(reset_iteration_tmpl).freeze()
+    decrement_iteration = KernelBuilder(decrement_iteration_tmpl).freeze()
+    q_init = KernelBuilder(q_init_tmpl).freeze()
+    receivers_to_donors = KernelBuilder(receivers_to_donors_tmpl).freeze()
     rake_compress_accum = (
-        KernelBuilder()
-        .wire_param("ITER")
+        KernelBuilder(rake_compress_accum_tmpl)
         .compose("get_src", get_src)
         .compose("update_src", update_src)
-        .share("ITER", "get_src.ITER", "update_src.ITER")
-        .wire_data("donors").wire_data("ndonors").wire_data("q").wire_data("src")
-        .wire_data("donors_alt").wire_data("ndonors_alt").wire_data("q_alt")
-        .ingest(rake_compress_accum_tmpl)
+        .freeze()
     )
     fuse_accum_buffers = (
-        KernelBuilder()
+        KernelBuilder(fuse_accum_buffers_tmpl)
         .compose("get_src", get_src)
-        .wire_data("q").wire_data("src").wire_data("q_alt")
-        .ingest(fuse_accum_buffers_tmpl)
+        .freeze()
     )
 
     kernels = {
@@ -337,13 +317,13 @@ def build_rake_compress(*, backend: str, backend_mod, n_neighbours: int, logn: i
     }
 
     sb = SequenceBuilder()
-    sb.compose("zero_init", zero_init)
-    sb.compose("reset_iteration", reset_iteration)
-    sb.compose("q_init", q_init)
-    sb.compose("receivers_to_donors", receivers_to_donors)
-    sb.compose("rake_step", rake_compress_accum)
-    sb.compose("decrement_iteration", decrement_iteration)
-    sb.compose("fuse_accum_buffers", fuse_accum_buffers)
+    sb.add("zero_init", zero_init)
+    sb.add("reset_iteration", reset_iteration)
+    sb.add("q_init", q_init)
+    sb.add("receivers_to_donors", receivers_to_donors)
+    sb.add("rake_step", rake_compress_accum)
+    sb.add("decrement_iteration", decrement_iteration)
+    sb.add("fuse_accum_buffers", fuse_accum_buffers)
 
     sb.step("zero_init")
     sb.step("reset_iteration")
@@ -423,21 +403,17 @@ def build_pointer_jump_push(*, backend: str, backend_mod, rounds: int):
                 grandparent = rec_curr[parent]
                 rec_next[i] = i if grandparent == parent else grandparent
 
-    q_init = KernelBuilder().wire_param("SOURCE").wire_data("q").ingest(q_init_tmpl)
-    copy_rec_to_work = KernelBuilder().wire_data("rec").wire_data("work").ingest(copy_rec_to_work_tmpl)
-    step = (
-        KernelBuilder()
-        .wire_data("rec_curr").wire_data("rec_next").wire_data("q_curr").wire_data("q_next")
-        .ingest(accum_pointer_jump_push_step_tmpl)
-    )
+    q_init = KernelBuilder(q_init_tmpl).freeze()
+    copy_rec_to_work = KernelBuilder(copy_rec_to_work_tmpl).freeze()
+    step = KernelBuilder(accum_pointer_jump_push_step_tmpl).freeze()
 
     kernels = {"q_init": q_init, "copy_rec_to_work": copy_rec_to_work, "accum_pointer_jump_push_step": step}
 
     sb = SequenceBuilder()
-    sb.compose("q_init", q_init)
-    sb.compose("copy_rec_to_work", copy_rec_to_work)
-    sb.compose("step_a", step)
-    sb.compose("step_b", step)
+    sb.add("q_init", q_init)
+    sb.add("copy_rec_to_work", copy_rec_to_work)
+    sb.add("step_a", step)
+    sb.add("step_b", step)
 
     sb.step("q_init")
     sb.step("copy_rec_to_work")

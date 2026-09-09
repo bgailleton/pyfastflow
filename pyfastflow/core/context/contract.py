@@ -44,11 +44,11 @@ Contract - see bk.py's module docstring for the full mechanism, including why
 this namespace exists at all and why cupy's own extractor is deliberately
 left untouched (`ctx.bk` is not part of the cupy template surface).
 
-Contract.check_root(root, provided) is the candidate-check compose() (builder.
-py) runs once a template's contract is known: for every chain this contract
-requires under `root` (e.g. `grid.neighbour`), the composed candidate must
-provide the next segment (`neighbour`) among its own top-level names, or this
-raises naming exactly what is missing and what the candidate offers instead.
+A Contract carries only its chains; nothing here decides whether a chain is
+satisfied. That check moved to freeze() (builder.py): every chain rooted at a
+composed child is resolved to its end through the child's own children/slots
+(the whole tree is known by then), and every other root is classified PARAM
+(a two-segment `.get`/`.set_node`) or reported missing.
 
 Author: B.G (08/2026)
 """
@@ -102,43 +102,6 @@ class Contract:
     def roots(self) -> set[str]:
         """The first segment of every chain - the ctx.* names this contract references directly."""
         return {chain[0] for chain in self._chains if chain}
-
-    def check_root(self, root: str, provided: set[str]) -> None:
-        """
-        Verify a composed candidate for slot `root` satisfies every chain
-        this contract requires under it.
-
-        A chain `("grid", "neighbour")` requires `"neighbour"` to be among
-        `provided` - the candidate's own top-level names (see frozen.py,
-        `_Frozen.provides`). A chain of length 1 rooted at `root` (bare
-        `ctx.root`, no further member) needs nothing from `provided` - the
-        root itself being composed is enough.
-
-        Parameters
-        ----------
-        root : str
-            The composed slot name being checked.
-        provided : set[str]
-            The candidate's own top-level PARAM/HELPER/composed names.
-
-        Raises
-        ------
-        ContractError
-            Some chain's next segment is absent from `provided` - names the
-            first missing member (and how many more, if any) and what the
-            candidate provides instead.
-
-        Author: B.G (08/2026)
-        """
-        missing = sorted(
-            {chain[1] for chain in self._chains if len(chain) > 1 and chain[0] == root and chain[1] not in provided}
-        )
-        if not missing:
-            return
-        extra = f" (+{len(missing) - 1} more: {', '.join(missing[1:])})" if len(missing) > 1 else ""
-        raise ContractError(
-            f"requires {root}.{missing[0]}{extra}, candidate provides {sorted(provided)}"
-        )
 
     def __repr__(self) -> str:
         if not self._chains:

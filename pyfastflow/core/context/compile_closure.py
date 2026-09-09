@@ -80,6 +80,15 @@ everything in the tree today compiles once at setup and launches many times,
 so a memo table would only add a cache-key surface with no payoff. Revisit
 only if anything ever compiles per-frame.
 
+The rebuilt function's linecache name is deterministic from its template
+qualname and bound address. Fresh-process CUDA probes on 09/2026 compiled the
+same Program SFD BoundKernels twice with isolated `offline_cache=True`
+directories: Taichi's second process reported `Create kernel ... from cache`,
+and Quadrants' reported both `Create kernel ... from cache` and `Loaded PTX
+from cache`. Thus neither backend needs a process-unique source location for
+these closure kernels, and this deterministic name remains the cache-safe
+choice.
+
 Author: B.G (08/2026)
 """
 
@@ -89,7 +98,6 @@ import linecache
 from types import FunctionType
 from typing import Any
 
-from ..pool.base import new_uid
 from .bk import make_closure_bk
 from .bound import Address, BoundKernel, format_address
 from .compile_shared import (
@@ -101,7 +109,7 @@ from .compile_shared import (
     check_unmet,
 )
 from .ctx import CTX_PARAM_NAME
-from .frozen import FrozenGroup, _Frozen
+from .frozen import FrozenGroup, Node
 from .slot import SlotKind
 
 
@@ -121,7 +129,7 @@ def _drop_ctx_param(func_def: ast.FunctionDef, label: str) -> None:
         raise CompileError(f"template {label!r}: first parameter must be {CTX_PARAM_NAME!r}")
 
 
-def _compile_dropping_ctx(template, ctx_obj: Any, label: str) -> FunctionType:
+def _compile_dropping_ctx(template, ctx_obj: Any, label: str, address: Address) -> FunctionType:
     """
     Rebuild `template` with `ctx` removed from its own signature and bound
     instead as a global (`ctx_obj`) the body's untouched `ctx.*` references
@@ -176,7 +184,8 @@ def _compile_dropping_ctx(template, ctx_obj: Any, label: str) -> FunctionType:
 
     module = ast.fix_missing_locations(ast.Module(body=[func_def], type_ignores=[]))
     source = ast.unparse(module)
-    filename = f"<pf-compile:{label}:{new_uid()}>"
+    qualname = getattr(template, "__qualname__", label)
+    filename = f"<pf:{qualname}:{format_address(address)}>"
     linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
 
     exec_globals: dict[str, Any] = dict(getattr(template, "__globals__", {}))
@@ -211,7 +220,7 @@ class _CtxNode:
     """
 
 
-def _build_ctx_node(prefix: Address, frozen: _Frozen, bound: BoundKernel, backend: Any, bk: Any) -> _CtxNode:
+def _build_ctx_node(prefix: Address, frozen: Node, bound: BoundKernel, backend: Any, bk: Any) -> _CtxNode:
     """
     Recursively build the ctx tree rooted at `frozen` (found at `prefix` in
     `bound`'s address tree), compiling every composed HELPER child - bottom
@@ -236,9 +245,9 @@ def _build_ctx_node(prefix: Address, frozen: _Frozen, bound: BoundKernel, backen
         param = bound.value_at(addr)
         setattr(node, name, param.device_view())
 
-    for name in frozen.slots.names(SlotKind.HELPER) | set(frozen.composed):
+    for name in frozen.slots.names(SlotKind.HELPER) | set(frozen.children):
         child_addr = prefix + (name,)
-        child_frozen = frozen.composed[name]
+        child_frozen = frozen.children[name]
         child_node = _build_ctx_node(child_addr, child_frozen, bound, backend, bk)
         if isinstance(child_frozen, FrozenGroup):
             # A FrozenGroup has no template of its own to compile - it is a
@@ -248,7 +257,7 @@ def _build_ctx_node(prefix: Address, frozen: _Frozen, bound: BoundKernel, backen
             setattr(node, name, child_node)
             continue
         label = format_address(child_addr)
-        raw = _compile_dropping_ctx(child_frozen.template, child_node, label)
+        raw = _compile_dropping_ctx(child_frozen.template, child_node, label, child_addr)
         compiled = backend.func(raw)
         # child_node's own attributes (its PARAM device views, its own
         # composed HELPER children) are copied onto the compiled func object
@@ -284,10 +293,10 @@ def compile_kernel(bound: BoundKernel, backend: Any) -> CompiledKernel:
     check_legal_accessors(bound)
 
     frozen = bound.frozen
-    data_names = check_data_signature(frozen.template, frozen.slots.names(SlotKind.DATA))
+    data_names = check_data_signature(frozen.template)
     bk = make_closure_bk(backend)
     root_node = _build_ctx_node((), frozen, bound, backend, bk)
-    raw = _compile_dropping_ctx(frozen.template, root_node, "root")
+    raw = _compile_dropping_ctx(frozen.template, root_node, "root", ())
     compiled = backend.kernel(raw)
 
     data_order = [(name,) for name in data_names]

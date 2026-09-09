@@ -64,7 +64,7 @@ found anywhere in its own composed subtree - the identical mechanism
 grid/__init__.py and
 noise/__init__.py already use, `share()`'s own path-walk resolving through a
 nested FrozenGroup exactly as it would through a FrozenHelper (see
-builder.py's `GroupBuilder.share()` - the walk checks `node.composed`/`node.
+builder.py's `GroupBuilder.share()` - the walk checks `node.children`/`node.
 slots.names(PARAM)` generically, indifferent to which kind of node it is
 looking at). The result: a caller binds `hillshade.NX`/`hillshade.NY`/
 `hillshade.DX`/`hillshade.N_NEIGHBOURS` once (to the same Parameter objects
@@ -107,16 +107,16 @@ already established.
 Author: B.G (08/2026)
 """
 
-from ..core.context.backends import backend_classes
-from ..core.context.builder import GroupBuilder, KernelBuilder, share_leaf
-from ..core.context.frozen import FrozenGroup, FrozenKernel
-from ..core.context.slot import SlotKind
+from ..core import (
+    Backend, FrozenGroup, FrozenKernel, GroupBuilder, SlotKind, require_backend,
+    share_leaf,
+)
 
 _TOPOLOGIES = {"D4": 4, "D8": 8}
 _MODES = ("const", "scalar")
 
 
-def _blocks_for(backend: str):
+def _blocks_for(be: Backend):
     """
     The private block module implementing make_hillshade_group's device code
     for one backend name: the closure blocks (shared by Taichi and
@@ -124,12 +124,12 @@ def _blocks_for(backend: str):
 
     Author: B.G (08/2026)
     """
-    if backend in ("taichi", "quadrants"):
+    if be.family == "closure":
         from . import _closure_blocks as blocks
-    elif backend == "cupy":
+    elif be.family == "cupy":
         from . import _cupy_blocks as blocks
     else:
-        raise ValueError(f"make_hillshade_group: unknown backend {backend!r}, expected 'taichi', 'quadrants' or 'cupy'")
+        raise ValueError(f"make_hillshade_group: unsupported backend family {be.family!r}")
     return blocks
 
 
@@ -141,7 +141,7 @@ def _k_indices(topology: str):
     raise ValueError(f"make_hillshade_group: topology must be one of {sorted(_TOPOLOGIES)}, got {topology!r}")
 
 
-def make_hillshade_group(backend: str, grid: FrozenGroup, *, topology: str = "D8") -> FrozenGroup:
+def make_hillshade_group(be: Backend, grid: FrozenGroup, *, topology: str = "D8") -> FrozenGroup:
     """
     Build one hillshade's structure: a FrozenGroup wiring `AZIMUTH`/
     `ALTITUDE`/`ZFACTOR` (its own value params) plus every name in `grid`'s
@@ -180,16 +180,17 @@ def make_hillshade_group(backend: str, grid: FrozenGroup, *, topology: str = "D8
     """
     if topology not in _TOPOLOGIES:
         raise ValueError(f"make_hillshade_group: topology must be one of {sorted(_TOPOLOGIES)}, got {topology!r}")
-    blocks = _blocks_for(backend)
+    be = require_backend(be)
+    blocks = _blocks_for(be)
     k = _k_indices(topology)
 
     group = GroupBuilder()
-    group.wire_param("AZIMUTH")
-    group.wire_param("ALTITUDE")
-    group.wire_param("ZFACTOR")
+    group.param("AZIMUTH")
+    group.param("ALTITUDE")
+    group.param("ZFACTOR")
     grid_param_names = grid.slots.names(SlotKind.PARAM)
     for name in grid_param_names:
-        group.wire_param(name)
+        group.param(name)
 
     blocks.build_group(group, grid=grid, **k)
 
@@ -203,7 +204,7 @@ def make_hillshade_group(backend: str, grid: FrozenGroup, *, topology: str = "D8
 
 
 def make_hillshade_parameters(
-    backend: str,
+    be: Backend,
     pool,
     *,
     azimuth: float = 315.0,
@@ -259,16 +260,16 @@ def make_hillshade_parameters(
         if mode not in _MODES:
             raise ValueError(f"make_hillshade_parameters: {label} must be 'const' or 'scalar', got {mode!r}")
 
-    _bk = backend_classes(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
+    ParamCls = require_backend(be).ParameterCls
 
-    azimuth_p = ParamCls("HS_AZIMUTH", dtype=dtypes["f32"], mode=azimuth_mode, value=float(azimuth), pool=pool)
-    altitude_p = ParamCls("HS_ALTITUDE", dtype=dtypes["f32"], mode=altitude_mode, value=float(altitude), pool=pool)
-    z_factor_p = ParamCls("HS_ZFACTOR", dtype=dtypes["f32"], mode=z_factor_mode, value=float(z_factor), pool=pool)
+    azimuth_p = ParamCls("HS_AZIMUTH", dtype="f32", mode=azimuth_mode, value=float(azimuth), pool=pool)
+    altitude_p = ParamCls("HS_ALTITUDE", dtype="f32", mode=altitude_mode, value=float(altitude), pool=pool)
+    z_factor_p = ParamCls("HS_ZFACTOR", dtype="f32", mode=z_factor_mode, value=float(z_factor), pool=pool)
 
     return {"AZIMUTH": azimuth_p, "ALTITUDE": altitude_p, "ZFACTOR": z_factor_p}
 
 
-def make_hillshade_kernel(backend: str, hillshade_group: FrozenGroup) -> FrozenKernel:
+def make_hillshade_kernel(be: Backend, hillshade_group: FrozenGroup) -> FrozenKernel:
     """
     The standalone `hillshade` pass: a FrozenKernel composing the *whole*
     `hillshade_group` under the name `hillshade` and writing `out[i] =
@@ -296,7 +297,8 @@ def make_hillshade_kernel(backend: str, hillshade_group: FrozenGroup) -> FrozenK
 
     Author: B.G (08/2026)
     """
-    blocks = _blocks_for(backend)
-    if backend == "cupy":
+    be = require_backend(be)
+    blocks = _blocks_for(be)
+    if be.family == "cupy":
         return blocks.build_kernel(hillshade_group)
-    return blocks.build_kernel(hillshade_group, backend=backend)
+    return blocks.build_kernel(hillshade_group, backend=be.name)

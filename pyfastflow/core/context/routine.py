@@ -16,7 +16,7 @@ sequence `compose()` was called in.
 Composing the same `FrozenKernel` under two step names runs it twice with
 independently bound data at each occurrence:
 
-    rb.compose("diffuse1", diffuse).compose("diffuse2", diffuse)
+    rb.step("diffuse1", diffuse).step("diffuse2", diffuse)
 
 gives two addresses (`diffuse1.*`, `diffuse2.*`), two independently bindable
 slot sets, and two independent `CompiledKernel` launches after `compile()`.
@@ -56,10 +56,12 @@ Author: B.G (08/2026)
 from typing import Any
 
 from ..pool.base import new_uid
-from .bound import Address, BindError, _Bound, format_address, parse_address, walk_frozen
-from .compile_shared import CompileError, check_unmet
-from .frozen import FrozenBuilderError, FrozenHelper, FrozenKernel, _Frozen
-from .slot import BuildError
+from .bound import Address, BindError, _Bound, format_address, parse_address
+from .builder import _ShareMixin
+from .compile_shared import check_unmet
+from .contract import Contract
+from .frozen import FrozenError, FrozenHelper, FrozenKernel, Node
+from .slot import BuildError, SlotGroup
 
 
 class RoutineBuilderError(BuildError):
@@ -71,10 +73,12 @@ class RoutineBuilderError(BuildError):
     """
 
 
-class RoutineBuilder:
+class RoutineBuilder(_ShareMixin):
     """
     Collects an ordered set of named kernel steps and freeze()s them into a
-    FrozenRoutine. See the module docstring.
+    FrozenRoutine. `share()`/`share_identical()` (from _ShareMixin, builder.py)
+    collapse a bundle - a grid's helpers and their params - shared across the
+    routine's steps, addressed `step.<...>`. See the module docstring.
 
     Author: B.G (08/2026)
     """
@@ -84,6 +88,9 @@ class RoutineBuilder:
         self._order: list[str] = []
         self._composed: dict[str, FrozenKernel] = {}
         self._launch: dict[str, dict] = {}
+        self._shared: dict[tuple, tuple] = {}
+        self._synthetic: dict[str, Any] = {}
+        self._shared_seen: set[tuple] = set()
         self._frozen = False
 
     @property
@@ -93,12 +100,12 @@ class RoutineBuilder:
 
     def _check_mutable(self) -> None:
         if self._frozen:
-            raise FrozenBuilderError(
+            raise FrozenError(
                 f"RoutineBuilder(uid={self._uid}) has already been freeze()-ed and is frozen - "
                 f"build a new RoutineBuilder instead of reusing this one"
             )
 
-    def compose(self, name: str, frozen_kernel: FrozenKernel, *, launch: "dict | None" = None) -> "RoutineBuilder":
+    def step(self, name: str, frozen_kernel: FrozenKernel, *, launch: "dict | None" = None) -> "RoutineBuilder":
         """
         Append a step named `name`, launching `frozen_kernel` at this
         position in the routine's launch order.
@@ -117,15 +124,15 @@ class RoutineBuilder:
         """
         self._check_mutable()
         if isinstance(frozen_kernel, FrozenHelper):
-            raise TypeError(
-                f"compose({name!r}, ...): got a FrozenHelper, not a FrozenKernel - a helper has "
+            raise RoutineBuilderError(
+                f"step({name!r}, ...): got a FrozenHelper, not a FrozenKernel - a helper has "
                 f"no standalone launch and cannot be a routine step. Compose it into a "
                 f"KernelBuilder first, then compose that kernel's FrozenKernel here."
             )
         if not isinstance(frozen_kernel, FrozenKernel):
-            raise TypeError(f"compose({name!r}, ...): expected a FrozenKernel, got {type(frozen_kernel).__name__}")
+            raise TypeError(f"step({name!r}, ...): expected a FrozenKernel, got {type(frozen_kernel).__name__}")
         if name in self._composed:
-            raise RoutineBuilderError(f"'{name}' is already composed on this routine")
+            raise RoutineBuilderError(f"'{name}' is already registered on this routine")
         self._composed[name] = frozen_kernel
         self._launch[name] = dict(launch) if launch else {}
         self._order.append(name)
@@ -147,60 +154,48 @@ class RoutineBuilder:
         if not self._order:
             raise RoutineBuilderError("freeze: routine has no steps - compose() at least one kernel first")
         self._frozen = True
-        return FrozenRoutine(self._order, self._composed, self._launch)
+        return FrozenRoutine(self._order, self._composed, self._launch, self._shared, self._synthetic)
 
 
-class FrozenRoutine(_Frozen):
+class FrozenRoutine(Node):
     """
-    The frozen result of a RoutineBuilder's freeze(): an ordered, immutable
-    {name: FrozenKernel}, plus each step's own launch-kwargs override. A
-    `_Frozen` (frozen.py) - the minimal identity/immutability base, not
-    `_FrozenLeaf`, since a routine is an ordered composite with no template/
-    contract/slots of its own. See the module docstring.
+    The frozen result of a RoutineBuilder's freeze(): a `Node` of kind
+    "routine" whose `children` are its steps, insertion order = launch order,
+    plus each step's own launch-kwargs override (`.launch`). It has no
+    template/contract/slots of its own; `.order` reports its step names in
+    launch order. build() is inherited from Node. See the module docstring.
 
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
 
-    def __init__(self, order: list, composed: dict, launch: "dict | None" = None):
-        super().__init__()
-        object.__setattr__(self, "_order", tuple(order))
-        object.__setattr__(self, "_composed", dict(composed))
+    KIND = "routine"
+
+    def __init__(
+        self,
+        order: list,
+        composed: dict,
+        launch: "dict | None" = None,
+        shared: "dict | None" = None,
+        synthetic: "dict | None" = None,
+    ):
+        super().__init__(
+            template=None,
+            slots=SlotGroup(),
+            children=composed,
+            contract=Contract(frozenset()),
+            shared=shared,
+            synthetic=synthetic,
+            order=tuple(order),
+        )
         object.__setattr__(self, "_launch", dict(launch) if launch else {})
-
-    @property
-    def order(self) -> tuple:
-        """Step names in launch order (= composition order)."""
-        return self._order
-
-    @property
-    def composed(self) -> dict:
-        """{step name: FrozenKernel}, read-only copy."""
-        return dict(self._composed)
 
     @property
     def launch(self) -> dict:
         """{step name: launch-kwargs override dict}, read-only copy. See compose()'s `launch=`."""
         return dict(self._launch)
 
-    def build(self) -> "BoundRoutine":
-        """
-        Return a fresh BoundRoutine with every step's addresses walked and
-        prefixed by that step's name. See the module docstring's
-        "Addressing" section.
-
-        A step's own `share()` declarations (builder.py) are honoured the
-        same way whether the step is built standalone or as part of a
-        routine.
-
-        Author: B.G (08/2026)
-        """
-        table: dict[Address, Any] = {}
-        for name in self._order:
-            walk_frozen((name,), self._composed[name], table)
-        return BoundRoutine(self, table)
-
     def __repr__(self) -> str:
-        return f"FrozenRoutine(uid={self._uid}, steps={list(self._order)})"
+        return f"FrozenRoutine(uid={self._uid}, steps={list(self.order)})"
 
 
 class BoundRoutine(_Bound):
@@ -213,32 +208,32 @@ class BoundRoutine(_Bound):
     Author: B.G (08/2026)
     """
 
-    def compile(self, backend: str, **kwargs) -> "CompiledRoutine":
+    def compile(self, backend=None, **kwargs) -> "CompiledRoutine":
         """
         Compile every step and return the resulting CompiledRoutine. See
         the module docstring's "Compiling" section.
 
-        Parameters
-        ----------
-        backend : str
-            "taichi", "quadrants" or "cupy".
-        **kwargs
-            Routine-level compile()-kwargs, the default every step falls
-            back to unless overridden by its own `launch=`.
+        `backend` is a `Backend` (or a name, or omitted to use the one recorded
+        from bound Parameters). `**kwargs` is the temporary per-step cupy
+        grid/block compat (Unit 4), overridden by a step's own `launch=`.
 
-        Author: B.G (08/2026)
+        Author: B.G (09/2026)
         """
+        self._check_open("compile")
         check_unmet(self)
+        be = self._resolve_backend(backend)
         frozen: FrozenRoutine = self._frozen
         steps: list[tuple[str, Any]] = []
+        step_bounds: list[_Bound] = []
         for name in frozen.order:
-            step_frozen = frozen.composed[name]
+            step_frozen = frozen.children[name]
             step_bound = step_frozen.build()
             self.bind_into(step_bound, (name,))
             step_kwargs = {**kwargs, **frozen.launch.get(name, {})}
-            compiled = step_bound.compile(backend, **step_kwargs)
+            compiled = step_bound.compile(be, **step_kwargs)
             steps.append((name, compiled))
-        return CompiledRoutine(steps)
+            step_bounds.append(step_bound)
+        return CompiledRoutine(steps, step_bounds)
 
 
 class CompiledRoutine:
@@ -249,9 +244,30 @@ class CompiledRoutine:
     Author: B.G (08/2026)
     """
 
-    def __init__(self, steps: list):
+    def __init__(self, steps: list, step_bounds: "list | None" = None):
         self._steps = list(steps)
         self._by_name = dict(steps)
+        # the per-step BoundKernels this routine built and owns (destroy safety,
+        # Unit 6): close() releases their hold on the shared Parameters/handles.
+        self._step_bounds = list(step_bounds) if step_bounds else []
+        self._closed = False
+
+    def close(self) -> None:
+        """
+        Close every step's compiled kernel and the per-step Bounds this routine
+        owns, releasing their hold on the shared Parameters/handles. Idempotent.
+        Does not close the caller-owned routine Bound this was compiled from.
+
+        Author: B.G (09/2026)
+        """
+        if self._closed:
+            return
+        self._closed = True
+        for _, compiled in self._steps:
+            if hasattr(compiled, "close"):
+                compiled.close()
+        for b in self._step_bounds:
+            b.close()
 
     @property
     def step_names(self) -> list:
@@ -290,3 +306,8 @@ class CompiledRoutine:
 
     def __repr__(self) -> str:
         return f"CompiledRoutine(steps={[n for n, _ in self._steps]})"
+
+
+# Node.build() reads this to mint a BoundRoutine (frozen.py); set here since
+# BoundRoutine is defined in this module alongside FrozenRoutine.
+FrozenRoutine.bound_cls = BoundRoutine

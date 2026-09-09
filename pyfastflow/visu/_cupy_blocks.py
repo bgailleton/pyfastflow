@@ -14,28 +14,7 @@ calls in one process never collide inside a single compiled cupy module.
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import HelperBuilder, KernelBuilder
-from ..core.context.contract import extract_cupy_contract
-from ..core.pool.base import new_uid
-
-
-def _helper(template, *, helpers=None):
-    """
-    One private/public HelperBuilder: PARAM slots are declared implicitly by
-    every `$ctx.NAME.get(...)$`/`$ctx.NAME.set_node(...)$` span contract.py
-    derives from `template`'s own text - mirrors grid/_cupy_blocks.py's own
-    `_helper`.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for chain in extract_cupy_contract(template).chains:
-        if (not helpers) or chain[0] not in helpers:
-            b.wire_param(chain[0])
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
+from ..core import KernelBuilder, freeze_helper as _helper, new_uid
 
 
 def build_group(group, *, grid, k_top, k_left, k_right, k_bottom):
@@ -99,7 +78,7 @@ __device__ float {t}_at(const float* z, int i) {{
 """,
         helpers={"grad_x": grad_x, "grad_y": grad_y},
     )
-    group.wire_helper("at").compose("at", at)
+    group.compose("at", at)
 
 
 def build_kernel(hillshade_group):
@@ -121,10 +100,7 @@ extern "C" __global__ void {t}_hillshade(const float* z, float* out, int n) {{
 }}
 """
     return (
-        KernelBuilder()
-        .wire_data("z")
-        .wire_data("out")
-        .wire_data("n")
+        KernelBuilder(template, domain="z")
         .compose("hillshade", hillshade_group)
-        .ingest(template)
+        .freeze()
     )

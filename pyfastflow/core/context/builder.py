@@ -1,68 +1,52 @@
 """
-KernelBuilder / HelperBuilder: the build phase - wire_param()/wire_helper()/
-wire_data()/compose(), then ingest() to close it out. See parameter.py's
-module docstring for what the overall scheme (build -> bind -> compile) is
-for; this module is the first of those three phases only.
+KernelBuilder / HelperBuilder / GroupBuilder (and HostBlockBuilder,
+host_block.py): the build phase. See parameter.py's module docstring for the
+overall build -> bind -> compile scheme; this module is the first phase.
 
-A builder is mutable exactly until ingest() runs. wire_param(name)/
-wire_helper(name)/wire_data(name) each declare one local Slot (slot.py);
-compose(name, frozen) attaches an already-frozen sub-structure (frozen.py)
-under an explicit slot name - never positionally - so a template can reach
-`flux.grad.z` once `flux` names what was composed. Every name - wired or
-composed - lives in one flat namespace per builder; wiring the same name
-twice, or composing over a name already used by a PARAM/DATA slot, raises.
-compose() may target a name already wire_helper()'d, though: a HELPER slot
-declares that a name *will* be reachable as `ctx.{name}(...)`, and compose()
-is how that promise gets kept - see compose()'s own docstring for why this
-is allowed while every other double-use of a name is not.
+The template is given at construction (`KernelBuilder(template)`,
+`HelperBuilder(template)`; a GroupBuilder has none), and the builder derives
+its own contract from it - the slots are not restated by hand. At `freeze()`:
 
-compose(name, frozen, split=[...]) is the other half of build-phase sharing
-(GroupBuilder.share(), below): when `frozen` is a FrozenGroup carrying
-`.shared` paths, every one of them is collapsed into its own canonical
-address by default (bound.py's build() - see that module's docstring for
-the full mechanism), and `split` opts specific dotted relative paths back
-out into their own, independently-bindable addresses again at THIS compose
-site. Each path in `split` must already be one of `frozen.shared`'s own
-declared relative paths, checked here, eagerly - naming the exact path if
-not. `split` on anything that is not a FrozenGroup with `.shared` entries
-raises: there is nothing to split.
+  PARAM slots   the ctx roots the template reads as a two-segment
+                `ctx.X.get(...)`/`ctx.X.set_node(...)` accessor and does not
+                compose (host blocks: `get`/`set`/`read`). param() adds an extra
+                PARAM the template does not imply - the only way a GroupBuilder,
+                which has no template, gets any.
+  DATA slots    a kernel's/host block's own signature after `ctx` (python) or
+                `__global__` parameter list (cupy). A helper's signature after
+                `ctx` is ordinary device-call arguments, NOT DATA; a group has
+                no signature. data(name, dtype=) attaches a dtype contract to a
+                signature-declared DATA argument.
+  children      compose(name, frozen) attaches an already-frozen sub-structure
+                (frozen.py) under `name`, by identity, never positionally - a
+                template reaches `ctx.name.member` once `name` is composed. A
+                composed child IS the helper/group root; there is no separate
+                HELPER slot to declare.
 
-ingest(template) is where the local contract is checked and the structural
-contract is derived (contract.py) - a python def by static AST walk, CUDA
-source text by scanning its own `$ctx....$` spans, dispatched on
-`isinstance(template, str)`. Every chain the contract requires must resolve:
-its root is either a wired PARAM/HELPER slot (further segments trusted,
-unchecked - see the class docstrings below) or a composed root, in which case
-the *next* segment must be among what the composed candidate `.provides`
-(frozen.py) - otherwise this raises naming exactly what is missing. A chain
-rooted at a wired DATA slot is a contract violation of a different kind: a
-DATA slot is a plain call argument of the template's own signature, never
-reached through `ctx`, so this raises with a hint toward that instead of the
-generic "no declared slot" message. ingest() does not itself require a wired
-HELPER slot to already be composed - a template need not reference every
-slot it declares, and an unreferenced, uncomposed HELPER slot is harmless to
-ingest(). It becomes a hard requirement one phase later, at build() (see
-frozen.py, bound.py): the address tree build() walks has no way to
-represent "reachable, but nothing composed here yet".
+Disambiguation, at freeze(): a root read as `ctx.X.get(...)`/`.set_node(...)`
+and not composed is a PARAM; a root composed is a child (and reading it as
+`.get` is an error - a composed child is not a Parameter); a root used any other
+way (a bare call, a further segment) and not composed is missing - `.missing()`
+reports the set, `freeze()` raises ContractError. Every chain that enters a
+composed child is resolved to its end through the child's own children/slots;
+a dead-end names the full chain and the deepest node reached.
 
-`RESERVED_BK_NAME` ("bk", bk.py) may never be wired (wire_param/wire_helper/
-wire_data, via `_wire`) or composed (`compose`) - `ctx.bk` is reserved,
-backend-recognised grammar (the backend-intrinsics namespace: `ctx.bk.sqrt`,
-`ctx.bk.atan2`, ...), not a name any factory's own template surface may
-repurpose. See bk.py's module docstring for the full mechanism and
-contract.py for the matching rule on the derivation side (a `ctx.bk.*` chain
-is dropped before it ever becomes a contract requirement, so ingest() never
-asks for a "bk" slot to be wired in the first place).
+share(canonical, *paths, as_=None) / share_identical(path, as_=None) declare
+build-phase sharing: several relative addresses of this builder's own tree that
+mean one quantity, collapsed by bound.py's walk into a single bindable address
+(the canonical, or a synthetic top-level name when `as_` re-roots). Each spec
+may be a PARAM leaf, a DATA leaf, or a child root (whole subtree). See share()'s
+own docstring; classify_path/compute_share/find_identical_roots (below) are the
+shared implementation every builder level reuses.
 
-ingest() returns a frozen, immutable FrozenKernel/FrozenHelper and freezes
-the builder itself in the same call - every wire_*/compose/ingest afterwards
-raises FrozenBuilderError. A builder is therefore used once, start to finish;
-build a new one for a different template rather than trying to reuse an
-ingested one: a builder holding live, still-mutable slot state after having
-already handed out one frozen, immutable result would be exactly the kind
-of aliasing hazard the frozen/mutable split exists to rule out.
+`RESERVED_BK_NAME` ("bk", bk.py) may never be a param()/compose() name -
+`ctx.bk` is the reserved backend-intrinsics namespace (`ctx.bk.sqrt`, ...),
+dropped from every contract before it becomes a requirement.
 
-Author: B.G (08/2026)
+freeze() returns a frozen, immutable Node and freezes the builder in the same
+call - every method afterwards raises FrozenError. A builder is used once.
+
+Author: B.G (09/2026)
 """
 
 from typing import Any
@@ -70,11 +54,110 @@ from typing import Any
 from ..pool.base import new_uid
 from .bk import RESERVED_BK_NAME
 from .contract import Contract, ContractError, extract_cupy_contract, extract_python_contract
-from .frozen import FrozenBuilderError, FrozenGroup, FrozenHelper, FrozenKernel, _Frozen
-from .slot import DataSlot, HelperSlot, ParamSlot, Slot, SlotGroup, SlotGroupError, SlotKind
+from .frozen import FrozenError, FrozenGroup, FrozenHelper, FrozenKernel, Node
+from .slot import BuildError, DataSlot, HelperSlot, ParamSlot, Slot, SlotGroup, SlotGroupError, SlotKind
 
 
-class _Builder:
+class _ShareMixin:
+    """
+    The build-phase sharing surface - `share()`/`share_identical()` with
+    identical semantics at every builder level (KernelBuilder/HelperBuilder/
+    GroupBuilder via _Builder, plus RoutineBuilder/SequenceBuilder). A user of
+    this mixin provides `_check_mutable()`, `_composed`, `_shared`,
+    `_synthetic`, `_shared_seen`, and optionally `_slots`. See share() for the
+    contract and compute_share (below) for the implementation.
+
+    Author: B.G (09/2026)
+    """
+
+    def share(self, canonical: str, *paths: str, as_: "str | None" = None) -> "_Builder":
+        """
+        Declare that `canonical` and every `paths` mean the same thing - one
+        build-phase-shared quantity, collapsed to a single bindable address.
+
+        Each of `canonical`/`paths` is a dotted relative address of THIS
+        builder's own tree (a top-level slot, or a path reaching into an
+        already-composed child, e.g. `"neighbour_raw.row.NX"`). Each may name a
+        PARAM leaf, a DATA leaf, or a child root - if a root, the whole subtree
+        under it is shared. All must be the same kind; shared roots must be the
+        identical frozen object (`is`), not merely alike.
+
+        Without `as_`, `canonical` is the surviving, independently-bindable
+        address and every `paths` redirects to it. With `as_`, a synthetic new
+        top-level name is minted and BOTH `canonical` and every `paths`
+        redirect there: after `share("slope.lap.grid", "diffuse.grid",
+        as_="grid")` the bindable addresses are `grid.NX`, `grid.DX`, ... and
+        both original paths collapse into them.
+
+        This is explicit, by identity, local to one builder's authoring - never
+        name-based matching across independently-authored composites.
+        `share_identical()` is the one-call form for "collapse every occurrence
+        of this bundle".
+
+        Raises
+        ------
+        BuildError
+            A path does not resolve, the paths are not all the same kind,
+            shared roots are not the identical object, a path is already
+            shared, or `as_` collides with an existing top-level name.
+
+        Author: B.G (09/2026)
+        """
+        self._check_mutable()
+        new_shared, synthetic, seen_add = compute_share(
+            self._share_top_slots(), self._composed, self._top_level_names(),
+            self._shared_seen, canonical, paths, as_,
+        )
+        self._shared.update(new_shared)
+        self._synthetic.update(synthetic)
+        self._shared_seen |= seen_add
+        return self
+
+    def share_identical(self, path: str, as_: "str | None" = None) -> "_Builder":
+        """
+        Collapse every composed child root anywhere in this builder's tree that
+        `is` the identical frozen object as the child root at `path`, sharing
+        them all (via `share(path, *others, as_=as_)`). The one-call form of
+        "propagate this bundle": one grid object composed under several children
+        becomes one bindable `grid.*` set.
+
+        `path` must name a child root, not a leaf. A no-op (not an error) if
+        nothing else in the tree is that same object.
+
+        Author: B.G (09/2026)
+        """
+        self._check_mutable()
+        kind, node, _slot = classify_path(self._share_top_slots(), self._composed, tuple(path.split(".")), what="share_identical")
+        if kind != "root":
+            raise BuildError(f"share_identical({path!r}): names a {kind} leaf, not a child root - only a root can be shared by identity")
+        others = [p for p in find_identical_roots(self._composed, node) if p != path]
+        if not others:
+            return self
+        return self.share(path, *others, as_=as_)
+
+    def _share_top_slots(self) -> "SlotGroup | None":
+        """
+        The SlotGroup share() resolves a top-level leaf name against: the
+        builder's explicitly-declared PARAM slots (param()), which
+        is what a share canonical names. Derived PARAM slots are not known until
+        freeze(), and a share canonical is never a derived slot (a group has no
+        template; a kernel shares its own explicit params), so this suffices at
+        share() time. Empty for a routine/sequence (no top-level params).
+
+        Author: B.G (09/2026)
+        """
+        sg = SlotGroup()
+        for name in getattr(self, "_explicit_params", {}):
+            sg.add(ParamSlot(name))
+        return sg
+
+    def _top_level_names(self) -> set:
+        """Every name already claimed at this level - composed children, synthetic roots, and explicit top-level params."""
+        return set(self._composed) | set(self._synthetic) | set(getattr(self, "_explicit_params", {}))
+
+
+
+class _Builder(_ShareMixin):
     """
     Shared build-phase machinery behind KernelBuilder/HelperBuilder. Not
     instantiated directly.
@@ -82,189 +165,104 @@ class _Builder:
     Author: B.G (08/2026)
     """
 
-    def __init__(self):
+    def __init__(self, template: Any = None):
         self._uid = new_uid()
-        self._slots = SlotGroup()
-        self._composed: dict[str, _Frozen] = {}
-        self._split: dict[str, frozenset] = {}
-        self._shared: dict[str, list[tuple]] = {}
+        self._template = template
+        # PARAM slots the template does not derive. GroupBuilder has no
+        # template, so all of its params are explicit.
+        self._explicit_params: set[str] = set()
+        # dtype contracts for DATA args the signature already declares:
+        # {name -> dtype}. data() populates it; validated at freeze
+        # against the signature-derived DATA set.
+        self._data_contracts: dict[str, Any] = {}
+        self._composed: dict[str, Node] = {}
+        # build-phase sharing in the Node form: {source path -> canonical path}
+        # (segment tuples), plus {synthetic top-level name -> Node|Slot} for the
+        # roots/leaves share(as_=...) re-roots, and the set of already-shared
+        # source paths for dup detection. See share()/share_identical().
+        self._shared: dict[tuple, tuple] = {}
+        self._synthetic: dict[str, Any] = {}
+        self._shared_seen: set[tuple] = set()
         self._frozen = False
+
+    # legal PARAM accessor set for this builder's device/host surface - a
+    # two-segment chain (name, accessor) is a PARAM read/write; anything else
+    # at an uncomposed root is a missing composition. Overridden by
+    # HostBlockBuilder (host-facing get/set/read).
+    _LEGAL_ACCESSORS = ("get", "set_node")
+    # whether this builder's signature after ctx contributes DATA slots
+    # (Kernel/HostBlock yes; Helper/Group no - a helper's args are device-call
+    # arguments, a group has no signature).
+    _HAS_DATA = False
 
     @property
     def uid(self) -> int:
         """Process-wide identity assigned at construction. See Parameter.uid (parameter.py)."""
         return self._uid
 
-    @property
-    def slots(self) -> SlotGroup:
-        """This builder's currently wired slots. Read-only - go through wire_*() to add more."""
-        return self._slots
-
-    @property
-    def composed(self) -> dict[str, _Frozen]:
-        """This builder's currently composed {name: frozen sub-structure}. Read-only - go through compose()."""
-        return dict(self._composed)
-
     def _check_mutable(self) -> None:
         if self._frozen:
-            raise FrozenBuilderError(
+            raise FrozenError(
                 f"{type(self).__name__}(uid={self._uid}) has already closed its build phase "
-                f"(ingest()/freeze()) and is frozen - build a new {type(self).__name__} "
+                f"(freeze()) and is frozen - build a new {type(self).__name__} "
                 f"instead of reusing this one"
             )
 
-    def _wire(self, slot: Slot) -> "_Builder":
-        self._check_mutable()
-        if slot.name == RESERVED_BK_NAME:
-            raise SlotGroupError(
-                f"'{RESERVED_BK_NAME}' is reserved - ctx.{RESERVED_BK_NAME} is the "
-                f"backend-intrinsics namespace (bk.py) and can never be wired as a slot"
-            )
-        if slot.name in self._composed:
-            raise SlotGroupError(f"'{slot.name}' is already composed on this builder")
-        self._slots.add(slot)
-        return self
-
-    def wire_param(self, name: str) -> "_Builder":
-        """
-        Declare a PARAM slot named `name`: reached in device code as
-        `ctx.{name}.get(...)` / `ctx.{name}.set_node(...)`, uniformly across
-        whatever mode the Parameter eventually bound to it has (see slot.py's
-        module docstring). Deliberately generic - a slot declares a place to
-        plug in a Parameter (parameter.py) later, not a shape; nothing
-        here constrains mode or dtype, which is the entire point of a
-        Parameter being able to move between const/scalar/field without
-        touching a template.
-
-        Parameters
-        ----------
-        name : str
-            Slot name.
-
-        Returns
-        -------
-        _Builder
-            self, for chaining.
-
-        Author: B.G (08/2026)
-        """
-        return self._wire(ParamSlot(name))
-
-    def wire_helper(self, name: str) -> "_Builder":
-        """
-        Declare a HELPER slot named `name`: called in device code as
-        `ctx.{name}(...)`. Filled at build time via compose() under this
-        same name - see the module docstring and compose()'s own docstring
-        for why compose() (and only compose()) may target an already-wired
-        HELPER slot.
-
-        Parameters
-        ----------
-        name : str
-            Slot name.
-
-        Returns
-        -------
-        _Builder
-            self, for chaining.
-
-        Author: B.G (08/2026)
-        """
-        return self._wire(HelperSlot(name))
-
-    def wire_data(self, name: str, *, dtype: Any = None) -> "_Builder":
-        """
-        Declare a DATA slot named `name`: a trusted call argument of the
-        compiled kernel/helper's own signature, never reached through `ctx`.
-        See slot.py's module docstring for the PARAM/HELPER/DATA distinction.
-        Overridden on HelperBuilder to always raise - a helper is
-        device-only and takes data only as its caller's own trusted
-        argument, never as a declared slot of its own.
-
-        Parameters
-        ----------
-        name : str
-        dtype : optional
-            Declares this slot's data-argument contract, checked later at
-            bind/compile time against whatever value is actually bound or
-            passed. Left as None, the slot stays open to any dtype.
-
-        Returns
-        -------
-        _Builder
-            self, for chaining.
-
-        Author: B.G (08/2026)
-        """
-        return self._wire(DataSlot(name, dtype=dtype))
-
-    def compose(self, name: str, frozen: _Frozen, *, split: "list[str] | None" = None) -> "_Builder":
-        """
-        Attach an already-frozen sub-structure (a FrozenKernel, FrozenHelper
-        or FrozenGroup - frozen.py) under slot `name`, giving a template
-        reaching `ctx.{name}` access to whatever `frozen` itself provides -
-        `{name}.{member}` for any PARAM/HELPER slot or composed root
-        `frozen` carries at its own top level.
-
-        `frozen` is stored by identity, not copied: compose the same object
-        into any number of builders and every one of them shares it.
-
-        `name` may be either fresh (nothing wired or composed under it yet)
-        or a HELPER slot already declared via wire_helper() on this same
-        builder - composing there is how that slot's "reachable, filled in
-        later" promise is kept, and is the one case where a name may be used
-        twice: once to wire the slot, once to compose its content. Composing
-        under a name already composed, or already wired as PARAM/DATA
-        (a kind compose() has no business filling), raises. `frozen` must be
-        a FrozenHelper or a FrozenGroup - a FrozenKernel raises: a kernel is
-        a host entry point, not something device code can call, and on a GPU
-        backend a kernel cannot call another kernel.
-
-        `split`, optional, is a list of dotted relative paths (e.g.
-        `"neighbour_raw.row.NX"`) that opt back out of `frozen`'s own
-        build-phase sharing (GroupBuilder.share(), FrozenGroup.shared) at
-        THIS compose site, re-minting each as its own independently-bindable
-        address instead of collapsing into its shared canonical - see the
-        module docstring and bound.py's module docstring for the full
-        mechanism.
-
-        Parameters
-        ----------
-        name : str
-            Slot name to compose `frozen` under.
-        frozen : FrozenHelper or FrozenGroup
-            Already-frozen sub-structure to attach.
-        split : list[str], optional
-            Dotted relative paths to opt back out of `frozen`'s build-phase
-            sharing at this compose site.
-
-        Returns
-        -------
-        _Builder
-            self, for chaining.
-
-        Raises
-        ------
-        TypeError
-            If `frozen` is not a `_Frozen`, or is a FrozenKernel.
-        SlotGroupError
-            If `name` is reserved, already composed, already wired as a
-            non-HELPER slot, or `split` names a path not in
-            `frozen.shared`, or `split` is given for a `frozen` with no
-            shared paths at all.
-
-        Author: B.G (08/2026)
-        """
-        self._check_mutable()
+    def _check_name(self, name: str, what: str) -> None:
         if name == RESERVED_BK_NAME:
             raise SlotGroupError(
                 f"'{RESERVED_BK_NAME}' is reserved - ctx.{RESERVED_BK_NAME} is the "
-                f"backend-intrinsics namespace (bk.py) and can never be composed as a root"
+                f"backend-intrinsics namespace (bk.py) and can never be a {what}"
             )
-        if not isinstance(frozen, _Frozen):
-            raise TypeError(f"compose({name!r}, ...): expected a FrozenKernel/FrozenHelper, got {type(frozen).__name__}")
+
+    def param(self, name: str) -> "_Builder":
+        """
+        Declare an EXTRA PARAM slot the template does not reference - the case
+        the template's own contract cannot derive: a canonical leaf a later
+        share()/share_leaf collapses into (a GroupBuilder, which has no template,
+        declares every one of its params this way), or a param bound but read
+        only through a composed child.
+
+        Strict: raises at freeze() if `name` turns out to be a derived slot
+        (already implied by the template) or a composed child.
+
+        Author: B.G (09/2026)
+        """
+        self._check_mutable()
+        self._check_name(name, "PARAM slot")
+        self._explicit_params.add(name)
+        return self
+
+    def data(self, name: str, *, dtype: Any = None) -> "_Builder":
+        """
+        Attach a dtype contract to a DATA slot the template's signature already
+        declares (a kernel's parameters after `ctx`). Raises at freeze() if
+        `name` is not a signature argument. Kernel and HostBlock only - a helper
+        has no DATA slots of its own, a group no signature.
+
+        Author: B.G (09/2026)
+        """
+        self._check_mutable()
+        self._data_contracts[name] = dtype
+        return self
+
+    def compose(self, name: str, frozen: Node) -> "_Builder":
+        """
+        Attach an already-frozen sub-structure (a FrozenHelper or FrozenGroup -
+        frozen.py) under `name`, giving a template reaching `ctx.{name}` access
+        to whatever `frozen` provides at its own top level. `frozen` is stored
+        by identity, not copied. Composing under a name already composed, or
+        already declared an explicit PARAM slot, raises. A FrozenKernel raises:
+        a kernel is a host entry point, not device-callable.
+
+        Author: B.G (08/2026)
+        """
+        self._check_mutable()
+        self._check_name(name, "composed root")
+        if not isinstance(frozen, Node):
+            raise TypeError(f"compose({name!r}, ...): expected a FrozenHelper/FrozenGroup, got {type(frozen).__name__}")
         if isinstance(frozen, FrozenKernel):
-            raise TypeError(
+            raise SlotGroupError(
                 f"compose({name!r}, ...): got a FrozenKernel, not a FrozenHelper - a kernel is a "
                 f"host entry point, not a device-callable helper, and cannot be composed into "
                 f"another builder (on a GPU backend a kernel cannot call another kernel). Build "
@@ -272,335 +270,286 @@ class _Builder:
             )
         if name in self._composed:
             raise SlotGroupError(f"'{name}' is already composed on this builder")
-        if name in self._slots and self._slots[name].kind is not SlotKind.HELPER:
-            raise SlotGroupError(
-                f"'{name}' is already wired on this builder as {self._slots[name]!r}; compose() "
-                f"only fills a HELPER slot (or a fresh name), never a PARAM/DATA one"
-            )
+        if name in self._explicit_params:
+            raise SlotGroupError(f"'{name}' is already declared a PARAM slot on this builder; compose() cannot reuse it")
         self._composed[name] = frozen
-        if split:
-            shared = getattr(frozen, "shared", None)
-            if not shared:
-                raise SlotGroupError(
-                    f"compose({name!r}, ..., split={split!r}): {name!r}'s frozen object has no "
-                    f"build-phase-shared PARAM paths to split - split only applies to a "
-                    f"FrozenGroup composed with at least one share() declaration"
-                )
-            all_shared = {p for paths in shared.values() for p in paths}
-            resolved = set()
-            for path in split:
-                segs = tuple(path.split("."))
-                if segs not in all_shared:
-                    raise SlotGroupError(
-                        f"compose({name!r}, ..., split=...): {path!r} is not a shared path on "
-                        f"the composed group (shared paths: "
-                        f"{sorted('.'.join(p) for p in all_shared)})"
-                    )
-                resolved.add(segs)
-            self._split[name] = frozenset(resolved)
         return self
 
-    def share(self, canonical: str, *paths: str) -> "_Builder":
+    def _derive_contract(self):
         """
-        Declare that `canonical` - a PARAM slot already wire_param()'d on
-        THIS builder - is the same value as each dotted `paths`, a relative
-        address reaching a PARAM slot somewhere in this builder's own
-        already-composed subtree (e.g. `"neighbour_raw.row.NX"`: the `row`
-        helper composed inside the `neighbour_raw` helper composed on this
-        builder, its own `NX` slot). bound.py's build() acts on this: by
-        default, every declared path collapses into `canonical`'s own
-        address - only `canonical` is independently minted, not every
-        private occurrence - which is the whole point (see bound.py's
-        module docstring for why this needed a build-phase mechanism rather
-        than being left to bind-phase wire() or bulk/pattern binding).
+        The (contract, data_names) this builder's template implies: a ctx.* AST
+        walk (python) or `$...$` span scan (cupy). The signature is read for
+        DATA names only when this builder contributes DATA (`_HAS_DATA` - a
+        kernel/host block; not a helper, whose signature after ctx is
+        device-call arguments, nor a template-less group).
 
-        This is explicit and local to one builder's own authoring - never
-        name-based matching across independently-authored composites (which
-        is exactly the kind of accidental collision this architecture's
-        addressing exists to prevent). A caller composing this builder's
-        frozen result elsewhere opts specific paths back OUT of the collapse
-        via compose()'s own `split=` (`_Builder.compose()`).
+        Author: B.G (09/2026)
+        """
+        template = self._template
+        if template is None:
+            return Contract(frozenset()), []
+        if isinstance(template, str):
+            contract = extract_cupy_contract(template)
+            if self._HAS_DATA:
+                from .compile_cupy import _check_cupy_data_signature
+                return contract, _check_cupy_data_signature(template)
+            return contract, []
+        contract = extract_python_contract(template)
+        if self._HAS_DATA:
+            from .compile_shared import check_data_signature
+            return contract, check_data_signature(template)
+        return contract, []
 
-        Available on KernelBuilder and HelperBuilder as well as GroupBuilder:
-        a kernel or helper that both reads a composed sub-structure's PARAM
-        slot directly (via its own wire_param()) and also composes something
-        that re-composes the same sub-structure may collapse those
-        occurrences itself, exactly as a GroupBuilder does for its own
-        composed children - no group wrapper needed purely to reach share().
-        For a KernelBuilder, `canonical` is only actually usable as a
-        collapse target - and this builder's own `.shared` only actually
-        takes effect - when this object is later reached as build()'s own
-        top-level frozen argument (a FrozenKernel is never itself composed
-        as someone else's child, per compose()'s own FrozenKernel guard
-        above); for a HelperBuilder composed as a child elsewhere, its
-        `.shared` is consulted exactly as a FrozenGroup's is (see bound.py's
-        module docstring).
+    def _resolve_chain(self, chain: tuple, root_node: Node) -> None:
+        """
+        Resolve a contract chain that entered composed child `root_node`
+        (chain[0]) to its end through the child's own children/slots. A chain
+        that dead-ends - a segment that is neither a child nor a PARAM leaf of
+        the deepest node reached, or trailing segments after a PARAM leaf that
+        are not a single legal accessor - raises ContractError naming the full
+        chain and the deepest node. See the module docstring.
 
-        Parameters
-        ----------
-        canonical : str
-            PARAM slot, already wire_param()'d on this builder, that the
-            given `paths` collapse into.
-        *paths : str
-            Dotted relative addresses into this builder's own composed
-            subtree, each naming a PARAM slot to share with `canonical`.
+        Author: B.G (09/2026)
+        """
+        cur = root_node
+        walked = chain[0]
+        segs = chain[1:]
+        i = 0
+        while i < len(segs):
+            seg = segs[i]
+            if seg in cur.children:
+                cur = cur.children[seg]
+                walked = f"{walked}.{seg}"
+                i += 1
+                continue
+            if seg in cur.slots.names(SlotKind.PARAM):
+                rest = segs[i + 1 :]
+                if rest == () or (len(rest) == 1 and rest[0] in self._LEGAL_ACCESSORS):
+                    return
+                raise ContractError(
+                    f"chain 'ctx.{'.'.join(chain)}': after PARAM leaf {seg!r} of {walked!r} "
+                    f"expected a single accessor {self._LEGAL_ACCESSORS}, got {'.'.join(rest)!r}"
+                )
+            raise ContractError(
+                f"chain 'ctx.{'.'.join(chain)}' dead-ends: {seg!r} is neither a composed child "
+                f"nor a PARAM slot of {walked!r} (it provides {sorted(cur.provides)})"
+            )
 
-        Returns
-        -------
-        _Builder
-            self, for chaining.
+    def _classify_roots(self, contract) -> tuple[set, set]:
+        """
+        Partition this template's contract roots into (derived PARAM names,
+        missing names). A root that is composed is resolved through its child
+        (raising on a dead-end / composed-as-Parameter chain) and contributes to
+        neither set. Every other root is PARAM iff all its chains are two
+        segments ending in a legal accessor, else missing. See the module
+        docstring's disambiguation rules.
 
-        Raises
-        ------
-        SlotGroupError
-            If `canonical` is not a PARAM slot wired on this builder, if a
-            path does not resolve (through this builder's already-composed
-            children) to a real PARAM slot, or if a path is already declared
-            shared under a different (or the same) canonical - each relative
-            path may be shared at most once.
+        Author: B.G (09/2026)
+        """
+        derived: set[str] = set()
+        missing: set[str] = set()
+        by_root: dict[str, list] = {}
+        for chain in contract.chains:
+            by_root.setdefault(chain[0], []).append(chain)
+        for root, chains_r in by_root.items():
+            if root == RESERVED_BK_NAME:
+                continue
+            if root in self._composed:
+                for chain in chains_r:
+                    self._resolve_chain(chain, self._composed[root])
+                continue
+            if all(len(c) == 2 and c[1] in self._LEGAL_ACCESSORS for c in chains_r):
+                derived.add(root)
+            else:
+                missing.add(root)
+        return derived, missing
 
-        Author: B.G (08/2026)
+    def missing(self) -> set:
+        """
+        The contract roots that are neither composed nor PARAM-able - a root
+        used with a bare call or a further segment but never composed. Empty
+        means freeze() will succeed (contract-wise). See the module docstring.
+
+        Author: B.G (09/2026)
+        """
+        contract, _data = self._derive_contract()
+        _derived, missing = self._classify_roots(contract)
+        return missing
+
+    def _build(self) -> "tuple[SlotGroup, dict, Contract]":
+        """
+        The (slots, composed, contract) triple freeze() turns into a Frozen:
+        PARAM slots derived from the template's contract merged with explicit
+        param() declarations, DATA slots derived from the signature (Kernel/
+        HostBlock) carrying any data() dtype contract. Raises ContractError on a
+        missing root or a dead-end chain, SlotGroupError on an explicit-param
+        conflict or a data() name absent from the signature.
+
+        Author: B.G (09/2026)
         """
         self._check_mutable()
-        if canonical not in self._slots or self._slots[canonical].kind is not SlotKind.PARAM:
-            raise SlotGroupError(
-                f"share({canonical!r}, ...): {canonical!r} is not a PARAM slot wired on this "
-                f"builder - call wire_param({canonical!r}) before share()"
+        contract, data_names = self._derive_contract()
+        derived, missing = self._classify_roots(contract)
+        if missing:
+            label = getattr(self._template, "__name__", repr(self._template))
+            raise ContractError(
+                f"template {label!r}: ctx root(s) {sorted(missing)} are used with a call or a "
+                f"further segment but never composed - compose() a frozen sub-structure under "
+                f"each (a bare `ctx.X.get(...)` would instead derive a PARAM slot)"
             )
-        if not paths:
-            raise SlotGroupError(f"share({canonical!r}): at least one path is required")
-
-        already_shared = {p for ps in self._shared.values() for p in ps}
-        resolved: list[tuple] = []
-        for path in paths:
-            segs = tuple(path.split("."))
-            if len(segs) < 2:
+        param_names = set(derived)
+        for name in self._explicit_params:
+            if name in self._composed:
+                raise SlotGroupError(f"'{name}' is both an explicit PARAM slot and a composed child")
+            if name in derived:
                 raise SlotGroupError(
-                    f"share({canonical!r}, {path!r}): a shared path must reach into a composed "
-                    f"child (at least 'child.PARAM'), got {path!r}"
+                    f"param({name!r}): {name!r} is already a template-derived PARAM slot - "
+                    f"drop the explicit param() (it is only for slots the template does not imply)"
                 )
-            root = segs[0]
-            if root not in self._composed:
-                raise SlotGroupError(f"share({canonical!r}, {path!r}): {root!r} is not composed on this builder")
-            node: _Frozen = self._composed[root]
-            walked = root
-            for seg in segs[1:-1]:
-                if seg not in node.composed:
-                    raise SlotGroupError(f"share({canonical!r}, {path!r}): {seg!r} is not composed under {walked!r}")
-                node = node.composed[seg]
-                walked = f"{walked}.{seg}"
-            leaf = segs[-1]
-            if leaf not in node.slots.names(SlotKind.PARAM):
-                raise SlotGroupError(f"share({canonical!r}, {path!r}): {leaf!r} is not a PARAM slot under {walked!r}")
-            if segs in already_shared:
-                raise SlotGroupError(f"share({canonical!r}, {path!r}): {path!r} is already shared")
-            resolved.append(segs)
-            already_shared.add(segs)
+            param_names.add(name)
 
-        self._shared.setdefault(canonical, [])
-        self._shared[canonical].extend(resolved)
-        return self
-
-    def _derive_and_check(self, template: Any) -> tuple[SlotGroup, dict[str, _Frozen], Contract]:
-        """
-        Derive `template`'s Contract and check every chain it requires
-        against this builder's wired slots and composed sub-structures -
-        see the module docstring for exactly what each chain shape needs.
-        Returns the (slots, composed, contract) triple ingest() freezes
-        into a FrozenKernel/FrozenHelper; raises nothing itself, letting
-        ContractError/SlotGroupError from the checks below propagate.
-
-        Author: B.G (08/2026)
-        """
-        contract = extract_cupy_contract(template) if isinstance(template, str) else extract_python_contract(template)
-
-        param_and_helper_roots = self._slots.names(SlotKind.PARAM) | self._slots.names(SlotKind.HELPER)
-        data_roots = self._slots.names(SlotKind.DATA)
-
-        for chain in contract.chains:
-            root = chain[0]
-            if root in self._composed:
-                contract.check_root(root, self._composed[root].provides)
-            elif root in param_and_helper_roots:
-                continue
-            elif root in data_roots:
-                raise ContractError(
-                    f"ctx.{root} is not reachable: '{root}' is a wire_data slot, and data is "
-                    f"a trusted call argument of the template's own signature, never reached "
-                    f"through ctx - pass it as a plain parameter instead of wiring it as a slot"
-                )
-            else:
-                raise ContractError(
-                    f"ctx.{root} has no declared slot - call wire_param({root!r}) or "
-                    f"wire_helper({root!r}) before ingest(), or compose({root!r}, ...) an "
-                    f"already-frozen sub-structure"
+        data_set = set(data_names) if self._HAS_DATA else set()
+        for name in self._data_contracts:
+            if name not in data_set:
+                raise SlotGroupError(
+                    f"data({name!r}): {name!r} is not a DATA argument of the template signature "
+                    f"{sorted(data_set)}"
                 )
 
-        return self._slots.copy(), dict(self._composed), contract
+        sg = SlotGroup()
+        for name in sorted(param_names):
+            sg.add(ParamSlot(name))
+        for name in data_names if self._HAS_DATA else []:
+            sg.add(DataSlot(name, dtype=self._data_contracts.get(name)))
+        self._frozen = True
+        return sg, dict(self._composed), contract
 
 
 class HelperBuilder(_Builder):
     """
-    Builds a device helper: PARAM/HELPER slots only, no data of its own. See
-    the module docstring's local-contract rules and frozen.py for what
-    ingest() returns.
+    Builds a device helper (frozen.py's FrozenHelper): PARAM slots and composed
+    children only. A helper's template signature after `ctx` is ordinary
+    device-call arguments, not DATA slots, so it has no DATA of its own -
+    data() raises. PARAM slots are derived from the template's
+    contract; param() adds any the template does not imply.
 
-    A helper takes data only as a trusted argument passed by whatever calls
-    it - never a declared slot of its own - so wire_data always raises here.
-
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
 
-    def wire_data(self, name: str, *, dtype: Any = None) -> "HelperBuilder":
-        """
-        Always raises: a HelperBuilder is device-only and carries PARAM and
-        HELPER slots only. Data reaches a helper as a trusted call argument
-        supplied by whatever calls it, never as a slot declared on the
-        helper itself. Declare the data slot on the enclosing KernelBuilder
-        instead.
+    _HAS_DATA = False
 
-        Author: B.G (08/2026)
-        """
-        raise TypeError(
-            "HelperBuilder.wire_data() is not allowed: a helper is device-only and takes data "
-            "only as a trusted call argument of its caller. Declare wire_data on the enclosing "
-            "KernelBuilder, and pass the value through as an ordinary template argument."
+    def __init__(self, template: Any = None):
+        super().__init__(template)
+
+    def data(self, name: str, *, dtype: Any = None) -> "HelperBuilder":
+        """Always raises: a helper takes data as a trusted call argument of its caller, never as a slot of its own."""
+        raise BuildError(
+            "HelperBuilder.data() is not allowed: a helper is device-only and takes "
+            "data only as a trusted call argument of its caller. Declare the DATA argument on the "
+            "enclosing KernelBuilder's own signature, and pass the value through."
         )
 
-    def ingest(self, template: Any) -> FrozenHelper:
-        """
-        Close out the build phase: derive and check `template`'s contract
-        (see the module docstring), freeze this builder, and return the
-        resulting FrozenHelper.
-
-        Parameters
-        ----------
-        template : Any
-            A python def (closure backends) or CUDA source text (cupy).
-
-        Returns
-        -------
-        FrozenHelper
-
-        Raises
-        ------
-        ContractError
-            If a chain `template` requires has no matching slot/composed
-            root.
-
-        Author: B.G (08/2026)
-        """
-        self._check_mutable()
-        slots, composed, contract = self._derive_and_check(template)
-        self._frozen = True
-        return FrozenHelper(template, slots, composed, contract, split=self._split, shared=self._shared)
+    def freeze(self) -> FrozenHelper:
+        """Derive slots from the template's contract (frozen.py) and return the FrozenHelper. See _Builder._build()."""
+        slots, composed, contract = self._build()
+        return FrozenHelper(self._template, slots, composed, contract, shared=self._shared, synthetic=self._synthetic)
 
 
 class KernelBuilder(_Builder):
     """
-    Builds a kernel: PARAM/HELPER/DATA slots all allowed. See the module
-    docstring's local-contract rules and frozen.py for what ingest() returns.
+    Builds a kernel (frozen.py's FrozenKernel): a device entry point. PARAM
+    slots are derived from the template's `ctx.X.get(...)` contract; DATA slots
+    from the template's own signature after `ctx` (python) / `__global__`
+    parameter list (cupy). param() adds an extra PARAM the template does not
+    imply (a share canonical); data() attaches a dtype contract to a
+    signature-declared DATA argument. `domain`/`block` are the launch config
+    (Unit 4).
 
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
 
-    def ingest(self, template: Any) -> FrozenKernel:
-        """
-        Close out the build phase: derive and check `template`'s contract
-        (see the module docstring), freeze this builder, and return the
-        resulting FrozenKernel.
+    _HAS_DATA = True
 
-        Parameters
-        ----------
-        template : Any
-            A python def (closure backends) or CUDA source text (cupy).
+    def __init__(self, template: Any = None, *, domain: "str | int | None" = None, block: "int | None" = None):
+        super().__init__(template)
+        self._domain = domain
+        self._block = block
 
-        Returns
-        -------
-        FrozenKernel
-
-        Raises
-        ------
-        ContractError
-            If a chain `template` requires has no matching slot/composed
-            root.
-
-        Author: B.G (08/2026)
-        """
-        self._check_mutable()
-        slots, composed, contract = self._derive_and_check(template)
-        self._frozen = True
-        return FrozenKernel(template, slots, composed, contract, split=self._split, shared=self._shared)
+    def freeze(self) -> FrozenKernel:
+        """Derive slots from the template's contract and signature (frozen.py) and return the FrozenKernel. See _Builder._build()."""
+        slots, composed, contract = self._build()
+        return FrozenKernel(
+            self._template, slots, composed, contract,
+            shared=self._shared, synthetic=self._synthetic,
+            domain=self._domain, block=self._block,
+        )
 
 
 class GroupBuilder(_Builder):
     """
-    Builds a non-callable, navigable composite: PARAM/HELPER slots and
-    composed sub-structures only, no template of its own and never callable
-    in device code - see frozen.py's FrozenGroup for what this closes into
-    and why it exists (a caller needing both `ctx.grid.neighbour(i, k)`, a
-    composed HELPER call, and `ctx.grid.NX.get(0)`, a PARAM leaf reached
-    straight through the same composite, one level in).
+    Builds a non-callable, navigable composite (frozen.py's FrozenGroup): PARAM
+    slots and composed children only, no template of its own. Because there is
+    no template to derive from, EVERY one of a group's PARAM slots is declared
+    explicitly via param() (the canonical leaves share_leaf collapses into);
+    data() raises (a group is never a call argument's signature).
 
-    `wire_data` always raises, for the same reason it does on HelperBuilder:
-    a group is device-structure-only, never a call argument's own signature.
-
-    `share()` (inherited from `_Builder` - see its own docstring for the full
-    mechanism) is build-phase sharing: a group PARAM slot the group's own
-    author declares once, that stands in for the same value re-read by
-    several of the group's own composed children - frozen.py's FrozenGroup
-    is what it freezes into.
-
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
 
-    def wire_data(self, name: str, *, dtype: Any = None) -> "GroupBuilder":
-        """
-        Always raises: a GroupBuilder declares PARAM/HELPER slots only. See
-        HelperBuilder.wire_data() (same reasoning) and frozen.py's
-        FrozenGroup.
+    _HAS_DATA = False
 
-        Author: B.G (08/2026)
-        """
-        raise TypeError(
-            "GroupBuilder.wire_data() is not allowed: a group is a passive, device-structure-"
-            "only composite - it is never the template a call argument belongs to. Declare "
-            "wire_data on whichever KernelBuilder eventually composes this group."
+    def __init__(self):
+        super().__init__(None)
+
+    def data(self, name: str, *, dtype: Any = None) -> "GroupBuilder":
+        """Always raises: a group is a passive device-structure composite, never a call argument's signature."""
+        raise BuildError(
+            "GroupBuilder.data() is not allowed: a group is a passive, device-"
+            "structure-only composite. Declare the DATA argument on whichever KernelBuilder "
+            "composes this group."
         )
 
     def freeze(self) -> FrozenGroup:
-        """
-        Close out the build phase and return the resulting FrozenGroup.
-        Unlike KernelBuilder.ingest()/HelperBuilder.ingest(), there is no
-        template to derive a Contract from - a group is never itself the
-        target of a ctx.* chain resolution of its own body (see frozen.py),
-        so its Contract is always empty. Every wired HELPER slot must still
-        end up composed by build() time (frozen.py/bound.py), exactly as for
-        a HelperBuilder/KernelBuilder - unreferenced here since there is no
-        template to check it against at this phase, but still enforced one
-        phase later.
-
-        Returns
-        -------
-        FrozenGroup
-
-        Author: B.G (08/2026)
-        """
-        self._check_mutable()
-        self._frozen = True
-        return FrozenGroup(
-            None, self._slots.copy(), dict(self._composed), Contract(frozenset()),
-            split=self._split, shared=self._shared,
-        )
+        """Return the FrozenGroup: PARAM slots from param(), children from compose(), empty contract (no template)."""
+        slots, composed, contract = self._build()
+        return FrozenGroup(None, slots, composed, contract, shared=self._shared, synthetic=self._synthetic)
 
 
-def find_param_paths(frozen: "_Frozen", leaf_name: str, prefix: tuple = ()) -> list:
+def freeze_helper(template, *, helpers=None, params=()):
+    """Freeze a helper template with its composed children.
+
+    ``params`` remains accepted only while feature call sites are consolidated;
+    helper PARAM slots are derived from the template contract.
+
+    Author: B.G (09/2026)
+    """
+    builder = HelperBuilder(template)
+    for name, frozen in (helpers or {}).items():
+        builder.compose(name, frozen)
+    return builder.freeze()
+
+
+def freeze_kernel(template, *, helpers=None, params=(), data=(), domain=None, block=None):
+    """Freeze a kernel template with its composed children and launch domain.
+
+    ``params`` and ``data`` remain accepted only while feature call sites are
+    consolidated; kernel slots are derived from the template contract.
+
+    Author: B.G (09/2026)
+    """
+    builder = KernelBuilder(template, domain=domain, block=block)
+    for name, frozen in (helpers or {}).items():
+        builder.compose(name, frozen)
+    return builder.freeze()
+
+
+def find_param_paths(frozen: Node, leaf_name: str, prefix: tuple = ()) -> list:
     """
     Every relative dotted path, as a `"a.b.NAME"` string, under `frozen`'s own
-    composed subtree whose PARAM slot is literally named `leaf_name` - the
+    children subtree whose PARAM slot is literally named `leaf_name` - the
     itemized list `share_leaf` hands to GroupBuilder.share(). Recurses through
-    `.composed` only (a HELPER slot with nothing composed raises earlier, at
-    that structure's own ingest()/build(), never reached here). Generic over
+    `.children` only (a HELPER slot with nothing composed raises earlier, at
+    that structure's own freeze()/build(), never reached here). Generic over
     whether a composed node is itself a FrozenHelper or a nested FrozenGroup.
 
     Shared by grid/noise/visu's own factories - see grid/__init__.py's module
@@ -609,7 +558,7 @@ def find_param_paths(frozen: "_Frozen", leaf_name: str, prefix: tuple = ()) -> l
 
     Parameters
     ----------
-    frozen : _Frozen
+    frozen : Node
         Sub-structure to search.
     leaf_name : str
         PARAM slot name to find.
@@ -627,7 +576,7 @@ def find_param_paths(frozen: "_Frozen", leaf_name: str, prefix: tuple = ()) -> l
     paths = []
     if leaf_name in frozen.slots.names(SlotKind.PARAM):
         paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
+    for name, child in frozen.children.items():
         paths.extend(find_param_paths(child, leaf_name, prefix + (name,)))
     return paths
 
@@ -652,7 +601,136 @@ def share_leaf(group: "GroupBuilder", canonical: str) -> None:
     Author: B.G (08/2026)
     """
     paths = []
-    for name, child in group.composed.items():
+    for name, child in group._composed.items():
         paths.extend(find_param_paths(child, canonical, (name,)))
     if paths:
         group.share(canonical, *paths)
+
+
+def classify_path(top_slots: "SlotGroup | None", top_composed: dict, segs: tuple, *, what: str):
+    """
+    Resolve a dotted relative path (as a segment tuple `segs`) into
+    `(kind, node, slot)`, where kind is `"param"`, `"data"` or `"root"`. A leaf
+    resolves against `top_slots` (a top-level slot) or a slot of a composed
+    child reached through `top_composed`; a child root resolves to the composed
+    Node found there (returned as `node`). Raises BuildError, tagged with
+    `what` (the calling method), if the path does not resolve.
+
+    Shared by every builder's share()/share_identical() (_Builder, RoutineBuilder,
+    SequenceBuilder): `top_slots` is that builder's own top-level slots (None for
+    a routine/sequence, which have none) and `top_composed` its composed children
+    (a kernel/helper/group's composed subtree, or a routine/sequence's blocks).
+
+    Author: B.G (09/2026)
+    """
+    root = segs[0]
+    if len(segs) == 1:
+        if top_slots is not None and root in top_slots:
+            k = top_slots[root].kind
+            if k is SlotKind.PARAM:
+                return ("param", None, top_slots[root])
+            if k is SlotKind.DATA:
+                return ("data", None, top_slots[root])
+            raise BuildError(f"{what} {'.'.join(segs)!r}: {root!r} names a HELPER slot, which is not shareable")
+        if root in top_composed:
+            return ("root", top_composed[root], None)
+        raise BuildError(f"{what} {'.'.join(segs)!r}: {root!r} is not a top-level slot or composed child")
+    if root not in top_composed:
+        raise BuildError(f"{what} {'.'.join(segs)!r}: {root!r} is not a composed child")
+    node = top_composed[root]
+    walked = root
+    for seg in segs[1:-1]:
+        if seg not in node.children:
+            raise BuildError(f"{what} {'.'.join(segs)!r}: {seg!r} is not composed under {walked!r}")
+        node = node.children[seg]
+        walked = f"{walked}.{seg}"
+    leaf = segs[-1]
+    if leaf in node.children:
+        return ("root", node.children[leaf], None)
+    if leaf in node.slots.names(SlotKind.PARAM):
+        return ("param", None, node.slots[leaf])
+    if leaf in node.slots.names(SlotKind.DATA):
+        return ("data", None, node.slots[leaf])
+    raise BuildError(f"{what} {'.'.join(segs)!r}: {leaf!r} is not a PARAM/DATA slot or child root under {walked!r}")
+
+
+def find_identical_roots(top_composed: dict, target, prefix: tuple = ()) -> list:
+    """
+    Every dotted path, as a string, of a composed child root anywhere in
+    `top_composed` (any depth) whose Node `is` `target`. What share_identical()
+    hands to share(). See classify_path for the tree shape.
+
+    Author: B.G (09/2026)
+    """
+    found = []
+    for name, node in top_composed.items():
+        p = prefix + (name,)
+        if node is target:
+            found.append(".".join(p))
+        found.extend(find_identical_roots(dict(node.children), target, p))
+    return found
+
+
+def compute_share(top_slots, top_composed, existing_top_names, shared_seen, canonical, paths, as_):
+    """
+    The shared implementation of `.share(canonical, *paths, as_=)` for every
+    builder level. Resolves and validates the specs (all same kind; shared
+    roots identical; no path shared twice; `as_` not colliding), and returns
+    `(new_shared, synthetic, seen_add)`:
+
+      new_shared  {source path -> canonical path} to merge into the builder's
+                  own `_shared` (the Node.shared form).
+      synthetic   {as_ name -> Node|Slot} to merge into `_synthetic`, empty
+                  unless `as_` was given.
+      seen_add    the source paths to record as already-shared.
+
+    See _Builder.share() for the caller-facing contract. Raises BuildError.
+
+    Author: B.G (09/2026)
+    """
+    specs = [canonical, *paths]
+    classified = []
+    for spec in specs:
+        segs = tuple(spec.split("."))
+        kind, node, slot = classify_path(top_slots, top_composed, segs, what="share")
+        classified.append((spec, segs, kind, node, slot))
+    kinds = {c[2] for c in classified}
+    if len(kinds) != 1:
+        raise BuildError(f"share: every path must be the same kind, got { {c[0]: c[2] for c in classified} }")
+    kind = next(iter(kinds))
+    if kind == "root":
+        ids = {id(c[3]) for c in classified}
+        if len(ids) != 1:
+            raise BuildError(f"share{specs}: shared roots must be the identical frozen object ('is'), got distinct objects")
+
+    new_shared: dict = {}
+    synthetic: dict = {}
+    seen_add: set = set()
+
+    if as_ is not None:
+        if as_ in existing_top_names:
+            raise BuildError(f"share(as_={as_!r}): collides with an existing top-level name")
+        canonical_addr = (as_,)
+        for spec, segs, _k, _node, _slot in classified:
+            if segs in shared_seen:
+                raise BuildError(f"share: {spec!r} is already shared")
+            new_shared[segs] = canonical_addr
+            seen_add.add(segs)
+        c0 = classified[0]
+        if kind == "root":
+            synthetic[as_] = c0[3]
+        elif kind == "param":
+            synthetic[as_] = ParamSlot(as_)
+        else:
+            synthetic[as_] = DataSlot(as_, dtype=getattr(c0[4], "dtype", None))
+    else:
+        if len(classified) < 2:
+            raise BuildError("share: needs at least one path besides canonical (or pass as_= to re-root a single path)")
+        canonical_addr = classified[0][1]
+        for spec, segs, _k, _node, _slot in classified[1:]:
+            if segs in shared_seen:
+                raise BuildError(f"share: {spec!r} is already shared")
+            new_shared[segs] = canonical_addr
+            seen_add.add(segs)
+
+    return new_shared, synthetic, seen_add

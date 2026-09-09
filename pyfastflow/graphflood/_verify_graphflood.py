@@ -52,26 +52,19 @@ def make_terrain(nx: int, ny: int, seed: int) -> np.ndarray:
 
 
 def run(backend: str, fill_method: str) -> None:
-    from ..core.context.backends import backend_classes
+    from ..core import Backend
     from ..grid import make_grid_group, make_grid_parameters
-    from . import make_graphflood
+    from . import bind_graphflood, make_graphflood
 
-    _bk = backend_classes(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
+    _bk = Backend.from_name(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
     i32, i64, f32 = dtypes["i32"], dtypes["i64"], dtypes["f32"]
-
-    if backend == "taichi":
-        from ..core.pool.taichi_pool import TaichiPool as PoolCls
-    elif backend == "quadrants":
-        from ..core.pool.quadrants_pool import QuadrantsPool as PoolCls
-    else:
-        from ..core.pool.cupy_pool import CupyPool as PoolCls
 
     nx = ny = SIDE
     n = nx * ny
-    pool = PoolCls()
+    pool = _bk.pool()
 
-    grid_group = make_grid_group(backend, topology="D8", boundary="normal", outlet="edge")
-    grid_params = make_grid_parameters(backend, pool, nx, ny, DX, topology="D8", outlet="edge")
+    grid_group = make_grid_group(_bk, topology="D8", boundary="normal", outlet="edge")
+    grid_params = make_grid_parameters(_bk, pool, nx, ny, DX, topology="D8", outlet="edge")
 
     z_np = make_terrain(nx, ny, SEED)
     z = pool.get_data(f32, (n,))
@@ -86,18 +79,21 @@ def run(backend: str, fill_method: str) -> None:
     # this is currently a no-op, but stays explicit rather than relying on
     # that (see graphflood_cli.py's own note - this exact omission was a
     # real, DX-masked bug there).
-    source_p = ParamCls("SOURCE", dtype=f32, mode="const", value=RAIN * DX * DX, pool=pool)
-    manning_p = ParamCls("MANNING", dtype=f32, mode="const", value=MANNING, pool=pool)
-    expo_p = ParamCls("EXPO", dtype=f32, mode="const", value=EXPO, pool=pool)
-    dt_p = ParamCls("DT", dtype=f32, mode="const", value=DT, pool=pool)
-    boundary_h_p = ParamCls("BOUNDARY_H", dtype=f32, mode="const", value=0.0, pool=pool)
-    gf_min_increment_p = ParamCls("GF_MIN_INCREMENT", dtype=f32, mode="const", value=0.0, pool=pool)
+    source_p = ParamCls("SOURCE", dtype="f32", mode="const", value=RAIN * DX * DX, pool=pool)
+    manning_p = ParamCls("MANNING", dtype="f32", mode="const", value=MANNING, pool=pool)
+    expo_p = ParamCls("EXPO", dtype="f32", mode="const", value=EXPO, pool=pool)
+    dt_p = ParamCls("DT", dtype="f32", mode="const", value=DT, pool=pool)
+    boundary_h_p = ParamCls("BOUNDARY_H", dtype="f32", mode="const", value=0.0, pool=pool)
+    gf_min_increment_p = ParamCls("GF_MIN_INCREMENT", dtype="f32", mode="const", value=0.0, pool=pool)
 
-    kwargs = dict(
-        n_flat=n, nx=nx, ny=ny, z=z.data, h=h.data, Q_in=Q_in.data, Qo=Qo.data,
+    structure_kwargs = dict(
+        n_flat=n, nx=nx, ny=ny,
+        fill_method=fill_method, block_size=BLOCK,
+    )
+    bindings = dict(
+        z=z, h=h, Q_in=Q_in, Qo=Qo,
         source_p=source_p, manning_p=manning_p, friction_exponent_p=expo_p, dt_p=dt_p,
         boundary_h_p=boundary_h_p, gf_min_increment_p=gf_min_increment_p,
-        fill_method=fill_method, block_size=BLOCK,
     )
 
     extra = {}
@@ -113,11 +109,11 @@ def run(backend: str, fill_method: str) -> None:
         rerouted = pool.get_data(i32, (n,))
         basin_route = pool.get_data(i32, (n,))
         b_rcv = pool.get_data(i32, (n,))
-        ndep_p = ParamCls("NDEP", dtype=i32, mode="scalar", value=0, pool=pool)
+        ndep_p = ParamCls("NDEP", dtype="i32", mode="scalar", value=0, pool=pool)
         extra = dict(
-            rec=rec.data, ndep_p=ndep_p, bid=bid.data, rec_jump=rec_jump.data, z_prime=z_prime.data,
-            is_border=is_border.data, basin_saddle=basin_saddle.data, basin_saddlenode=basin_saddlenode.data,
-            outlet=outlet_h.data, rerouted=rerouted.data, b_rcv=b_rcv.data, basin_route=basin_route.data,
+            rec=rec, ndep_p=ndep_p, bid=bid, rec_jump=rec_jump, z_prime=z_prime,
+            is_border=is_border, basin_saddle=basin_saddle, basin_saddlenode=basin_saddlenode,
+            outlet=outlet_h, rerouted=rerouted, b_rcv=b_rcv, basin_route=basin_route,
         )
     else:
         surface = pool.get_data(f32, (n,))
@@ -127,17 +123,18 @@ def run(backend: str, fill_method: str) -> None:
         max_passes = 4 * max(nx, ny)
         counters = pool.get_data(i32, (max_passes + 2,))
         queued_gen = pool.get_data(i32, (n,))
-        pass_p = ParamCls("P", dtype=i32, mode="scalar", value=0, pool=pool)
-        active_p = ParamCls("ACTIVE", dtype=i32, mode="scalar", value=0, pool=pool)
+        pass_p = ParamCls("P", dtype="i32", mode="scalar", value=0, pool=pool)
+        active_p = ParamCls("ACTIVE", dtype="i32", mode="scalar", value=0, pool=pool)
         counters.from_numpy(np.zeros(max_passes + 2, dtype=np.int32))
         queued_gen.from_numpy(np.full(n, -1, dtype=np.int32))
         extra = dict(
-            surface=surface.data, filled=filled.data, parent=parent.data, frontier=frontier.data,
-            counters=counters.data, queued_gen=queued_gen.data, pass_p=pass_p, active_p=active_p,
-            max_passes=max_passes,
+            surface=surface, filled=filled, parent=parent, frontier=frontier,
+            counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
         )
+        structure_kwargs["max_passes"] = max_passes
 
-    gf = make_graphflood(backend, grid_group, grid_params, **kwargs, **extra)
+    frozen, _ = make_graphflood(_bk, grid_group, **structure_kwargs)
+    gf = bind_graphflood(frozen, grid_params, **bindings, **extra)
 
     outlet_mask = None
     total_in = 0.0
@@ -165,6 +162,7 @@ def run(backend: str, fill_method: str) -> None:
         f"stored_volume={stored:.4g} total_in={total_in:.4g} total_out~{total_out:.4g} "
         f"balance_residual~{total_in - stored - total_out:.4g}"
     )
+    gf.close()
 
 
 def main() -> None:

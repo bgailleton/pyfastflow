@@ -17,8 +17,7 @@ picked by this same dispatch, not a change to any caller.
 Author: B.G (08/2026)
 """
 
-from ..core.context.builder import HelperBuilder
-from ..core.context.frozen import FrozenHelper
+from ..core import FrozenHelper, HelperBuilder
 
 _MIN_SLOPE = 1.0e-5
 _MIN_MANNING = 1.0e-9
@@ -62,10 +61,4 @@ def build_friction_qo(law: str, grid) -> FrozenHelper:
     """
     if law not in _LAWS:
         raise ValueError(f"build_friction_qo: law must be one of {sorted(_LAWS)}, got {law!r}")
-    return (
-        HelperBuilder()
-        .wire_param("MANNING")
-        .wire_param("EXPO")
-        .compose("grid", grid)
-        .ingest(_LAWS[law])
-    )
+    return HelperBuilder(_LAWS[law]).compose("grid", grid).freeze()

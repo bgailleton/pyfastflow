@@ -1,255 +1,246 @@
 """
-FrozenKernel / FrozenHelper / FrozenGroup: what ingest()/freeze() (builder.py)
-hands back - the immutable, value-like result of a builder's build phase.
+Node: the one immutable graph node every frozen build-phase result is.
 
-`_Frozen` is the minimal identity/immutability base every frozen build-phase
-result shares (FrozenRoutine/FrozenSequence subclass it directly);
-`_FrozenLeaf` adds the structure the leaf kinds carry. `isinstance(x,
-_Frozen)` is therefore true for a Routine and a Sequence as well.
+A builder's `.freeze()` (builder.py) hands back a Node - the inert,
+value-like recipe the bind phase (bound.py) builds against. There is one node
+protocol and six kinds of it (`kind`): `"kernel"`, `"helper"`, `"group"`,
+`"hostblock"` (the leaves, frozen.py/host_block.py) and `"routine"`,
+`"sequence"` (the ordered composites, routine.py/sequence.py). All six are the
+same class family, so `isinstance(x, Node)` holds for every one of them and a
+single walker (`bound.walk`) mints the address table for all of them.
 
-The leaf kinds are produced only by KernelBuilder.ingest() /
-HelperBuilder.ingest() / GroupBuilder.freeze() (builder.py), never
-constructed directly. Each holds:
+Fields, all fixed once at construction (`__setattr__` raises FrozenError
+afterwards):
 
-  template   the ingested template, unchanged (a python def or CUDA text).
-  slots      a SlotGroup snapshot (slot.py) - this builder's own wired
-             PARAM/HELPER/DATA slots, frozen at the size they had when
-             ingest() ran.
-  composed   {name: FrozenKernel|FrozenHelper} - the already-frozen
-             sub-structures compose()d in during build, by identity: the very
-             object handed to compose() is what sits here, never a copy.
-  contract   the Contract (contract.py) derived from `template` at ingest
-             time.
-  split      {composed_name: frozenset(relative Address)} - which of a
-             composed FrozenGroup's own shared() paths (see FrozenGroup,
-             below) this object's own compose(name, frozen, split=[...])
-             call opted back out of that group's default collapse, keyed by
-             the composed slot name they were declared under. Empty for a
-             composed child that either is not a FrozenGroup or was composed
-             with no `split=`. See bound.py's `_walk_group`/`_walk_group_
-             subtree` for where this is actually consulted - build() time,
-             the only point split is decided (see GroupBuilder.share()'s own
-             docstring, builder.py).
-  shared     {canonical PARAM slot name (wired directly on this object):
-             frozenset(relative Address)} - this object's own build-phase
-             sharing declarations (`_Builder.share()`, builder.py). Every
-             frozen object carries this, not only a FrozenGroup: a
-             FrozenKernel's own `.shared` matters when it is reached
-             directly as build()'s top-level argument, a FrozenHelper's
-             when it is composed as someone else's child - see bound.py's
-             module docstring for the mechanism both are walked with.
+  kind      one of the six strings above (from each subclass's `KIND`).
+  template  the ingested template - a python def, CUDA source text, or None
+            (group/routine/sequence carry no template of their own).
+  slots     a SlotGroup snapshot (slot.py): this node's own PARAM/DATA/HELPER
+            leaves, frozen at the size they had when the builder closed.
+  children  {name: Node}, insertion-ordered - the named sub-nodes composed
+            under this one. For a routine, insertion order IS launch order;
+            for a sequence, children is the block registry and `order` is the
+            schedule. Stored behind a read-only view.
+  contract  the Contract (contract.py) derived from `template`.
+  shared    {relative path -> relative canonical path}, each a segment tuple
+            relative to THIS node - this node's own build-phase sharing
+            (_Builder.share()/share_identical(), builder.py). A path may name a
+            PARAM leaf, a DATA leaf, or a child root (the whole subtree then
+            redirects). The canonical may be an existing address of this node's
+            tree or, when share(as_=...) re-roots, a synthetic top-level name
+            declared in `synthetic`. See bound.py's walk. Read-only view.
+  synthetic {name -> Node | Slot} - the synthetic top-level roots/leaves that
+            share(as_=...) mints: a Node backs a shared child root, a Slot a
+            shared leaf. The walk mints each at `name` and `shared` redirects
+            the original paths to it. Empty unless as_ was used. Read-only view.
+  order     the schedule tuple. `()` for a leaf; a routine's step names in
+            launch order; a sequence's ordered step/loop entries.
 
-Nothing here is a recipe any more - a frozen object is done being built.
-Mutability alternates through the scheme this module is one step of: builder
-mutable -> frozen builder immutable (here) -> bound object mutable ->
-compiled callable immutable. `__setattr__` raises FrozenBuilderError
-unconditionally after construction, so any code path that tries to poke a new
-value into a frozen object - rather than building a new one - fails loudly
-and by name.
+`.provides` is what a compose() one level further out checks a chain's next
+segment against: this node's own top-level PARAM/HELPER slot names plus its
+own child names. DATA is excluded - a DATA slot is never reached through
+`ctx.*` (slot.py), so it is not part of what `outer.this.member` can ask this
+node to provide.
 
-A frozen object is shared, not copied: compose() the same FrozenHelper into
-two different builders and both results hold that one object, checked by
-identity anywhere sameness matters (uid, `is`). This is what lets one grid
-neighbour helper, built once, back eighty different kernels without eighty
-copies of its recipe.
+`.build()` enters the bind phase: `self.bound_cls(self, *walk(self))`. The
+walk mints one independently-bindable slot per full dotted path; `bound_cls`
+(a class attribute per kind) says which Bound* class receives it. No
+isinstance dispatch anywhere - one node protocol, one build path.
 
-`.provides` is what a *further-out* compose() sees when this object is itself
-composed one level up: the set of this object's own top-level PARAM/HELPER
-slot names, plus its own composed root names. DATA slots are excluded - a
-DATA slot is never reached through `ctx.*` (see slot.py), so it is not part
-of what a chain like `outer.this.member` could ever ask this object to
-provide.
+A node is shared by identity, never copied: compose the same Node into two
+builders and both hold that one object (checked by `is`/`uid` wherever
+sameness matters). One grid helper, built once, backs eighty kernels with no
+eighty copies of its recipe. `.build()` never mutates the node and allocates a
+fresh bind-time table on every call, so those eighty kernels each get their
+own independently-bindable address tree from one frozen recipe.
 
-`.build()` is the entry point into the bind phase (bound.py): it walks
-this object's whole composition tree - recursing into every composed
-FrozenHelper/FrozenKernel in turn - and mints one independently-bindable
-slot per full dotted path it finds, returning a BoundKernel/BoundHelper. This
-is where "one FrozenHelper composed into eighty kernels is one frozen object
-but eighty independently-bindable slot sets" actually happens: `build()`
-never mutates `self` (nothing here could - see `__setattr__` above) and
-allocates a fresh bind-time table on every call. See bound.py's module
-docstring for the walk itself, the address grammar, and why every wired
-HELPER slot must already be composed by the time `build()` runs (deferred
-here rather than in `ingest()` - see bound.py for the reasoning).
-
-Author: B.G (08/2026)
+Author: B.G (09/2026)
 """
 
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from ..pool.base import new_uid
 from .contract import Contract
 from .slot import BuildError, SlotGroup, SlotKind
 
+Address = tuple[str, ...]
 
-class FrozenBuilderError(BuildError):
+
+class FrozenError(BuildError):
     """
-    Raised on any attempt to mutate a frozen object - a FrozenKernel/
-    FrozenHelper directly, or a KernelBuilder/HelperBuilder that has already
-    been ingest()-ed (see builder.py's `_check_mutable`).
+    Raised on any attempt to mutate a frozen Node, or a builder that has
+    already closed its build phase (builder.py's `_check_mutable`) - build a
+    new one instead of poking a new value into a done one.
 
-    Author: B.G (08/2026)
-    """
-
-
-class _Frozen:
-    """
-    Minimal immutable base shared by every frozen build-phase result: the
-    leaf kinds (FrozenKernel/FrozenHelper/FrozenGroup/FrozenHostBlock,
-    through `_FrozenLeaf`) and the ordered-composite kinds
-    (FrozenRoutine/FrozenSequence - routine.py/sequence.py - directly). It
-    carries only process-wide identity and the mutation guard, so
-    `isinstance(x, _Frozen)` holds for all of them. Not instantiated
-    directly.
-
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
 
-    def __init__(self):
-        object.__setattr__(self, "_uid", new_uid())
 
-    @property
-    def uid(self) -> int:
-        """
-        Process-wide identity assigned at construction, from the same
-        counter as Parameter/Bag (parameter.py, bag.py). Two references to
-        one frozen object share a uid; composing "the same" frozen object
-        into two builders never changes it.
-
-        Author: B.G (08/2026)
-        """
-        return self._uid
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise FrozenBuilderError(
-            f"{type(self).__name__}(uid={self._uid}) is frozen and cannot be mutated - "
-            f"build a new {type(self).__name__} instead"
-        )
-
-    def __delattr__(self, name: str) -> None:
-        raise FrozenBuilderError(
-            f"{type(self).__name__}(uid={self._uid}) is frozen and cannot be mutated - "
-            f"build a new {type(self).__name__} instead"
-        )
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}(uid={self._uid})"
-
-
-class _FrozenLeaf(_Frozen):
+def _norm_shared(shared: "Mapping | None") -> "dict[Address, Address]":
     """
-    Base of the leaf frozen results - FrozenKernel/FrozenHelper/FrozenGroup/
-    FrozenHostBlock: pure structure (template, slots, composed, contract,
-    split, shared) with no ordered sub-blocks of their own. See the module
-    docstring for every field.
+    A `{relative path -> relative canonical path}` map with both sides as
+    segment tuples, defensively copied. `None` yields an empty map. See the
+    module docstring's `shared` field.
 
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
+    out: dict[Address, Address] = {}
+    for path, canonical in (shared or {}).items():
+        out[tuple(path)] = tuple(canonical)
+    return out
+
+
+class Node:
+    """
+    The one immutable graph node. Not instantiated directly - each `kind` is
+    one of the six subclasses. See the module docstring for every field and
+    for `build()`.
+
+    Author: B.G (09/2026)
+    """
+
+    KIND: str = None  # set by each subclass
+    bound_cls: type = None  # set by each subclass (frozen leaves: assigned in bound.py)
 
     def __init__(
         self,
         template: Any,
         slots: SlotGroup,
-        composed: dict[str, "_Frozen"],
+        children: "Mapping[str, Node]",
         contract: Contract,
-        split: "dict[str, frozenset] | None" = None,
-        shared: "dict[str, list] | None" = None,
+        shared: "Mapping | None" = None,
+        synthetic: "Mapping | None" = None,
+        order: tuple = (),
     ):
-        super().__init__()
+        object.__setattr__(self, "_uid", new_uid())
+        object.__setattr__(self, "kind", self.KIND)
         object.__setattr__(self, "template", template)
         object.__setattr__(self, "slots", slots)
-        object.__setattr__(self, "composed", dict(composed))
+        object.__setattr__(self, "children", MappingProxyType(dict(children)))
         object.__setattr__(self, "contract", contract)
-        object.__setattr__(self, "split", {k: frozenset(v) for k, v in (split or {}).items()})
-        object.__setattr__(self, "shared", {k: frozenset(v) for k, v in (shared or {}).items()})
+        object.__setattr__(self, "shared", MappingProxyType(_norm_shared(shared)))
+        object.__setattr__(self, "synthetic", MappingProxyType(dict(synthetic or {})))
+        object.__setattr__(self, "order", tuple(order))
+
+    @property
+    def uid(self) -> int:
+        """
+        Process-wide identity assigned at construction, from the same counter
+        as Parameter/DataHandle. Two references to one node share a uid;
+        composing "the same" node into two builders never changes it.
+
+        Author: B.G (09/2026)
+        """
+        return self._uid
 
     @property
     def provides(self) -> set[str]:
         """
-        This object's own top-level PARAM/HELPER slot names, plus its own
-        composed root names - what a compose() one level further out checks
-        a chain's next segment against. See the module docstring.
+        This node's own top-level PARAM/HELPER slot names plus its own child
+        names - what a compose() one level further out checks a chain's next
+        segment against. DATA excluded. See the module docstring.
 
-        Author: B.G (08/2026)
+        Author: B.G (09/2026)
         """
-        return self.slots.names(SlotKind.PARAM) | self.slots.names(SlotKind.HELPER) | set(self.composed)
+        return self.slots.names(SlotKind.PARAM) | self.slots.names(SlotKind.HELPER) | set(self.children)
 
-    def build(self) -> "Any":
+    def build(self) -> Any:
         """
-        Walk this object's whole composition tree and return a
-        BoundKernel/BoundHelper minting one independently-bindable slot per
+        Enter the bind phase: walk this node's whole tree and return a fresh
+        Bound* (`self.bound_cls`) with one independently-bindable slot per
         full dotted path. See the module docstring and bound.py.
 
-        Imported locally to avoid a module-level import cycle (bound.py
-        itself imports FrozenKernel/FrozenHelper from here, to tell which of
-        the two `build()` produces).
+        `bound` is imported locally so its module-load assignment of every
+        frozen leaf's `bound_cls` has run before `self.bound_cls` is read
+        (bound.py imports this module).
 
-        Author: B.G (08/2026)
+        Author: B.G (09/2026)
         """
-        from .bound import build as _build
+        from . import bound
 
-        return _build(self)
+        return self.bound_cls(self, *bound.walk(self))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise FrozenError(
+            f"{type(self).__name__}(uid={self._uid}) is frozen and cannot be mutated - "
+            f"build a new {type(self).__name__} instead"
+        )
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenError(
+            f"{type(self).__name__}(uid={self._uid}) is frozen and cannot be mutated - "
+            f"build a new {type(self).__name__} instead"
+        )
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(uid={self._uid}, provides={sorted(self.provides)})"
 
 
-class FrozenKernel(_FrozenLeaf):
+class FrozenKernel(Node):
     """
-    The frozen result of a KernelBuilder's ingest(). See the module
+    A frozen kernel - a KernelBuilder's freeze() result: a device entry point
+    with a template, PARAM/DATA slots and composed children. See the module
     docstring.
 
-    Author: B.G (08/2026)
+    `domain`/`block` are its launch config (Unit 4): `domain` names one of the
+    kernel's DATA arguments (the launch extent is that buffer's length at launch
+    time) or is an int (a fixed extent) or None (closure backends range over the
+    template's own loop; cupy then falls back to the compile-time grid/block
+    compat path). `block` is the cupy threads-per-block.
+
+    Author: B.G (09/2026)
     """
 
+    KIND = "kernel"
 
-class FrozenHelper(_FrozenLeaf):
+    def __init__(
+        self,
+        template,
+        slots,
+        children,
+        contract,
+        shared=None,
+        synthetic=None,
+        domain=None,
+        block=None,
+    ):
+        super().__init__(template, slots, children, contract, shared=shared, synthetic=synthetic)
+        object.__setattr__(self, "domain", domain)
+        object.__setattr__(self, "block", block)
+
+
+class FrozenHelper(Node):
     """
-    The frozen result of a HelperBuilder's ingest(). See the module
+    A frozen device helper - a HelperBuilder's ingest() result: PARAM/HELPER
+    slots and composed children, no DATA slots of its own (a helper's data
+    reaches it as a trusted call argument of its caller). See the module
     docstring.
 
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
 
+    KIND = "helper"
 
-class FrozenGroup(_FrozenLeaf):
+
+class FrozenGroup(Node):
     """
-    The frozen result of a GroupBuilder's freeze() (builder.py): a
-    non-callable, navigable composite - PARAM/HELPER slots and composed
-    sub-structures only, `template` always None, never itself the target of
-    a device call. `ctx.grid.NX.get(0)` (a PARAM leaf reached through it) and
-    `ctx.grid.neighbour(i, k)` (a composed HELPER child called through it)
-    both resolve by ordinary chain recursion through `.slots`/`.composed`
-    exactly as they would through a FrozenHelper one level in - a
-    FrozenGroup differs only in having no template of its own to compile,
-    so `ctx.grid(...)` (calling it bare) is illegal: compile_closure.py's
-    `_build_ctx_node` attaches its built ctx node directly, uncompiled and
-    non-callable, instead of wrapping it in `backend.func`; compile_cupy.py's
-    `_resolve_chain` raises CompileError if a chain ever tries to call it
-    with no further segment.
+    A frozen group - a GroupBuilder's freeze() result: a non-callable,
+    navigable composite of PARAM/HELPER slots and composed children, `template`
+    always None. `ctx.grid.NX.get(0)` (a PARAM leaf reached through it) and
+    `ctx.grid.neighbour(i, k)` (a composed HELPER child called through it) both
+    resolve by ordinary chain recursion through `.slots`/`.children`, exactly
+    as through a helper one level in - a group differs only in having no
+    template to compile, so calling it bare (`ctx.grid(...)`) is illegal
+    (compile_closure.py attaches its ctx node uncompiled; compile_cupy.py's
+    chain resolver raises).
 
-    `.contract` is always empty (a group's own build phase derives nothing -
-    see GroupBuilder.freeze()), which is exactly right for
-    compile_shared.check_legal_accessors' walk: it recurses into a
-    FrozenGroup's own composed children (where real contracts live) but
-    finds no PARAM chain of the group's own to check.
+    `.contract` is always empty - a group has no body of its own to derive one
+    from - which is exactly what compile_shared.check_legal_accessors' walk
+    expects: it recurses into a group's composed children (where real
+    contracts live) and finds no PARAM chain of the group's own to check.
 
-    `.shared` is build-phase sharing (`_Builder.share()`): {canonical PARAM
-    slot name (wired directly on this group): frozenset(relative Address)},
-    each Address a dotted path into this group's own composed subtree that
-    reads the "same" quantity as `canonical` - the private per-axis blocks a
-    public helper composes for its own use (e.g. `neighbour_raw`'s own `row`)
-    read `NX` again independently of the group's own top-level `NX` slot,
-    otherwise. bound.py's build() (`_walk_group`/`_walk_group_subtree`) is
-    what actually acts on this: by default, every Address in `.shared`'s
-    values is never independently minted at all - only `canonical` is - so
-    `grid.NX` is the one PARAM address a caller sees and binds, not
-    `grid.NX` plus every private occurrence. A composer may opt specific
-    paths back out at compose() time (`split=` - builder.py's `_Builder.
-    compose()`, recorded as the composing object's own `.split`), re-minting
-    them as independent addresses again - see bound.py's module docstring
-    for the full mechanism and why it needs no separate machinery beyond a
-    build-time redirect table alongside the usual address table.
-
-    Author: B.G (08/2026)
+    Author: B.G (09/2026)
     """
+
+    KIND = "group"
