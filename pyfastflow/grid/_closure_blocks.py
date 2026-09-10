@@ -1,51 +1,6 @@
-"""
-Taichi/Quadrants (closure) block templates behind make_grid, on the
-builder/frozen/bound stack (core/context/builder.py, frozen.py, bound.py).
+"""Python grid-helper templates for Taichi and Quadrants."""
 
-Every private block below is one plain python def, first parameter `ctx`,
-PICKED - never branched on inside a single function body - by build_group()
-according to the grid's config: topology (D4/D8), boundary (normal/
-periodic_EW/periodic_NS), nodata (on/off), outlet (edge/mask). Composability
-is per axis: a periodic boundary swaps in the "periodic" variant of a row or
-column block, never both, and the untouched axis keeps its "identity"/
-"bounded" variant - there is no ti.static/#if choosing between them inside
-one function. The one runtime if-ladder is _delta(k): k is genuine per-call
-device data, not a structural choice, so it cannot be resolved by picking a
-python function ahead of time. A dynamically-indexed local array for that
-ladder would spill to local memory on GPU, hence the explicit if/elif chain
-instead.
-
-Every public helper below is a HelperBuilder whose template calls the private
-blocks it needs through `ctx` - composed under an explicit name via
-`.compose(name, frozen)` (builder.py), so a block reached from two composites
-(e.g. `row` reached from both `neighbour_raw` and `dist_between_nodes`) is
-composed separately, once per composite that calls it directly - see
-builder.py's module docstring: a template can only reach what is composed
-onto its own scope, never a sibling's. The same FrozenHelper object is shared
-by identity at every such composition (frozen.py), but each occurrence mints
-its own independently-bindable PARAM address once the whole tree is build()-
-ed one level up (bound.py) - `make_grid_group`'s own `share_leaf` call
-collapses these back to one address per canonical name before returning
-(see make_grid's own module docstring for the exact set); a caller working
-against this module directly, below that collapsing, would see one address
-per occurrence instead.
-
-nx/ny/dx are read exclusively through `ctx.NX.get(0)` / `ctx.NY.get(0)` /
-`ctx.DX.get(0)`, uniformly across whatever mode they end up bound to (const,
-scalar, field) - see parameter.py, "Reading a Parameter in device code is
-uniform across modes." This is what lets any of them be overridden to a
-runtime-modifiable mode without touching a single block template.
-
-`abs`/`min` (row_dist_periodic/col_dist_periodic) are plain python builtins,
-not a bound backend module - `ctx` is a template's only injected name, and
-nothing besides `ctx.*` chains is part of the grammar contract.py derives.
-Both Taichi and Quadrants trace plain `abs()`/`min()` directly inside a
-`ti.func`/`qd.func` body without a `ti.`/`qd.` prefix.
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import HelperBuilder
+from ..core import freeze_helper as _helper
 
 # ---------------------------------------------------------------------------
 # geometry
@@ -422,35 +377,8 @@ def _neighbour_and_distance_tmpl(ctx, i, k):
     return j, d
 
 
-def _helper(template, *, params=(), helpers=None):
-    """
-    One private/public HelperBuilder: wire_param() every name in `params`,
-    compose() every (name, frozen) pair in `helpers` under that same name,
-    then ingest(template). The one assembly every block below goes through,
-    so a new block does not repeat the wire/compose/ingest boilerplate.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_group(group, *, topology, boundary, nodata, outlet):
-    """
-    Compose every private block and public helper for a closure backend
-    (Taichi or Quadrants) onto `group` (a GroupBuilder), picking each
-    block's variant from `topology`/`boundary`/`nodata`/`outlet`.
-
-    Returns nothing - every public helper is compose()d onto `group` itself,
-    under its own public name, by this call.
-
-    Author: B.G (08/2026)
-    """
+    """Compose the selected closure-backend grid helpers onto ``group``."""
     d8 = topology == "D8"
 
     row = _helper(_row_tmpl, params=["NX"])
@@ -561,13 +489,13 @@ def build_group(group, *, topology, boundary, nodata, outlet):
         helpers={"_NEIGHBOUR": neighbour, "_DISTFROMK": dist_from_k},
     )
 
-    group.wire_helper("neighbour").compose("neighbour", neighbour)
-    group.wire_helper("neighbour_raw").compose("neighbour_raw", neighbour_raw)
-    group.wire_helper("nodata").compose("nodata", nodata_fn)
-    group.wire_helper("is_active").compose("is_active", is_active)
-    group.wire_helper("can_out").compose("can_out", can_out)
-    group.wire_helper("dist_from_k").compose("dist_from_k", dist_from_k)
-    group.wire_helper("dist_between_nodes").compose("dist_between_nodes", dist_between)
-    group.wire_helper("is_on_edge").compose("is_on_edge", is_on_edge)
-    group.wire_helper("which_edge").compose("which_edge", which_edge)
-    group.wire_helper("neighbour_and_distance").compose("neighbour_and_distance", neighbour_and_distance)
+    group.compose("neighbour", neighbour)
+    group.compose("neighbour_raw", neighbour_raw)
+    group.compose("nodata", nodata_fn)
+    group.compose("is_active", is_active)
+    group.compose("can_out", can_out)
+    group.compose("dist_from_k", dist_from_k)
+    group.compose("dist_between_nodes", dist_between)
+    group.compose("is_on_edge", is_on_edge)
+    group.compose("which_edge", which_edge)
+    group.compose("neighbour_and_distance", neighbour_and_distance)

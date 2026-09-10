@@ -1,29 +1,4 @@
-"""
-Machinery shared by the two backends whose templates are python functions:
-Taichi and Quadrants.
-
-Specialization works by rebuilding the template function around a globals dict
-that carries the bound objects, so a name like `phys` in the template body
-resolves to the bound object when the backend traces it. The rebuilt function
-is then decorated with ti.func/qd.func or ti.kernel/qd.kernel.
-
-The two backends can share all of this because the pieces used here - func,
-kernel, static, u8, i32, i64 - carry the same names and the same behaviour in
-both modules. A backend subclass therefore only pins `_backend` to the ti or qd
-module; nothing else varies.
-
-What lives here is only what a Parameter's device view (ClosureBackendParameter,
-_build_device_view) needs to compile its own tiny get/set_node funcs -
-specialize_closure and the two supporting classes. The kernel/helper/routine
-compile path for Taichi/Quadrants is compile_closure.py, which composes a
-BoundKernel's `ctx` tree instead of splicing bound objects into template
-globals - see its own module docstring for why.
-
-cupy does not appear here: CUDA source text has no globals to patch, and that
-backend substitutes into the source directly instead.
-
-Author: B.G (07/2026)
-"""
+"""Shared Parameter support for Python-template backends."""
 
 from types import FunctionType
 from typing import Any, ClassVar
@@ -56,7 +31,6 @@ def specialize_closure(template, globals_: dict[str, Any]) -> FunctionType:
         A new function sharing `template`'s code object but with `globals_`
         merged into its globals.
 
-    Author: B.G (07/2026)
     """
     source = getattr(template, "__wrapped__", template)
     func_globals = dict(source.__globals__)
@@ -85,7 +59,6 @@ class ClosureParamDeviceView:
     parameter's mode. A const parameter is read-only and carries no `.set_node`
     at all, which turns a write to one into a trace-time error.
 
-    Author: B.G (07/2026)
     """
 
     def __init__(self, name: str, get_fn, set_fn=None):
@@ -103,12 +76,11 @@ class ClosureBackendParameter(Parameter):
     dtype mapping and the device view are written once here against the names
     both modules share.
 
-    Author: B.G (07/2026)
     """
 
     _backend: ClassVar[Any]
 
-    def __init__(self, name: str, *, dtype, mode: str, value, pool, n_flat: int | None = None):
+    def __init__(self, name: str, *, dtype: str, mode: str, value, pool, shape: tuple = ()):
         """
         Declare one parameter and give it its initial value.
 
@@ -118,30 +90,37 @@ class ClosureBackendParameter(Parameter):
         Parameters
         ----------
         name : str
-        dtype : ti.* or qd.* dtype
+        dtype : str
+            Short dtype tag (``"f32"``, ``"i32"``, ...).
         mode : str
             One of MODES ("const", "scalar", "field").
         value : Any
             Initial value.
         pool : Pool
             Device-buffer pool backing scalar/field storage.
-        n_flat : int, optional
-            Node count, required for field mode.
-
+        shape : tuple, optional
+            Field storage shape. Field parameters require a non-empty shape.
         Raises
         ------
         ValueError
-            If `mode` is not in MODES, or field mode is given without
-            `n_flat`.
+            If `mode` is not in MODES, or field mode is given without a
+            shape.
 
-        Author: B.G (07/2026)
         """
         if mode not in MODES:
             raise ValueError(f"{name}: mode must be one of {sorted(MODES)}, got {mode!r}")
+        if not isinstance(dtype, str):
+            raise TypeError(f"{name}: dtype must be a short tag string, got {type(dtype).__name__}")
+        try:
+            backend_dtype = getattr(self._backend, dtype)
+        except AttributeError as exc:
+            raise ValueError(f"{name}: unknown dtype tag {dtype!r}") from exc
+        shape = tuple(shape)
 
         super().__init__()
         self.name = name
         self.dtype = dtype
+        self.backend_dtype = backend_dtype
         self.mode = mode
         self._pool = pool
         self._const_value: Any = None
@@ -151,9 +130,9 @@ class ClosureBackendParameter(Parameter):
         if mode == "scalar":
             self._handle = pool.get_data(dtype, ())
         elif mode == "field":
-            if n_flat is None:
-                raise ValueError(f"{name}: field mode requires n_flat")
-            self._handle = pool.get_data(dtype, (n_flat,))
+            if not shape:
+                raise ValueError(f"{name}: field mode requires shape=(...)")
+            self._handle = pool.get_data(dtype, shape)
 
         self._store(value)
 
@@ -163,7 +142,6 @@ class ClosureBackendParameter(Parameter):
         Map a backend dtype (`ti.*`/`qd.*`) to the numpy dtype used for
         host-side (de)serialization.
 
-        Author: B.G (07/2026)
         """
         backend = cls._backend
         if dtype == backend.u8:
@@ -174,11 +152,10 @@ class ClosureBackendParameter(Parameter):
             return np.int64
         return np.float32
 
-    def get(self):
+    def _host_value(self):
         """
         The python value for const mode, the backing DataHandle otherwise.
 
-        Author: B.G (07/2026)
         """
         return self._const_value if self.mode == "const" else self._handle
 
@@ -192,12 +169,13 @@ class ClosureBackendParameter(Parameter):
         ValueError
             If this parameter's mode is const.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
-            raise ValueError(
+            from .errors import ParameterError
+
+            raise ParameterError(
                 f"{self.name}: const parameter is immutable; build a new Parameter and "
-                f"replace() it into the bag, then recompile"
+                f"bind a new Parameter and recompile"
             )
         self._store(value)
 
@@ -207,15 +185,14 @@ class ClosureBackendParameter(Parameter):
         one path that may set a const, used by __init__ to place its initial
         value.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
-            self._const_value = self._numpy_dtype(self.dtype)(value).item()
+            self._const_value = self._numpy_dtype(self.backend_dtype)(value).item()
         elif self.mode == "scalar":
-            self._handle.data[None] = value
+            self._handle.array[None] = value
         else:  # field
-            arr = np.asarray(value, dtype=self._numpy_dtype(self.dtype)).reshape(-1)
-            self._handle.data.from_numpy(arr)
+            arr = np.asarray(value, dtype=self._numpy_dtype(self.backend_dtype)).reshape(-1)
+            self._handle.array.from_numpy(arr)
 
     def set_node(self, node, value) -> None:
         """
@@ -226,14 +203,15 @@ class ClosureBackendParameter(Parameter):
         ValueError
             If this parameter's mode is const.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
-            raise ValueError(f"{self.name}: const parameter is read-only")
+            from .errors import ParameterError
+
+            raise ParameterError(f"{self.name}: const parameter is read-only")
         if self.mode == "scalar":
-            self._handle.data[None] = value
+            self._handle.array[None] = value
         else:  # field
-            self._handle.data[node] = value
+            self._handle.array[node] = value
 
     def read(self):
         """
@@ -244,24 +222,26 @@ class ClosureBackendParameter(Parameter):
         ValueError
             If this parameter's mode is field.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
             return self._const_value
         if self.mode == "field":
-            raise ValueError(
+            from .errors import ParameterError
+
+            raise ParameterError(
                 f"{self.name}: read() is for scalar/const only; a field is not meant to be "
                 f"read back to the host as a whole"
             )
-        return self._numpy_dtype(self.dtype)(self._handle.data.to_numpy()).item()
+        return self._numpy_dtype(self.backend_dtype)(self._handle.array.to_numpy()).item()
 
     def destroy(self) -> None:
         """
         Return any pooled storage to the pool. const mode owns none, so this
-        is a no-op there.
+        is a no-op there. Raises ParameterError while a bound object still holds
+        this Parameter (see Parameter._assert_unbound).
 
-        Author: B.G (07/2026)
         """
+        self._assert_unbound("destroy")
         if self._handle is not None:
             self._pool.release_data(self._handle)
             self._handle = None
@@ -279,7 +259,6 @@ class ClosureBackendParameter(Parameter):
         that storage - and that does not reach kernels compiled earlier, which
         still hold it (see parameter.py, "Lifetime of a compiled object").
 
-        Author: B.G (07/2026)
         """
         if self._device_view is None:
             self._device_view = self._build_device_view()
@@ -295,12 +274,11 @@ class ClosureBackendParameter(Parameter):
         for field. set_node is built for scalar and field only. MODE, VALUE and
         HANDLE are ordinary python values spliced in as globals.
 
-        Author: B.G (07/2026)
         """
         backend = self._backend
         mode = self.mode
         value = self._const_value
-        handle = self._handle.data if self._handle is not None else None
+        handle = self._handle.array if self._handle is not None else None
 
         def get_template(node):
             if STATIC(MODE == "const"):

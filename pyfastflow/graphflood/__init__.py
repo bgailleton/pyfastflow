@@ -1,182 +1,19 @@
-"""
-make_graphflood: the GraphFlood vanilla-SFD solver, built on top of the
-already-ported ../flow (receivers, accumulation, depressions, fill-by-
-reconstruction) and ../grid, plus this package's own friction-law helper
-(_closure_friction.py/_cupy_friction.py) and per-step core kernels
-(_closure_core.py/_cupy_core.py) - see ../../flood/flood_graphflood_kernels.py
-for the legacy kernels this ports the physics from.
+"""GraphFlood shallow-water building blocks.
 
-One GraphFlood timestep, in order:
-
-    1. (h-aware) receivers on the current (z, h) -> rec, then a prior
-       local-minima resolution over rec/h - `fill_method` picks which:
-         "jump": depression routing (../flow's make_depressions/
-           make_depression_solver, reroute="carve" - always carve, never
-           jump-reroute, despite this value's own name; see below) -
-           redirects `rec` around pits without touching z or h.
-         "reconstruct": grayscale morphological reconstruction (../flow's
-           make_fill_reconstruct/make_fill_reconstruct_solver) run against
-           the z+h surface, not bare z - see "Filling on the surface" below.
-    2. full downstream accumulation over the resolved graph (../flow's
-       make_accumulation) with a caller-bound rain/inflow SOURCE Parameter
-       -> Q_in.
-    3. this package's own "core" step: compute_qo (friction-law outflow
-       capacity from the steepest h-aware slope) then apply_divergence
-       (h += DT*(Q_in - Qo)/DX**2, clamped) - see _closure_core.py's module
-       docstring for why splitting the legacy single-kernel
-       graphflood_core_kernel into these two already avoids the race its
-       own two-pass dh buffer existed for, with no dh buffer needed here.
-       What a can_out node does in this step is a build-time choice,
-       `outlet_behavior` - see "Outlet behaviour" below.
-
-Outlet behaviour
-------------------
-The grid's own `can_out(i)` helper only answers "is this node allowed to
-drain out of the domain" - it carries no opinion on what that drainage
-looks like, and until now this factory hardcoded exactly one answer.
-`outlet_behavior` (build-time, picked - never branched on inside one
-kernel body, same as `friction_law`) now selects it explicitly, in both
-compute_qo and apply_divergence (_closure_core.py/_cupy_core.py's own
-docstrings on each function have the per-behavior kernel-level detail):
-
-  "fixed_h" (default): a Dirichlet stage boundary - apply_divergence pins
-    h[i] = BOUNDARY_H at every can_out node regardless of Q_in/Qo;
-    compute_qo correspondingly never computes a real Qo there (Qo[i] = 0,
-    unused). Requires `boundary_h_p`.
-  "free": an open/free-outfall boundary - can_out nodes are not special-
-    cased at all. compute_qo gives them a real friction-law Qo from their
-    own steepest h-aware slope exactly like an interior node, and
-    apply_divergence runs the same Q_in/Qo divergence update on them -
-    water actually drains out at the rate the friction law and whatever
-    water is present there give it, rather than being pinned to a fixed
-    stage. Wires no `BOUNDARY_H` at all; `boundary_h_p` is not required
-    (and unused if given).
-  "fixed_s": a normal/uniform-flow outfall - like "free" (apply_divergence
-    is identical, no special case, no `BOUNDARY_H`), but compute_qo gives a
-    can_out node's Qo from a caller-supplied constant hydraulic slope
-    (`boundary_slope_p`) instead of its own locally-computed steepest
-    slope, through the exact same friction-law call every other node uses
-    (see _closure_core.py's build_compute_qo docstring - the friction
-    helper already takes h/slope as plain arguments, so this needs no
-    second copy of it). Useful when the real exit slope is known (e.g. a
-    surveyed channel grade) and better trusted than this cell's own local
-    geometry. Requires `boundary_slope_p`; does not require `boundary_h_p`.
-
-Filling on the surface
-------------------------
-`fill_method="reconstruct"` does not modify ../flow's fill_reconstruct
-kernels at all: this module's own `make_surface` kernel builds `surface =
-z + h`, that gets bound as fill_reconstruct's own "z" data argument (the
-factory is generic over what "elevation" means), and this module's own
-`h_from_filled` kernel (`h = max(0, filled - z)`, against the REAL z) pulls
-the result back into a depth field afterwards - two small dedicated kernels,
-no changes to _closure_reconstruct.py/_cupy_reconstruct.py.
-make_fill_reconstruct_solver's own "counters"/"queued_gen" caller-side init
-is a single-solve contract ("zeroed/filled once, before the first call" -
-../flow/__init__.py); since GraphFlood calls it once per timestep on a
-surface that changes every timestep, this module's own
-`build_reset_reconstruct_scratch` (_closure_core.py/_cupy_core.py) re-zeros/
-re-fills both immediately before every call - see that function's own
-docstring for what reusing stale state without this would corrupt.
-`parent` (the
-receiver graph fill_reconstruct converges directly, no separate depression
-pass, no basin ids) stands in for `rec` in this path - `make_receivers` is
-not called at all, since fill_reconstruct's own descent already resolves
-routing and pits together. `h_from_filled` runs before accumulation/core,
-so a depression's rise is already reflected in h before Qo/divergence read
-it. Nothing here enforces a nonzero gradient across a filled plateau -
-`filled`/`parent` come out of ../flow's fill_reconstruct exactly as
-documented there (an exact grayscale reconstruction, flat where a basin is
-genuinely flat); the only floor on slope is compute_qo's own friction-law
-epsilon clamp (`_closure_friction.py`'s `_MIN_SLOPE`), the same guard
-legacy's compute_qo_from_h_slope used, there to keep Qo's division finite,
-not to fabricate a physical gradient a real flat lake surface would not
-have.
-
-`fill_method="jump"` always resolves depressions with `reroute="carve"` -
-there is no `reroute` parameter on this factory, and carve is the only
-option it ever drives (jump-reroute is cheaper per pass but produces a
-worse - less locally coherent - reroute; carve is the better default and
-the only one wired here). "jump" is this fill_method value's own name
-(distinguishing it from "reconstruct" - no surface fill, `rec` is
-redirected around each pit instead), unrelated to which reroute technique
-runs underneath. It needs make_receivers's `rec` plus every buffer
-make_depression_solver(reroute="carve") itself needs: `bid`, `rec_jump`,
-`z_prime`, `is_border`, `basin_saddle`, `basin_saddlenode`, `outlet`,
-`ndep_p` always; `depression_method="vanilla"` additionally needs `tag`,
-`tag_alt`, `rec_scratch` and `rerouted` (the carve-vanilla combination's own
-extra scratch, per make_depression_solver's own docstring, ../flow/
-__init__.py); the default `depression_method="optimized"` needs none of
-those four.
-
-kind="unstable"
------------------
-Bypasses routing, local-minima resolution and accumulation entirely -
-../../flood/flood_graphflood_kernels.py's distribute_flow_local_kernel,
-ported as this package's own build_distribute (_closure_core.py/
-_cupy_core.py), followed by build_copy_q then the same compute_qo/
-apply_divergence core every kind uses. Every node redistributes its own
-current inflow Q_in[i] to its immediate downslope (h-aware) neighbours in
-proportion to their slope share, every step - no receiver graph, no
-depression solve, no fill. A local pit (no downslope neighbour) keeps its
-own inflow in place and nudges h up by GF_MIN_INCREMENT, so it drains out
-gradually as the outer step loop runs rather than being resolved exactly -
-this replaces an acyclic-graph guarantee with a graduated approximation,
-which is what makes the method "unstable" relative to kind="vanilla_sfd".
-One compiled RoutineBuilder covers the whole step (closure backends: one
-"distribute" kernel, two top-level loops, already barrier-separated by the
-backend's own launch model; cupy: "distribute_zero"/"distribute_route", two
-real launches, same reasoning as make_accumulation's method="atomic"
-q_init/accum split) - no host decision anywhere in it, unlike
-kind="vanilla_sfd"'s per-step orchestration (GraphfloodUnstable.step() is
-one call, not several).
-
-kind="vanilla_mfd"
---------------------
-cupy-only (raises otherwise). Always fills by reconstruction (never
-`fill_method="jump"` - there is no `fill_method` parameter under this
-kind), for the same reason ../../CLAUDE.md's own state notes give for why
-`persistent_mfd` accumulation itself is reconstruct-only: MFD needs a fully
-resolved, monotonic surface to split weights over, which reroute-only
-depression handling does not produce. Per step: make_surface -> reset
-counters/queued_gen -> fill_reconstruct_solver -> h_from_filled (all
-identical to kind="vanilla_sfd"'s fill_method="reconstruct" path - see
-"Filling on the surface" above), then "reconstruct_epsilon"'s own
-self-scaling perturbation pass (_cupy_reconstruct_epsilon.py - a per-cell
-`dist`, a per-cell-ULP cumulative sum along `parent`, not a fixed constant
-- see that module's own docstring for why plain `filled` gives every cell
-inside a resolved, genuinely-flat depression zero outgoing MFD edges,
-stalling accumulation at the flat's boundary, why a *fixed* epsilon
-constant is itself wrong on real DEM data (too small relative to float32's
-ULP at real elevation magnitudes, silently swallowed by rounding), and why
-`dist` is passed to dirs_weights as a separate tie-break carrier rather
-than added into `filled` - which would round the per-hop signal away),
-then this package's
-own MFD topology construction (_cupy_mfd_topology.py's build_mfd_topology -
-`dirs`/`mfd_w`/`indegree`, built from `filled` with `dist` as the flat-
-tie-break carrier, every step) feeding ../flow's `persistent_mfd`
-accumulation (_cupy_mfd_accum.py's build_persistent_mfd/persistent_grid_block/
-init_frontier_mfd) instead of the SFD accumulation kind="vanilla_sfd"
-uses, then the same compute_qo/apply_divergence core every kind uses (fed
-the real, un-perturbed `h`/`filled`; `dist` only ever reaches
-`dirs_weights`). See GraphfloodVanillaMFD's own
-docstring for why `count`/`barrier` are re-seeded via a direct cupy host
-write every step rather than a compiled kernel.
-
-Scope of this cut
---------------------
-Only `accum_method="atomic"` is implemented for kind="vanilla_sfd" -
-"rake_compress"/"pointer_jump_push" need their own extra scratch buffers
-threaded through this factory's own signature, not done in this pass.
-
-Author: B.G (08/2026)
+Build a recipe with :func:`make_graphflood`, bind terrain and model state,
+then call the resulting object for each timestep. ``vanilla_sfd`` routes one
+receiver per cell, ``unstable`` redistributes flow locally, and CuPy-only
+``vanilla_mfd`` splits flow between downslope neighbours.
 """
 
 import math
+from dataclasses import dataclass
+from types import MappingProxyType
 
-from ..core.context.backends import backend_classes
-from ..core.context.routine import RoutineBuilder
+from ..core import Backend, RoutineBuilder, require_backend
 from ..flow import (
+    bind_depression_solver,
+    bind_fill_reconstruct_solver,
     make_accumulation,
     make_depression_solver,
     make_depressions,
@@ -193,13 +30,13 @@ _DEP_METHODS = frozenset({"vanilla", "optimized"})
 _OUTLET_BEHAVIORS = frozenset({"fixed_h", "free", "fixed_s"})
 
 
-def _core_blocks_for(backend: str):
-    if backend in ("taichi", "quadrants"):
+def _core_blocks_for(be: Backend):
+    if be.family == "closure":
         from . import _closure_core as blocks
-    elif backend == "cupy":
+    elif be.family == "cupy":
         from . import _cupy_core as blocks
     else:
-        raise ValueError(f"make_graphflood: unknown backend {backend!r}, expected 'taichi', 'quadrants' or 'cupy'")
+        raise ValueError(f"make_graphflood: unsupported backend family {be.family!r}")
     return blocks
 
 
@@ -209,19 +46,18 @@ def _require(label: str, **buffers) -> None:
         raise ValueError(f"make_graphflood: {label} requires {missing}")
 
 
-class GraphfloodVanillaSFD:
-    """
-    Host-orchestrated wrapper around the compiled pieces one GraphFlood
-    vanilla-SFD timestep needs - mirrors ../ops/__init__.py's Scan/Reduce
-    shape (a plain python object over already-compiled kernels/sequences),
-    not a stateful context class: every compiled member here came from an
-    established factory (make_receivers/make_accumulation/
-    make_depression_solver/make_fill_reconstruct_solver) or this package's
-    own small core kernels, already built/bound/compiled by make_graphflood
-    before construction. `.step()` runs one timestep; call it in a python
-    loop.
+def _compile_bound(bound, be: Backend):
+    """Compile one bound structure and release its binding hold."""
+    compiled = bound.compile(be)
+    bound.close()
+    return compiled
 
-    Author: B.G (08/2026)
+
+class GraphfloodVanillaSFD:
+    """Compiled single-flow GraphFlood timestep.
+
+    Call :meth:`step` once per model timestep; the bound terrain and flow
+    arrays are updated in place.
     """
 
     def __init__(self, *, fill_method: str, receivers=None, minima_solver, make_surface=None,
@@ -238,12 +74,7 @@ class GraphfloodVanillaSFD:
         self._core = core
 
     def step(self) -> None:
-        """
-        Run one GraphFlood timestep in place - see the module docstring for
-        the exact kernel order per `fill_method`.
-
-        Author: B.G (08/2026)
-        """
+        """Run one timestep in place."""
         if self.fill_method == "jump":
             self._receivers()
             self._minima_solver()
@@ -262,50 +93,38 @@ class GraphfloodVanillaSFD:
         """Alias for step()."""
         self.step()
 
+    def close(self) -> None:
+        """Release every compiled step's bindings."""
+        for step in (self._receivers, self._minima_solver, self._make_surface,
+                     self._h_from_filled, self._reset_counters, self._reset_queued_gen,
+                     self._q_init, self._accum, self._core):
+            if step is not None:
+                step.close()
+
 
 class GraphfloodUnstable:
-    """
-    Host-orchestrated wrapper around kind="unstable"'s single compiled
-    routine (distribute[/distribute_zero+distribute_route] -> copy_q ->
-    compute_qo -> apply_divergence, one RoutineBuilder, no host decision
-    between steps - see make_graphflood's own module docstring). `.step()`
-    runs one timestep; call it in a python loop.
-
-    Author: B.G (08/2026)
-    """
+    """Compiled unstable-flow GraphFlood timestep."""
 
     def __init__(self, routine):
         self._routine = routine
 
     def step(self) -> None:
-        """Run one GraphFlood timestep in place. Author: B.G (08/2026)"""
+        """Run one GraphFlood timestep in place."""
         self._routine()
 
     def __call__(self) -> None:
         """Alias for step()."""
         self.step()
 
+    def close(self) -> None:
+        """Release the compiled routine's bindings."""
+        self._routine.close()
+
 
 class GraphfloodVanillaMFD:
-    """
-    Host-orchestrated wrapper around kind="vanilla_mfd"'s per-step pieces -
-    fill-by-reconstruction (shared with kind="vanilla_sfd"'s
-    fill_method="reconstruct"), "reconstruct_epsilon"'s hop-distance
-    perturbation pass (_cupy_reconstruct_epsilon.py - see its own module
-    docstring for why plain `filled` breaks MFD topology across a flat
-    resolved depression, and why the `dist` it builds is passed to
-    dirs_weights as a separate tie-break carrier), this package's own MFD topology
-    construction (_cupy_mfd_topology.py), ../flow's persistent_mfd
-    accumulation (_cupy_mfd_accum.py) and the same compute_qo/
-    apply_divergence core every kind uses - see make_graphflood's own
-    module docstring for the full per-step order. cupy-only: `count`/
-    `barrier` are re-seeded from `init_frontier_mfd`'s own host-side cupy
-    indexing every step (indegree/dirs/mfd_w are rebuilt from scratch every
-    step too, since the surface changes every step), which only exists as
-    a raw cupy operation, not a compiled kernel this wrapper could run on
-    another backend. `.step()` runs one timestep; call it in a python loop.
+    """Compiled CuPy multiple-flow GraphFlood timestep.
 
-    Author: B.G (08/2026)
+    The MFD topology and accumulation state are rebuilt at each timestep.
     """
 
     def __init__(
@@ -336,17 +155,14 @@ class GraphfloodVanillaMFD:
         self._core = core
 
     def step(self) -> None:
-        """Run one GraphFlood timestep in place. Author: B.G (08/2026)"""
+        """Run one GraphFlood timestep in place."""
         self._make_surface()
         self._reset_counters()
         self._reset_queued_gen()
         self._minima_solver()
         self._h_from_filled()
         self._hops_init()
-        # hops_rounds is always even (see make_graphflood's own computation),
-        # so alternating fwd/bwd this many times always ends back in the
-        # primary dist/anc buffers - see build_hops_jump's own docstring for
-        # why this ping-pong exists (in-place pointer-jumping races on `+=`).
+        # An even count leaves the final hop state in the primary buffers.
         for _ in range(self._hops_rounds // 2):
             self._hops_jump_fwd()
             self._hops_jump_bwd()
@@ -365,9 +181,18 @@ class GraphfloodVanillaMFD:
         """Alias for step()."""
         self.step()
 
+    def close(self) -> None:
+        """Release every compiled step's bindings."""
+        for step in (self._make_surface, self._reset_counters, self._reset_queued_gen,
+                     self._minima_solver, self._h_from_filled, self._hops_init,
+                     self._hops_jump_fwd, self._hops_jump_bwd, self._indegree_reset,
+                     self._dirs_weights, self._indegree_count, self._q_init,
+                     self._accum, self._core):
+            step.close()
 
-def make_graphflood(
-    backend: str,
+
+def _compile_graphflood(
+    be: Backend,
     grid,
     grid_params: dict,
     *,
@@ -431,143 +256,13 @@ def make_graphflood(
     dist2=None,
     anc2=None,
 ):
+    """Bind and compile a GraphFlood timestep.
+
+    This internal builder receives the complete live state. Public callers
+    normally use :func:`make_graphflood` followed by :func:`bind_graphflood`.
     """
-    Build, bind and compile one GraphFlood timestep, returning a ready-to-
-    call GraphfloodVanillaSFD (kind="vanilla_sfd") or GraphfloodUnstable
-    (kind="unstable"). See the module docstring for the per-step order and
-    for what `fill_method="jump"` vs `"reconstruct"` each need under
-    kind="vanilla_sfd".
-
-    kind="unstable" bypasses routing/local-minima resolution/accumulation
-    entirely - `fill_method`/`accum_method`/`depression_method` and every
-    jump/reconstruct-only buffer below are ignored. It only needs `z`, `h`,
-    `Q_in`, `Qo`, `Q_next` (all n_flat-sized), `source_p`/`manning_p`/
-    `friction_exponent_p`/`dt_p`/`gf_min_increment_p` (and `boundary_h_p`/
-    `boundary_slope_p` per `outlet_behavior`, same as kind="vanilla_sfd")
-    plus `topology`/`diagonal_partition_correction`/`friction_law`. `Q_next`
-    is this kind's own scratch buffer (build_distribute's output before
-    build_copy_q folds it back into `Q_in`) - required, and only used, here.
-
-    Every array argument (`z`, `h`, `Q_in`, `Qo`, `Q_next`, `rec`, ...) is a
-    raw device buffer (a DataHandle's `.data`), n_flat-sized, caller-
-    allocated - this factory allocates nothing, matching
-    make_depression_solver/make_fill_reconstruct_solver. `z`/`h` are read/
-    written in place; `Q_in`/`Qo`/`Q_next` are scratch this factory owns the
-    meaning of but not the storage.
-
-    `source_p`/`manning_p`/`friction_exponent_p`/`dt_p`/`gf_min_increment_p`
-    (and `boundary_h_p` when `outlet_behavior="fixed_h"`) are caller-
-    allocated Parameters (any mode - const, scalar or field all work) bound
-    into SOURCE/MANNING/EXPO/DT/GF_MIN_INCREMENT (and BOUNDARY_H)
-    respectively - rain, friction and timestep are all params, per the
-    module docstring; nothing here hardcodes a value or a unit conversion
-    the caller cannot override. `source_p` is Q **per cell** (m^3/s), not a
-    bare rate - apply_divergence's `(Q_in - Qo)/area*dt` compares it
-    directly against `Qo`, which compute_qo's friction law already produces
-    in m^3/s (build_friction_qo's own `* DX` term). A caller converting from
-    a rain rate (m/s or mm/h) must multiply by cell area (`DX**2`) before
-    binding it here - forgetting this under-scales `Q_in` by a factor of
-    `DX**2` (invisible on any grid built with `DX=1`, silently wrong on a
-    real DEM's actual cell size).
-
-    fill_method="jump" additionally requires `rec`, `ndep_p`, `bid`,
-    `rec_jump`, `z_prime`, `is_border`, `basin_saddle`, `basin_saddlenode`,
-    `outlet`, `rerouted` (all n_flat-sized, i32 unless noted - see
-    make_depression_solver's own docstring for exact dtypes/caller-side init
-    needs). fill_method="reconstruct" additionally requires `surface`,
-    `filled`, `parent`, `frontier` (2*n_flat,), `counters`, `queued_gen`,
-    `pass_p`, `active_p` (see make_fill_reconstruct_solver's own docstring
-    for shapes/caller-side init needs); `rec` is not used in this path.
-
-    Parameters
-    ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
-    grid : FrozenGroup
-        ../grid's make_grid_group result.
-    grid_params : dict
-        ../grid's make_grid_parameters result, backing the same grid.
-    kind : str, optional
-        "vanilla_sfd" (default), "unstable" or "vanilla_mfd" (cupy-only) -
-        see above.
-    n_flat, nx, ny : int
-        `nx`/`ny` are unused under kind="unstable".
-    z, h, Q_in, Qo : DataHandle
-    Q_next : DataHandle, optional
-        Required iff kind="unstable" - see above.
-    source_p, manning_p, friction_exponent_p, dt_p, gf_min_increment_p : Parameter
-    boundary_h_p : Parameter, optional
-        Required iff `outlet_behavior="fixed_h"` (the default) - see
-        "Outlet behaviour" in the module docstring.
-    boundary_slope_p : Parameter, optional
-        Required iff `outlet_behavior="fixed_s"` - see "Outlet behaviour"
-        in the module docstring.
-    fill_method : str, optional
-        "jump" (default) or "reconstruct".
-    accum_method : str, optional
-        "atomic" (only value implemented so far).
-    depression_method : str, optional
-        "vanilla" or "optimized" (default) - only used when
-        fill_method="jump".
-    topology : str, optional
-        "D4" or "D8" (default) - must match `grid`.
-    diagonal_partition_correction : bool, optional
-        Default True.
-    friction_law : str, optional
-        Passed to build_friction_qo (default "manning").
-    outlet_behavior : str, optional
-        "fixed_h" (default), "free" or "fixed_s" - see "Outlet behaviour"
-        in the module docstring.
-    block_size : int, optional
-        cupy CUDA block size (default 256); unused on taichi/quadrants.
-    rec, ndep_p, bid, rec_jump, z_prime, is_border, basin_saddle,
-    basin_saddlenode, outlet : DataHandle/Parameter, optional
-        Required when fill_method="jump" (always used with reroute="carve"
-        internally - see above).
-    tag, tag_alt, rec_scratch, rerouted : DataHandle, optional
-        Required when fill_method="jump" and depression_method="vanilla" -
-        see above; unused (and not required) under the default
-        depression_method="optimized".
-    surface, filled, parent, frontier, counters, queued_gen, pass_p,
-    active_p : DataHandle/Parameter, optional
-        Required when fill_method="reconstruct", or when kind="vanilla_mfd"
-        (always fills by reconstruction there - see above).
-    max_passes : int, optional
-        Forwarded to make_fill_reconstruct_solver.
-    dirs, mfd_w, indegree, frontier0, frontier1, count, barrier : DataHandle, optional
-        Required iff kind="vanilla_mfd" - `dirs` u8 (n_flat,), `mfd_w` f32
-        (n_flat * n_neighbours,) where n_neighbours is 4/8 for D4/D8,
-        `indegree` i32 (n_flat,), `frontier0`/`frontier1` i32 (n_flat,)
-        each, `count` i32 (2,), `barrier` u32 (1,) - all rebuilt from
-        scratch every step, no caller-side init needed beyond allocation.
-    dist, anc, dist2, anc2 : DataHandle, optional
-        Required iff kind="vanilla_mfd" - "reconstruct_epsilon"'s own
-        scratch (_cupy_reconstruct_epsilon.py): `dist`/`dist2` f32 (n_flat,)
-        (a self-scaling, per-cell-ULP cumulative perturbation - see
-        build_hops_init's own docstring for why this is float, not a hop
-        count), `anc`/`anc2` i32 (n_flat,) - `dist2`/`anc2` are the
-        double-buffering partner build_hops_jump's ping-pong needs (see its
-        own docstring for why in-place pointer-jumping isn't safe here).
-        `dist` is handed straight to dirs_weights as its flat-tie-break
-        carrier; there is no separate perturbed-elevation array. All rebuilt
-        from scratch every step, no caller-side init needed beyond allocation.
-
-    Returns
-    -------
-    GraphfloodVanillaSFD, GraphfloodUnstable or GraphfloodVanillaMFD
-        Per `kind`.
-
-    Raises
-    ------
-    ValueError
-        Unrecognised `kind`/`fill_method`/`accum_method`/`depression_method`/
-        `outlet_behavior`; `kind="vanilla_mfd"` on a non-cupy `backend`;
-        `boundary_h_p` missing under `outlet_behavior="fixed_h"`;
-        `boundary_slope_p` missing under `outlet_behavior="fixed_s"`; or a
-        buffer required by the selected `kind`/`fill_method` is missing.
-
-    Author: B.G (08/2026)
-    """
+    be = require_backend(be)
+    backend = be.name
     if kind not in _KINDS:
         raise ValueError(f"make_graphflood: kind must be one of {sorted(_KINDS)}, got {kind!r}")
     if outlet_behavior not in _OUTLET_BEHAVIORS:
@@ -579,11 +274,10 @@ def make_graphflood(
     if outlet_behavior == "fixed_s":
         _require("outlet_behavior='fixed_s'", boundary_slope_p=boundary_slope_p)
 
-    closure = backend in ("taichi", "quadrants")
-    launch = {} if closure else {"grid": ((int(n_flat) + block_size - 1) // block_size,), "block": (block_size,)}
-    core_blocks = _core_blocks_for(backend)
+    closure = be.family == "closure"
+    core_blocks = _core_blocks_for(be)
     if closure:
-        backend_mod = backend_classes(backend).module
+        backend_mod = be.module
 
     if kind == "unstable":
         _require("kind='unstable'", Q_next=Q_next)
@@ -602,8 +296,8 @@ def make_graphflood(
                 backend=backend, backend_mod=backend_mod, grid=grid, outlet_behavior=outlet_behavior,
             )
             rb = RoutineBuilder()
-            rb.compose("distribute", distribute_fk)
-            rb.compose("copy_q", copy_q_fk)
+            rb.step("distribute", distribute_fk)
+            rb.step("copy_q", copy_q_fk)
             distribute_steps = ("distribute",)
         else:
             distribute_fks = core_blocks.build_distribute(
@@ -618,13 +312,13 @@ def make_graphflood(
             )
             apply_div_fk = core_blocks.build_apply_divergence(grid=grid, n_flat=n_flat, outlet_behavior=outlet_behavior)
             rb = RoutineBuilder()
-            rb.compose("distribute_zero", distribute_fks["zero"])
-            rb.compose("distribute_route", distribute_fks["route"])
-            rb.compose("copy_q", copy_q_fk)
+            rb.step("distribute_zero", distribute_fks["zero"])
+            rb.step("distribute_route", distribute_fks["route"])
+            rb.step("copy_q", copy_q_fk)
             distribute_steps = ("distribute_zero", "distribute_route")
 
-        rb.compose("compute_qo", compute_qo_fk)
-        rb.compose("apply_divergence", apply_div_fk)
+        rb.step("compute_qo", compute_qo_fk)
+        rb.step("apply_divergence", apply_div_fk)
         frozen = rb.freeze()
         bound = frozen.build()
 
@@ -650,7 +344,8 @@ def make_graphflood(
         if outlet_behavior == "fixed_h":
             bound.bind(("apply_divergence", "BOUNDARY_H"), boundary_h_p)
         bound.bind_leaf(grid_params, prefix=("apply_divergence",))
-        return GraphfloodUnstable(bound.compile(backend, **launch))
+        routine = _compile_bound(bound, be)
+        return GraphfloodUnstable(routine)
 
     if kind == "vanilla_mfd":
         if backend != "cupy":
@@ -661,7 +356,7 @@ def make_graphflood(
             dirs=dirs, mfd_w=mfd_w, indegree=indegree, frontier0=frontier0, frontier1=frontier1,
             count=count, barrier=barrier, dist=dist, anc=anc, dist2=dist2, anc2=anc2,
         )
-        from ..flow._cupy_mfd_accum import build_persistent_mfd, init_frontier_mfd, persistent_grid_block
+        from ..flow._cupy_mfd_accum import build_persistent_mfd, init_frontier_mfd
         from . import _cupy_mfd_topology, _cupy_reconstruct_epsilon
 
         make_surface_fk = core_blocks.build_make_surface(n_flat=n_flat)
@@ -669,45 +364,45 @@ def make_graphflood(
         ms_bound.bind("z", z)
         ms_bound.bind("h", h)
         ms_bound.bind("surface", surface)
-        make_surface_kernel = ms_bound.compile(backend, **launch)
+        make_surface_kernel = _compile_bound(ms_bound, be)
 
         h_from_filled_fk = core_blocks.build_h_from_filled(n_flat=n_flat)
         hf_bound = h_from_filled_fk.build()
         hf_bound.bind("z", z)
         hf_bound.bind("filled", filled)
         hf_bound.bind("h", h)
-        h_from_filled_kernel = hf_bound.compile(backend, **launch)
+        h_from_filled_kernel = _compile_bound(hf_bound, be)
 
         resolved_max_passes = max_passes if max_passes is not None else 4 * max(int(nx), int(ny))
         reset_fks = core_blocks.build_reset_reconstruct_scratch(n_flat=n_flat, counters_size=resolved_max_passes + 2)
         rc_bound = reset_fks["counters"].build()
         rc_bound.bind("counters", counters)
-        reset_counters_kernel = rc_bound.compile(backend, **launch)
+        reset_counters_kernel = _compile_bound(rc_bound, be)
         rq_bound = reset_fks["queued_gen"].build()
         rq_bound.bind("queued_gen", queued_gen)
-        reset_queued_gen_kernel = rq_bound.compile(backend, **launch)
+        reset_queued_gen_kernel = _compile_bound(rq_bound, be)
 
-        recon = make_fill_reconstruct(backend, grid, nx=nx, ny=ny)
-        minima_solver = make_fill_reconstruct_solver(
-            backend, recon, grid_params, z=surface, filled=filled, parent=parent, frontier=frontier,
-            counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
+        recon = make_fill_reconstruct(be, grid, nx=nx, ny=ny)
+        recon_frozen, _ = make_fill_reconstruct_solver(
+            be, recon, grid_params, pass_p=pass_p, active_p=active_p,
             n_flat=n_flat, nx=nx, ny=ny, block_size=block_size, max_passes=max_passes,
         )
+        recon_bound = bind_fill_reconstruct_solver(
+            recon_frozen, grid_params, z=surface, filled=filled, parent=parent,
+            frontier=frontier, counters=counters, queued_gen=queued_gen,
+            pass_p=pass_p, active_p=active_p,
+        )
+        minima_solver = _compile_bound(recon_bound, be)
 
-        # "reconstruct_epsilon": accumulate a per-cell `dist` perturbation
-        # along the `parent` chain (hops-to-outlet, ULP-scaled), then feed it
-        # alongside real `filled` to dirs_weights, which breaks the flat-lake
-        # tie inside the slope helper's own additive `h` term - see
-        # _cupy_reconstruct_epsilon.py's own module docstring for why plain
-        # `filled` dead-ends MFD topology across a flat resolved depression
-        # and why `dist` must never be folded up into `filled` to fix it.
+        # Build a path-distance perturbation to resolve flat-lake ties in the
+        # MFD topology. Keep it separate from the filled elevation.
         hops_init_fk = _cupy_reconstruct_epsilon.build_hops_init(n_flat=n_flat)
         hi_bound = hops_init_fk.build()
         hi_bound.bind("parent", parent)
         hi_bound.bind("filled", filled)
         hi_bound.bind("dist", dist)
         hi_bound.bind("anc", anc)
-        hops_init_kernel = hi_bound.compile(backend, **launch)
+        hops_init_kernel = _compile_bound(hi_bound, be)
 
         hops_jump_fk = _cupy_reconstruct_epsilon.build_hops_jump(n_flat=n_flat)
         hj_fwd_bound = hops_jump_fk.build()
@@ -715,14 +410,14 @@ def make_graphflood(
         hj_fwd_bound.bind("anc_in", anc)
         hj_fwd_bound.bind("dist_out", dist2)
         hj_fwd_bound.bind("anc_out", anc2)
-        hops_jump_fwd_kernel = hj_fwd_bound.compile(backend, **launch)
+        hops_jump_fwd_kernel = _compile_bound(hj_fwd_bound, be)
 
         hj_bwd_bound = hops_jump_fk.build()
         hj_bwd_bound.bind("dist_in", dist2)
         hj_bwd_bound.bind("anc_in", anc2)
         hj_bwd_bound.bind("dist_out", dist)
         hj_bwd_bound.bind("anc_out", anc)
-        hops_jump_bwd_kernel = hj_bwd_bound.compile(backend, **launch)
+        hops_jump_bwd_kernel = _compile_bound(hj_bwd_bound, be)
 
         # rounded up to even so alternating fwd/bwd always ends back in the
         # primary dist/anc buffers - see build_hops_jump's own docstring.
@@ -739,17 +434,17 @@ def make_graphflood(
         dw_bound.bind("dirs", dirs)
         dw_bound.bind("mfd_w", mfd_w)
         dw_bound.bind_leaf(grid_params)
-        dirs_weights_kernel = dw_bound.compile(backend, **launch)
+        dirs_weights_kernel = _compile_bound(dw_bound, be)
 
         ir_bound = topo["indegree_reset"].build()
         ir_bound.bind("indegree", indegree)
-        indegree_reset_kernel = ir_bound.compile(backend, **launch)
+        indegree_reset_kernel = _compile_bound(ir_bound, be)
 
         ic_bound = topo["indegree_count"].build()
         ic_bound.bind("dirs", dirs)
         ic_bound.bind("indegree", indegree)
         ic_bound.bind_leaf(grid_params)
-        indegree_count_kernel = ic_bound.compile(backend, **launch)
+        indegree_count_kernel = _compile_bound(ic_bound, be)
 
         nn = _TOPOLOGY_NN[topology]
         persistent = build_persistent_mfd(grid=grid, n_flat=n_flat, n_neighbours=nn)
@@ -757,7 +452,7 @@ def make_graphflood(
         qi_bound.bind("SOURCE", source_p)
         qi_bound.bind("accum", Q_in)
         qi_bound.bind_leaf(grid_params, prefix=("grid",))
-        persistent_q_init_kernel = qi_bound.compile(backend, **launch)
+        persistent_q_init_kernel = _compile_bound(qi_bound, be)
 
         pa_bound = persistent["accum"].build()
         pa_bound.bind("frontier0", frontier0)
@@ -769,8 +464,7 @@ def make_graphflood(
         pa_bound.bind("accum", Q_in)
         pa_bound.bind("indegree", indegree)
         pa_bound.bind_leaf(grid_params)
-        pgrid, pblock = persistent_grid_block()
-        persistent_accum_kernel = pa_bound.compile(backend, grid=pgrid, block=pblock)
+        persistent_accum_kernel = _compile_bound(pa_bound, be)
 
         compute_qo_fk = core_blocks.build_compute_qo(
             grid=grid, n_flat=n_flat, topology=topology,
@@ -778,7 +472,7 @@ def make_graphflood(
             outlet_behavior=outlet_behavior,
         )
         apply_div_fk = core_blocks.build_apply_divergence(grid=grid, n_flat=n_flat, outlet_behavior=outlet_behavior)
-        core_frozen = RoutineBuilder().compose("compute_qo", compute_qo_fk).compose("apply_divergence", apply_div_fk).freeze()
+        core_frozen = RoutineBuilder().step("compute_qo", compute_qo_fk).step("apply_divergence", apply_div_fk).freeze()
         core_bound = core_frozen.build()
         core_bound.bind(("compute_qo", "z"), z)
         core_bound.bind(("compute_qo", "h"), h)
@@ -796,7 +490,7 @@ def make_graphflood(
         if outlet_behavior == "fixed_h":
             core_bound.bind(("apply_divergence", "BOUNDARY_H"), boundary_h_p)
         core_bound.bind_leaf(grid_params, prefix=("apply_divergence",))
-        core_kernel = core_bound.compile(backend, **launch)
+        core_kernel = _compile_bound(core_bound, be)
 
         return GraphfloodVanillaMFD(
             make_surface=make_surface_kernel, reset_counters=reset_counters_kernel,
@@ -820,11 +514,10 @@ def make_graphflood(
             f"make_graphflood: depression_method must be one of {sorted(_DEP_METHODS)}, got {depression_method!r}"
         )
 
-    closure = backend in ("taichi", "quadrants")
-    launch = {} if closure else {"grid": ((int(n_flat) + block_size - 1) // block_size,), "block": (block_size,)}
-    core_blocks = _core_blocks_for(backend)
+    closure = be.family == "closure"
+    core_blocks = _core_blocks_for(be)
     if closure:
-        backend_mod = backend_classes(backend).module
+        backend_mod = be.module
 
     # ------------------------------------------------------------------
     # 1. routing + local-minima resolution
@@ -849,7 +542,7 @@ def make_graphflood(
                 tag=tag, tag_alt=tag_alt, rec_scratch=rec_scratch, rerouted=rerouted,
             )
         recv = make_receivers(
-            backend, grid, topology=topology, mode="steepest",
+            be, grid, topology=topology, mode="steepest",
             diagonal_partition_correction=diagonal_partition_correction, h_aware=True,
         )
         recv_bound = recv["receivers"].build()
@@ -857,17 +550,21 @@ def make_graphflood(
         recv_bound.bind("z", z)
         recv_bound.bind("h", h)
         recv_bound.bind("rec", rec)
-        receivers_kernel = recv_bound.compile(backend, **launch)
+        receivers_kernel = _compile_bound(recv_bound, be)
 
-        deps = make_depressions(backend, grid, ndep_p, method=depression_method, reroute="carve", n_flat=n_flat)
-        minima_solver = make_depression_solver(
-            backend, deps, grid_params, method=depression_method, reroute="carve",
+        deps = make_depressions(be, grid, ndep_p, method=depression_method, reroute="carve", n_flat=n_flat)
+        deps_frozen, _ = make_depression_solver(
+            be, deps, grid_params, method=depression_method, reroute="carve",
+            n_flat=n_flat, block_size=block_size,
+        )
+        deps_bound = bind_depression_solver(
+            deps_frozen, grid_params, ndep_p=ndep_p, method=depression_method, reroute="carve",
             rec=rec, z=z, bid=bid, rec_jump=rec_jump, z_prime=z_prime, is_border=is_border,
             basin_saddle=basin_saddle, basin_saddlenode=basin_saddlenode, outlet=outlet,
             rerouted=rerouted, tag=tag, tag_alt=tag_alt, rec_scratch=rec_scratch,
             basin_route=basin_route, b_rcv=b_rcv,
-            n_flat=n_flat, block_size=block_size,
         )
+        minima_solver = _compile_bound(deps_bound, be)
         rec_for_accum = rec
     else:
         _require(
@@ -885,13 +582,13 @@ def make_graphflood(
         ms_bound.bind("z", z)
         ms_bound.bind("h", h)
         ms_bound.bind("surface", surface)
-        make_surface_kernel = ms_bound.compile(backend, **launch)
+        make_surface_kernel = _compile_bound(ms_bound, be)
 
         hf_bound = h_from_filled_fk.build()
         hf_bound.bind("z", z)
         hf_bound.bind("filled", filled)
         hf_bound.bind("h", h)
-        h_from_filled_kernel = hf_bound.compile(backend, **launch)
+        h_from_filled_kernel = _compile_bound(hf_bound, be)
 
         resolved_max_passes = max_passes if max_passes is not None else 4 * max(int(nx), int(ny))
         if closure:
@@ -902,33 +599,38 @@ def make_graphflood(
             )
         rc_bound = reset_fks["counters"].build()
         rc_bound.bind("counters", counters)
-        reset_counters_kernel = rc_bound.compile(backend, **launch)
+        reset_counters_kernel = _compile_bound(rc_bound, be)
         rq_bound = reset_fks["queued_gen"].build()
         rq_bound.bind("queued_gen", queued_gen)
-        reset_queued_gen_kernel = rq_bound.compile(backend, **launch)
+        reset_queued_gen_kernel = _compile_bound(rq_bound, be)
 
-        recon = make_fill_reconstruct(backend, grid, nx=nx, ny=ny)
-        minima_solver = make_fill_reconstruct_solver(
-            backend, recon, grid_params, z=surface, filled=filled, parent=parent, frontier=frontier,
-            counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
+        recon = make_fill_reconstruct(be, grid, nx=nx, ny=ny)
+        recon_frozen, _ = make_fill_reconstruct_solver(
+            be, recon, grid_params, pass_p=pass_p, active_p=active_p,
             n_flat=n_flat, nx=nx, ny=ny, block_size=block_size, max_passes=max_passes,
         )
+        recon_bound = bind_fill_reconstruct_solver(
+            recon_frozen, grid_params, z=surface, filled=filled, parent=parent,
+            frontier=frontier, counters=counters, queued_gen=queued_gen,
+            pass_p=pass_p, active_p=active_p,
+        )
+        minima_solver = _compile_bound(recon_bound, be)
         rec_for_accum = parent
 
     # ------------------------------------------------------------------
     # 2. full downstream accumulation
     # ------------------------------------------------------------------
-    accum = make_accumulation(backend, grid, method="atomic", n_flat=n_flat)
+    accum = make_accumulation(be, grid, method="atomic", n_flat=n_flat)
     if "q_init" in accum:
         qi_bound = accum["q_init"].build()
         qi_bound.bind("SOURCE", source_p)
         qi_bound.bind("q", Q_in)
-        q_init_kernel = qi_bound.compile(backend, **launch)
+        q_init_kernel = _compile_bound(qi_bound, be)
     a_bound = accum["accum"].build()
     a_bound.bind("SOURCE", source_p)
     a_bound.bind("rec", rec_for_accum)
     a_bound.bind("q", Q_in)
-    accum_kernel = a_bound.compile(backend, **launch)
+    accum_kernel = _compile_bound(a_bound, be)
 
     # ------------------------------------------------------------------
     # 3. core: compute_qo then apply_divergence
@@ -950,7 +652,7 @@ def make_graphflood(
         )
         apply_div_fk = core_blocks.build_apply_divergence(grid=grid, n_flat=n_flat, outlet_behavior=outlet_behavior)
 
-    core_frozen = RoutineBuilder().compose("compute_qo", compute_qo_fk).compose("apply_divergence", apply_div_fk).freeze()
+    core_frozen = RoutineBuilder().step("compute_qo", compute_qo_fk).step("apply_divergence", apply_div_fk).freeze()
     core_bound = core_frozen.build()
     core_bound.bind(("compute_qo", "z"), z)
     core_bound.bind(("compute_qo", "h"), h)
@@ -968,7 +670,7 @@ def make_graphflood(
         core_bound.bind(("apply_divergence", "BOUNDARY_H"), boundary_h_p)
     core_bound.bind_leaf(grid_params, prefix=("compute_qo",))
     core_bound.bind_leaf(grid_params, prefix=("apply_divergence",))
-    core_kernel = core_bound.compile(backend, **launch)
+    core_kernel = _compile_bound(core_bound, be)
 
     return GraphfloodVanillaSFD(
         fill_method=fill_method,
@@ -982,3 +684,133 @@ def make_graphflood(
         accum=accum_kernel,
         core=core_kernel,
     )
+
+
+@dataclass(frozen=True)
+class FrozenGraphflood:
+    """Immutable GraphFlood recipe, ready for live-state binding."""
+
+    be: Backend
+    grid: object
+    config: MappingProxyType
+
+
+def make_graphflood(
+    be: Backend,
+    grid,
+    *,
+    kind: str = "vanilla_sfd",
+    n_flat: int,
+    nx: int,
+    ny: int,
+    fill_method: str = "jump",
+    accum_method: str = "atomic",
+    depression_method: str = "optimized",
+    topology: str = "D8",
+    diagonal_partition_correction: bool = True,
+    friction_law: str = "manning",
+    outlet_behavior: str = "fixed_h",
+    block_size: int = 256,
+    max_passes: int | None = None,
+):
+    """Return an unbound GraphFlood recipe.
+
+    Bind terrain, flow, and model parameters with :func:`bind_graphflood`.
+    The resulting object updates its bound arrays in place on each call.
+
+    Parameters
+    ----------
+    be : Backend
+        Target backend. ``vanilla_mfd`` requires CuPy.
+    grid : FrozenGroup
+        Grid topology helpers.
+    kind : {"vanilla_sfd", "unstable", "vanilla_mfd"}
+        Flow-routing formulation.
+    n_flat, nx, ny : int
+        Raster size and dimensions.
+    fill_method : {"jump", "reconstruct"}
+        Depression treatment for ``vanilla_sfd``. ``jump`` reroutes receiver
+        paths; ``reconstruct`` fills the water-surface field.
+    accum_method : {"atomic"}
+        Downstream accumulation method. This is currently the sole choice.
+    depression_method : {"vanilla", "optimized"}
+        Basin labelling method used by ``fill_method="jump"``.
+    topology : {"D4", "D8"}
+        Flow neighbourhood.
+    diagonal_partition_correction : bool
+        Apply diagonal-distance correction on D8 grids.
+    friction_law : str
+        Flow-resistance law.
+    outlet_behavior : {"fixed_h", "free", "fixed_s"}
+        Boundary treatment at outlets. ``fixed_h`` requires a boundary-depth
+        parameter; ``fixed_s`` requires a boundary-slope parameter.
+    block_size, max_passes : int, optional
+        CuPy launch size and reconstruction iteration limit.
+
+    Returns
+    -------
+    tuple
+        A :class:`FrozenGraphflood` recipe and an empty parameter mapping.
+    """
+    be = require_backend(be)
+    if kind not in _KINDS:
+        raise ValueError(f"make_graphflood: kind must be one of {sorted(_KINDS)}, got {kind!r}")
+    if fill_method not in _FILL_METHODS:
+        raise ValueError(f"make_graphflood: fill_method must be one of {sorted(_FILL_METHODS)}, got {fill_method!r}")
+    if accum_method not in _ACCUM_METHODS:
+        raise ValueError(f"make_graphflood: accum_method must be one of {sorted(_ACCUM_METHODS)}, got {accum_method!r}")
+    if depression_method not in _DEP_METHODS:
+        raise ValueError(f"make_graphflood: depression_method must be one of {sorted(_DEP_METHODS)}, got {depression_method!r}")
+    if topology not in _TOPOLOGY_NN:
+        raise ValueError(f"make_graphflood: topology must be one of {sorted(_TOPOLOGY_NN)}, got {topology!r}")
+    if outlet_behavior not in _OUTLET_BEHAVIORS:
+        raise ValueError(
+            f"make_graphflood: outlet_behavior must be one of {sorted(_OUTLET_BEHAVIORS)}, got {outlet_behavior!r}"
+        )
+    if kind == "vanilla_mfd" and be.family != "cupy":
+        raise ValueError("make_graphflood: kind='vanilla_mfd' is cupy-only")
+    config = MappingProxyType({
+        "kind": kind,
+        "n_flat": int(n_flat), "nx": int(nx), "ny": int(ny),
+        "fill_method": fill_method, "accum_method": accum_method,
+        "depression_method": depression_method, "topology": topology,
+        "diagonal_partition_correction": bool(diagonal_partition_correction),
+        "friction_law": friction_law, "outlet_behavior": outlet_behavior,
+        "block_size": int(block_size), "max_passes": max_passes,
+    })
+    return FrozenGraphflood(be, grid, config), {}
+
+
+def bind_graphflood(frozen: FrozenGraphflood, grid_params: dict, **bindings):
+    """Bind live GraphFlood state and compile its timestep.
+
+    Parameters
+    ----------
+    frozen : FrozenGraphflood
+        Recipe returned by :func:`make_graphflood`.
+    grid_params : dict
+        Parameters associated with the recipe's grid group.
+    **bindings
+        Live arrays and parameters. Every recipe requires ``z``, ``h``,
+        ``Q_in``, ``Qo``, ``source_p``, ``manning_p``,
+        ``friction_exponent_p``, ``dt_p``, and ``gf_min_increment_p``.
+        ``fixed_h`` additionally needs ``boundary_h_p``; ``fixed_s`` needs
+        ``boundary_slope_p``. ``jump`` recipes need receiver and basin
+        scratch arrays; ``reconstruct`` recipes need surface and frontier
+        scratch arrays. ``unstable`` needs ``Q_next``. CuPy MFD recipes need
+        reconstruction, topology, frontier, and hop-distance scratch arrays.
+
+    Returns
+    -------
+    GraphfloodVanillaSFD, GraphfloodUnstable, or GraphfloodVanillaMFD
+        A callable timestep object. Call :meth:`close` when it is no longer used.
+    """
+    if not isinstance(frozen, FrozenGraphflood):
+        raise TypeError("bind_graphflood() requires a FrozenGraphflood from make_graphflood()")
+    overlap = set(frozen.config).intersection(bindings)
+    if overlap:
+        raise TypeError(
+            "bind_graphflood() received recipe configuration as live binding(s): "
+            f"{sorted(overlap)}; pass these to make_graphflood()"
+        )
+    return _compile_graphflood(frozen.be, frozen.grid, grid_params, **frozen.config, **bindings)

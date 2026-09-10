@@ -1,174 +1,116 @@
-"""
-Backend-agnostic pool contracts.
-
-Defines the blueprint that every pool backend (Taichi fields, ndarrays,
-quadrants, cupy, ...) must implement. No allocation logic here
-- this is the interface only.
-
-Author: B.G (07/2026)
-"""
+"""Interfaces for reusable backend arrays."""
 
 import itertools
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any
 
+from ..context.errors import PyFastFlowError
+
 _uid_counter = itertools.count()
 
 
-class PoolError(RuntimeError):
-    """
-    Raised on a pool lifecycle misuse: releasing a foreign or already-free
-    handle, or clearing a pool that still has handles in use.
-
-    Author: B.G (08/2026)
-    """
+class PoolError(PyFastFlowError):
+    """Raised when a pool or handle is used outside its lifetime."""
 
 
 def new_uid() -> int:
-    """
-    Return the next value from the process-wide identity counter.
-
-    Every Parameter, Bag, Helper (device-function builder and its compiled
-    artifact) and pool DataHandle is assigned one of these at construction,
-    exposed as a read-only `uid` property. uids are plain integers drawn from
-    this single shared counter - not stable across processes, and
-    deliberately so: they identify an object within one running process and
-    must never appear in generated code or a cache key.
-
-    Author: B.G (07/2026)
-    """
+    """Return a new process-local object identity."""
     return next(_uid_counter)
 
 
 class DataHandle(ABC):
-    """
-    Opaque handle to one pooled backend resource (a Taichi field, ndarray, ...).
+    """A checked-out backend buffer owned by a Pool.
 
-    Owns the acquire/release lifecycle: `release()` returns the handle to its
-    pool for reuse without freeing memory; `destroy()` actually frees it.
-
-    Attributes:
-        uid: Process-wide identity from the shared counter (new_uid()) - unique
-            across every Parameter, Bag, Helper and DataHandle regardless of
-            backend. Concrete handles set self._uid in their own __init__.
-        dtype: Backend-native or common dtype tag for this resource.
-        shape: Resource dimensions. () for a scalar.
-        in_use: True between acquire() and release().
-
-    Author: B.G (07/2026)
+    Release returns its memory to the pool for reuse; destroy discards that
+    memory. A handle bound as ``DATA`` cannot be released or destroyed until
+    every bound or compiled object using it has been closed.
     """
 
-    dtype: Any
+    dtype: str
+    backend_dtype: Any
     shape: tuple[int, ...]
     in_use: bool
 
+    _BACKEND_NAME: str = None
+    # Number of bound or compiled objects that hold this handle as DATA.
+    _bound_by = 0
+
+    def _assert_unbound(self, action: str) -> None:
+        """Reject a lifecycle change while this handle is bound as DATA."""
+        if self._bound_by > 0:
+            raise PoolError(
+                f"handle uid={getattr(self, '_uid', '?')}: cannot {action} while still bound by "
+                f"{self._bound_by} object(s) - close() every Bound/compiled object holding it first"
+            )
+
+    @property
+    def backend(self):
+        """Backend that owns this handle."""
+        from ..context.backends import Backend
+
+        return Backend.from_name(self._BACKEND_NAME)
+
     @property
     def uid(self) -> int:
-        """
-        Process-wide identity assigned at construction. See new_uid().
-
-        Author: B.G (07/2026)
-        """
+        """Process-local identity of this handle."""
         return self._uid
 
     @property
     @abstractmethod
-    def data(self):
-        """
-        Return the raw backend object (ti.field, np.ndarray, ...).
-
-        Author: B.G (07/2026)
-        """
+    def array(self):
+        """Underlying backend array."""
         ...
 
     @abstractmethod
     def acquire(self) -> None:
-        """
-        Mark this handle in_use. Called by the owning pool on checkout.
-
-        Author: B.G (07/2026)
-        """
+        """Mark this handle as checked out."""
         ...
 
     @abstractmethod
     def release(self) -> None:
-        """
-        Mark this handle available for reuse. Backend memory is kept.
-
-        Author: B.G (07/2026)
-        """
+        """Mark this handle available for reuse without freeing memory."""
         ...
 
     @abstractmethod
     def destroy(self) -> None:
-        """
-        Free the underlying backend memory. Handle is unusable afterwards.
-
-        Author: B.G (07/2026)
-        """
+        """Discard the underlying backend memory."""
         ...
 
     @abstractmethod
     def to_numpy(self):
-        """
-        Copy the resource out to a numpy array.
-
-        Author: B.G (07/2026)
-        """
+        """Copy this buffer to a NumPy array."""
         ...
 
     @abstractmethod
     def from_numpy(self, arr) -> None:
-        """
-        Copy a numpy array into the resource in place.
-
-        Author: B.G (07/2026)
-        """
+        """Copy a NumPy array into this buffer."""
         ...
 
 
 class Pool(ABC):
-    """
-    Blueprint for a backend-specific pool manager.
+    """Manager for reusable backend buffers.
 
-    Implementations keep handles bucketed by (dtype, shape) and reuse
-    released handles before allocating new ones.
-
-    Author: B.G (07/2026)
+    A pool returns a matching available handle or allocates one when needed.
+    Released handles retain their memory and can be checked out again.
     """
 
     @abstractmethod
     def get_data(self, dtype, shape) -> DataHandle:
-        """
-        Return an available handle matching (dtype, shape), allocating one if needed.
-
-        Author: B.G (07/2026)
-        """
+        """Check out a buffer of the requested dtype and shape."""
         ...
 
     @abstractmethod
     def release_data(self, handle: DataHandle) -> None:
-        """
-        Return a handle to the pool for reuse.
-
-        Raises on a handle this pool never minted, and on a double release (a
-        handle already marked available) - either would let the same backing
-        buffer be handed out to two owners at once.
-
-        Author: B.G (07/2026)
-        """
+        """Return a checked-out handle to this pool for reuse."""
         ...
 
     @contextmanager
     def data(self, dtype, shape):
-        """
-        Scoped acquire/release: `with pool.data(dtype, shape) as h:` checks a
-        handle out and returns it on block exit, including on exception. The
-        primary acquisition API - use `get_data`/`release_data` directly only
-        when a handle must outlive the acquiring scope.
+        """Yield a checked-out handle and return it on exit.
 
-        Author: B.G (08/2026)
+        This is the usual acquisition API. Use ``get_data`` only when a
+        handle must outlive the surrounding scope.
         """
         handle = self.get_data(dtype, shape)
         try:
@@ -178,31 +120,15 @@ class Pool(ABC):
 
     @abstractmethod
     def clear_unused(self) -> None:
-        """
-        Destroy and drop all handles currently not in_use.
-
-        Author: B.G (07/2026)
-        """
+        """Destroy every available handle in this pool."""
         ...
 
     @abstractmethod
     def clear_all(self, force: bool = False) -> None:
-        """
-        Destroy and drop every handle.
-
-        Raises if any handle is still `in_use` unless `force=True` is passed -
-        destroying a live handle leaves its holder with a dangling device
-        resource.
-
-        Author: B.G (07/2026)
-        """
+        """Destroy every handle, rejecting checked-out ones unless forced."""
         ...
 
     @abstractmethod
     def stats(self) -> dict:
-        """
-        Return {"total", "in_use", "available"} handle counts.
-
-        Author: B.G (07/2026)
-        """
+        """Return counts for total, checked-out, and available handles."""
         ...

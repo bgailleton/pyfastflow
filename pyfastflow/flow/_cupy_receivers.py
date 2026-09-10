@@ -1,44 +1,6 @@
-"""
-cupy (CUDA source) block templates behind make_receivers, on the
-builder/frozen/bound stack (core/context/builder.py, frozen.py, bound.py).
-Mirrors _closure_receivers.py block for block: same private/public split,
-same `mode`/`h_aware`/`diagonal_partition_correction` selectors picking
-which CUDA text gets built, same always-wrap-then-share() shape for `grid`'s
-two independent occurrences (see _closure_receivers.py's module docstring).
+"""CUDA templates for flow receivers."""
 
-Every span reaching a PARAM is spelled `$ctx.NAME.get(...)$`/
-`$ctx.NAME.set_node(...)$` in full, every span reaching a composed HELPER is
-spelled `$ctx.name(args)$` (see builder.py's module docstring, "Param
-access is STRICT"). Every `__device__`/
-`__global__` symbol is prefixed with this build's own tag (a fresh
-new_uid()) so two make_receivers() calls in one process never collide inside
-a single compiled cupy module.
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import HelperBuilder, KernelBuilder
-from ..core.context.slot import SlotKind
-from ..core.pool.base import new_uid
-
-
-def _find_param_paths(frozen, leaf_name: str, prefix: tuple = ()) -> list:
-    """Every relative dotted path under `frozen`'s composed subtree whose PARAM slot is named `leaf_name` - see _closure_receivers.py's own (identical)."""
-    paths = []
-    if leaf_name in frozen.slots.names(SlotKind.PARAM):
-        paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
-        paths.extend(_find_param_paths(child, leaf_name, prefix + (name,)))
-    return paths
-
-
-def _share_leaf(builder, canonical: str) -> None:
-    """Declare every occurrence of PARAM `canonical` in `builder`'s composed subtree shared with its own top-level slot - see _closure_receivers.py's own (identical)."""
-    paths = []
-    for name, child in builder.composed.items():
-        paths.extend(_find_param_paths(child, canonical, (name,)))
-    if paths:
-        builder.share(canonical, *paths)
+from ..core import HelperBuilder, KernelBuilder, SlotKind, new_uid, share_leaf
 
 
 def build_distance_slope_helpers(grid, *, topology: str, diagonal_partition_correction: bool):
@@ -50,14 +12,13 @@ def build_distance_slope_helpers(grid, *, topology: str, diagonal_partition_corr
 
     Returns {name: HelperBuilder}.
 
-    Author: B.G (08/2026)
     """
     d8 = topology == "D8"
     correct = diagonal_partition_correction and d8
     t = f"fr{new_uid()}"
 
     if correct:
-        dist_from_k_corrected = HelperBuilder().compose("grid", grid).ingest(
+        dist_from_k_corrected = HelperBuilder(
             f"""
 __device__ float {t}_dist_from_k_corrected(int k) {{
     float d = $ctx.grid.dist_from_k(k)$;
@@ -67,8 +28,8 @@ __device__ float {t}_dist_from_k_corrected(int k) {{
     return d;
 }}
 """
-        )
-        dist_between_nodes_corrected = HelperBuilder().compose("grid", grid).ingest(
+        ).compose("grid", grid).freeze()
+        dist_between_nodes_corrected = HelperBuilder(
             f"""
 __device__ float {t}_dist_between_nodes_corrected(int i, int j) {{
     float d = $ctx.grid.dist_between_nodes(i, j)$;
@@ -78,37 +39,29 @@ __device__ float {t}_dist_between_nodes_corrected(int i, int j) {{
     return d;
 }}
 """
-        )
+        ).compose("grid", grid).freeze()
     else:
-        dist_from_k_corrected = HelperBuilder().compose("grid", grid).ingest(
+        dist_from_k_corrected = HelperBuilder(
             f"__device__ float {t}_dist_from_k_corrected(int k) {{ return $ctx.grid.dist_from_k(k)$; }}"
-        )
-        dist_between_nodes_corrected = HelperBuilder().compose("grid", grid).ingest(
+        ).compose("grid", grid).freeze()
+        dist_between_nodes_corrected = HelperBuilder(
             f"__device__ float {t}_dist_between_nodes_corrected(int i, int j) {{ return $ctx.grid.dist_between_nodes(i, j)$; }}"
-        )
+        ).compose("grid", grid).freeze()
 
-    slope_from_values_k = (
-        HelperBuilder()
-        .compose("dist_from_k_corrected", dist_from_k_corrected)
-        .ingest(
-            f"""
+    slope_from_values_k = HelperBuilder(
+        f"""
 __device__ float {t}_slope_from_values_k(float zi, float hi, float zj, float hj, int k) {{
     return ((zi - zj) + (hi - hj)) / $ctx.dist_from_k_corrected(k)$;
 }}
 """
-        )
-    )
-    slope_between_nodes = (
-        HelperBuilder()
-        .compose("dist_between_nodes_corrected", dist_between_nodes_corrected)
-        .ingest(
-            f"""
+    ).compose("dist_from_k_corrected", dist_from_k_corrected).freeze()
+    slope_between_nodes = HelperBuilder(
+        f"""
 __device__ float {t}_slope_between_nodes(float vi, float vj, int i, int j) {{
     return (vi - vj) / $ctx.dist_between_nodes_corrected(i, j)$;
 }}
 """
-        )
-    )
+    ).compose("dist_between_nodes_corrected", dist_between_nodes_corrected).freeze()
 
     return {
         "dist_from_k_corrected": dist_from_k_corrected,
@@ -124,14 +77,10 @@ def build_rand_unit(hash_u32):
     composing the caller-supplied `hash_u32` (../noise's public hash helper)
     rather than a private copy - see _closure_receivers.py's own docstring.
 
-    Author: B.G (08/2026)
     """
     t = f"fr{new_uid()}"
     return (
-        HelperBuilder()
-        .wire_param("SEED")
-        .compose("hash_u32", hash_u32)
-        .ingest(
+        HelperBuilder(
             f"""
 __device__ float {t}_rand_unit(int i, int k) {{
     unsigned int key = (unsigned int)$ctx.SEED.get(0)$;
@@ -141,7 +90,7 @@ __device__ float {t}_rand_unit(int i, int k) {{
     return (float)hashed / 4294967296.0f;
 }}
 """
-        )
+        ).compose("hash_u32", hash_u32).freeze()
     )
 
 
@@ -177,7 +126,6 @@ def build_receivers(
     dict
         {name: HelperBuilder/KernelBuilder}.
 
-    Author: B.G (08/2026)
     """
     out = build_distance_slope_helpers(grid, topology=topology, diagonal_partition_correction=diagonal_partition_correction)
     slope = out["slope_from_values_k"]
@@ -229,21 +177,17 @@ extern "C" __global__ void {t}_receivers({args}) {{
 }}
 """
 
-    kb = KernelBuilder()
+    kb = KernelBuilder(body, domain="z")
     grid_param_names = grid.slots.names(SlotKind.PARAM)
     for name in grid_param_names:
-        kb.wire_param(name)
+        kb.param(name)
     kb.compose("grid", grid)
     kb.compose("slope", slope)
     if mode == "stochastic":
         kb.compose("rand_unit", out["rand_unit"])
 
-    data_names = ["z"] + (["h"] if h_aware else []) + ["rec"]
-    for name in data_names:
-        kb.wire_data(name)
-
     for name in grid_param_names:
-        _share_leaf(kb, name)
+        share_leaf(kb, name)
 
-    out["receivers"] = kb.ingest(body)
+    out["receivers"] = kb.freeze()
     return out

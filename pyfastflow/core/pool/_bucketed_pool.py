@@ -1,8 +1,4 @@
-"""
-Shared bucketed Pool implementation, parameterized by a DataHandle subclass.
-
-Author: B.G (07/2026)
-"""
+"""Pool implementation that reuses buffers with matching dtype and shape."""
 
 from typing import Any, ClassVar
 
@@ -10,12 +6,7 @@ from .base import DataHandle, Pool, PoolError
 
 
 class BucketedPool(Pool):
-    """
-    Pool manager bucketed by (dtype, shape). Subclasses only pin
-    `_handle_cls` to the DataHandle implementation they allocate.
-
-    Author: B.G (07/2026)
-    """
+    """Shared pool implementation; subclasses select the handle type."""
 
     _handle_cls: ClassVar[type]
 
@@ -23,19 +14,20 @@ class BucketedPool(Pool):
         self._buckets: dict[tuple[Any, tuple[int, ...]], list[DataHandle]] = {}
 
     def get_data(self, dtype, shape) -> DataHandle:
-        key = (dtype, tuple(shape))
+        backend_dtype = self._handle_cls.normalize_dtype(dtype)
+        key = (backend_dtype, tuple(shape))
         bucket = self._buckets.setdefault(key, [])
         for handle in bucket:
             if not handle.in_use:
                 handle.acquire()
                 return handle
-        handle = self._handle_cls(dtype, key[1])
+        handle = self._handle_cls(backend_dtype, key[1])
         handle.acquire()
         bucket.append(handle)
         return handle
 
     def release_data(self, handle: DataHandle) -> None:
-        bucket = self._buckets.get((handle.dtype, tuple(handle.shape)), [])
+        bucket = self._buckets.get((handle.backend_dtype, tuple(handle.shape)), [])
         if not any(h is handle for h in bucket):
             raise PoolError(
                 f"release_data: handle uid={handle.uid} (dtype={handle.dtype}, "

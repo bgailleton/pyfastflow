@@ -1,49 +1,10 @@
-"""
-cupy (CUDA source) block templates behind ops's make_bitpack_group/make_scan/
-make_reduce, on the builder/frozen/bound stack (core/context/builder.py,
-frozen.py, bound.py). Mirrors _closure_blocks.py's split and
-../grid/_cupy_blocks.py's own conventions: every span reaching a PARAM is
-spelled `$ctx.NAME.get(...)$`/`$ctx.NAME.set_node(...)$` in full, every span
-reaching a composed HELPER is spelled `$ctx.name(args)$`. Every device/
-global function name is prefixed with this build's own tag (a fresh
-new_uid()), matching grid/noise/visu's own belt-and-braces convention
-(compile_cupy.py already mangles by address - see its own module docstring
-- this is redundant safety, not load bearing).
+"""CUDA operation templates for CuPy."""
 
-`.inclusive()` on cupy stays `cp.cumsum` (ops/__init__.py's own module
-docstring: CUB's DeviceScan is already the accelerator cupy dispatches to by
-default) - no RoutineBuilder involved for that half. Compaction's count-read
-and scatter are a two-step FrozenRoutine (routine.py): "read_count" (a
-1-thread kernel writing scan_out[n-1] into the COUNT PARAM) and "scatter",
-each composed with its own `launch=` override
-(routine.py's `RoutineBuilder.compose(name, frozen, launch=...)`) - a
-genuinely different, meaningfully-sized grid/block per step, which is what
-actually exercises the per-step launch mechanism on a backend where launch
-dims mean anything (see ops/__init__.py's module docstring for the fuller
-design-fork note this resolves).
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import GroupBuilder, HelperBuilder, KernelBuilder
-from ..core.context.contract import extract_cupy_contract
-from ..core.pool.base import new_uid
+from ..core import GroupBuilder, RoutineBuilder, freeze_helper as _helper, freeze_kernel as _kernel, new_uid
 
 # ---------------------------------------------------------------------------
 # bitpack: pack(f, i) -> i64, unpack_value(p) -> f32, unpack_index(p) -> i32
 # ---------------------------------------------------------------------------
-
-
-def _helper(template, *, helpers=None):
-    """PARAM slots auto-derived from the template's own contract, exactly like grid/_cupy_blocks.py's `_helper`."""
-    b = HelperBuilder()
-    for chain in extract_cupy_contract(template).chains:
-        if (not helpers) or chain[0] not in helpers:
-            b.wire_param(chain[0])
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
 
 
 def build_bitpack_group() -> "FrozenGroup":
@@ -53,7 +14,6 @@ def build_bitpack_group() -> "FrozenGroup":
     CUDA's __float_as_uint/__uint_as_float. No PARAM slots anywhere in this
     tree.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     flip = _helper(
@@ -116,9 +76,9 @@ __device__ int {t}_unpack_index(long long packed) {{
     )
 
     group = GroupBuilder()
-    group.wire_helper("pack").compose("pack", pack)
-    group.wire_helper("unpack_value").compose("unpack_value", unpack_value)
-    group.wire_helper("unpack_index").compose("unpack_index", unpack_index)
+    group.compose("pack", pack)
+    group.compose("unpack_value", unpack_value)
+    group.compose("unpack_index", unpack_index)
     return group.freeze()
 
 
@@ -133,7 +93,6 @@ def build_math_group() -> "FrozenGroup":
     the same bit-twiddling as _closure_blocks.build_math_group - composed
     onto a fresh GroupBuilder under those two public names. No PARAM slots.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     atan = _helper(f"__device__ float {t}_atan(float x) {{ return atan2f(x, 1.0f); }}")
@@ -159,17 +118,13 @@ __device__ float {t}_nextafter(float x, float y) {{
     )
 
     group = GroupBuilder()
-    group.wire_helper("atan").compose("atan", atan)
-    group.wire_helper("nextafter").compose("nextafter", nextafter)
+    group.compose("atan", atan)
+    group.compose("nextafter", nextafter)
     return group.freeze()
 
 
 # ---------------------------------------------------------------------------
-# elementwise (kernels, returned unbuilt) - `n` is baked as a python int at
-# build time (this build's own closure), not a data argument - see
-# _closure_blocks.build_elementwise's own docstring; the pre-rewrite cupy
-# text carried `n` as a real kernel argument instead, which this port
-# tightens to match every other backend's already-closed-over `n`.
+# Elementwise kernels close over ``n`` as a build-time Python integer.
 # ---------------------------------------------------------------------------
 
 
@@ -179,15 +134,11 @@ def build_elementwise(n: int) -> dict:
     multiply_by_scalar over a flat f32 buffer of length `n`, as unbuilt
     FrozenKernels.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
 
     def _k(template, names):
-        b = KernelBuilder()
-        for name in names:
-            b.wire_data(name)
-        return b.ingest(template)
+        return KernelBuilder(template, domain=n).freeze()
 
     return {
         "swap": _k(
@@ -261,27 +212,6 @@ extern "C" __global__ void {t}_multiply_by_scalar(float* A, float scalar) {{
 # ---------------------------------------------------------------------------
 
 
-def _find_param_paths(frozen, leaf_name: str, prefix: tuple = ()) -> list:
-    """Identical to _closure_blocks.py's own `_find_param_paths`."""
-    from ..core.context.slot import SlotKind
-
-    paths = []
-    if leaf_name in frozen.slots.names(SlotKind.PARAM):
-        paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
-        paths.extend(_find_param_paths(child, leaf_name, prefix + (name,)))
-    return paths
-
-
-def _share_leaf(group: GroupBuilder, canonical: str) -> None:
-    """Identical to _closure_blocks.py's own `_share_leaf`."""
-    paths = []
-    for name, child in group.composed.items():
-        paths.extend(_find_param_paths(child, canonical, (name,)))
-    if paths:
-        group.share(canonical, *paths)
-
-
 def build_slope_group(grid) -> "FrozenGroup":
     """
     sumslope_downstream(z, i) / slope_dir(z, i, k), same arithmetic as
@@ -290,10 +220,7 @@ def build_slope_group(grid) -> "FrozenGroup":
     independently as each helper's own child, same nested-FrozenGroup shape
     as the closure port (see that module's own docstring).
 
-    Author: B.G (08/2026)
     """
-    from ..core.context.slot import SlotKind
-
     t = f"pf{new_uid()}"
     sumslope_downstream = _helper(
         f"""
@@ -328,14 +255,9 @@ __device__ float {t}_slope_dir(const float* z, int i, int k) {{
     )
 
     group = GroupBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        group.wire_param(name)
-    group.wire_helper("sumslope_downstream").compose("sumslope_downstream", sumslope_downstream)
-    group.wire_helper("slope_dir").compose("slope_dir", slope_dir)
-
-    for name in grid_param_names:
-        _share_leaf(group, name)
+    group.compose("sumslope_downstream", sumslope_downstream)
+    group.compose("slope_dir", slope_dir)
+    group.share_identical("sumslope_downstream.grid", as_="grid")
 
     return group.freeze()
 
@@ -354,7 +276,6 @@ def build_block_reduce_group(block_size: int = 128) -> "FrozenGroup":
     warm-up for <cub/block/block_reduce.cuh>, roughly two minutes; that is
     expected, not a hang.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     sum_helper = _helper(
@@ -368,7 +289,7 @@ __device__ float {t}_block_reduce_sum(float val) {{
 """
     )
     group = GroupBuilder()
-    group.wire_helper("sum").compose("sum", sum_helper)
+    group.compose("sum", sum_helper)
     return group.freeze()
 
 
@@ -377,36 +298,15 @@ __device__ float {t}_block_reduce_sum(float val) {{
 # ---------------------------------------------------------------------------
 
 
-def _kernel(template, *, data=(), helpers=None):
-    b = KernelBuilder()
-    for d in data:
-        b.wire_data(d)
-    for chain in extract_cupy_contract(template).chains:
-        if (not helpers) or chain[0] not in helpers:
-            b.wire_param(chain[0])
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_count_and_scatter_routine(n: int, *, block: int = 256) -> "FrozenRoutine":
     """
     A 2-step FrozenRoutine (routine.py): "read_count" (one thread, writes
     scan_out[n-1] into the wired PARAM slot "COUNT") then "scatter" (one
     thread per node, `ids[scan_out[i]-1] = i` wherever `flags[i] != 0`) - the
-    compaction half of scan-based stream compaction. Each step is composed
-    with its own `launch=` override (routine.py's `RoutineBuilder.compose(
-    ..., launch=...)`) sized to that step's own real thread count - "
-    read_count" is one thread regardless of `n`, "scatter" needs
-    ceil(n/block) blocks of `block` threads - see the module docstring for
-    why this, not the inclusive scan itself, is what exercises per-step
-    launch on cupy.
+    compaction half of scan-based stream compaction. Each kernel declares its
+    own domain: one thread for "read_count", and `n` threads for "scatter".
 
-    Author: B.G (08/2026)
     """
-    from ..core.context.routine import RoutineBuilder
-
     t = f"pf{new_uid()}"
     read_count = _kernel(
         f"""
@@ -415,6 +315,8 @@ extern "C" __global__ void {t}_read_count(const int* scan_out) {{
 }}
 """,
         data=["scan_out"],
+        domain=1,
+        block=1,
     )
     scatter = _kernel(
         f"""
@@ -427,10 +329,11 @@ extern "C" __global__ void {t}_scatter(const int* flags, const int* scan_out, in
 }}
 """,
         data=["flags", "scan_out", "ids"],
+        domain=int(n),
+        block=block,
     )
 
-    grid_dim = (n + block - 1) // block
     rb = RoutineBuilder()
-    rb.compose("read_count", read_count, launch={"grid": 1, "block": 1})
-    rb.compose("scatter", scatter, launch={"grid": grid_dim, "block": block})
+    rb.step("read_count", read_count)
+    rb.step("scatter", scatter)
     return rb.freeze()

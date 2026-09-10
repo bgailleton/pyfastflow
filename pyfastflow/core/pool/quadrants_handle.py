@@ -1,8 +1,4 @@
-"""
-Quadrants backend implementation of DataHandle.
-
-Author: B.G (07/2026)
-"""
+"""Quadrants field-backed DataHandle."""
 
 import quadrants as qd
 
@@ -10,10 +6,8 @@ from ._fields_handle import FieldsBuilderDataHandle
 
 
 class QuadrantsDataHandle(FieldsBuilderDataHandle):
-    """
-    DataHandle backed by one Quadrants field.
+    """Handle backed by one Quadrants field."""
 
-    Author: B.G (07/2026)
-    """
+    _BACKEND_NAME = "quadrants"
 
     _backend = qd

@@ -27,11 +27,11 @@ import importlib
 import numpy as np
 import pytest
 
-from pyfastflow.core.context.backends import backend_classes
+from pyfastflow.core.context.backends import Backend
 from pyfastflow.core.context.bound import BindError
 from pyfastflow.core.context.builder import HelperBuilder, KernelBuilder
 from pyfastflow.core.context.contract import ContractError
-from pyfastflow.core.context.frozen import FrozenBuilderError
+from pyfastflow.core.context.frozen import FrozenError
 from pyfastflow.core.context.host_block import HostBlockBuilder
 from pyfastflow.core.context.compile_shared import CompileError
 from pyfastflow.core.context.routine import RoutineBuilder
@@ -71,7 +71,7 @@ def backend(request):
 
 
 def _env(name):
-    bk = backend_classes(name)
+    bk = Backend.from_name(name)
     if name == "taichi":
         from pyfastflow.core.pool.taichi_pool import TaichiPool as P
 
@@ -89,10 +89,6 @@ def _env(name):
 
 def _closure(name):
     return name in ("taichi", "quadrants")
-
-
-def _launch(name, n):
-    return {} if _closure(name) else {"grid": ((n + 255) // 256,), "block": (256,)}
 
 
 # ---------------------------------------------------------------------------
@@ -118,9 +114,7 @@ extern "C" __global__ void {t}_k(const float* arr, float* out) {{
 }}
 """
 
-    kb = KernelBuilder()
-    kb.wire_param("K").wire_param("S").wire_param("F").wire_data("arr").wire_data("out")
-    frozen = kb.ingest(template)
+    frozen = KernelBuilder(template, domain="arr").freeze()
 
     arr_np = np.arange(n, dtype=np.float32)
     fld_np = (np.arange(n, dtype=np.float32) * 0.5)
@@ -128,31 +122,37 @@ extern "C" __global__ void {t}_k(const float* arr, float* out) {{
     out = pool.get_data(f32, (n,))
     arr.from_numpy(arr_np)
 
-    kp = Param("K", dtype=f32, mode="const", value=2.0, pool=pool)
-    sp = Param("S", dtype=f32, mode="scalar", value=10.0, pool=pool)
-    fp = Param("F", dtype=f32, mode="field", value=fld_np, pool=pool, n_flat=n)
+    kp = Param("K", dtype="f32", mode="const", value=2.0, pool=pool)
+    sp = Param("S", dtype="f32", mode="scalar", value=10.0, pool=pool)
+    fp = Param("F", dtype="f32", mode="field", value=fld_np, pool=pool, shape=(n,))
 
     bound = frozen.build()
     bound.bind("K", kp)
     bound.bind("S", sp)
     bound.bind("F", fp)
-    bound.bind("arr", arr.data)
-    bound.bind("out", out.data)
-    bound.compile(backend, **_launch(backend, n))()
+    bound.bind("arr", arr)
+    bound.bind("out", out)
+    run = bound.compile()
+    run()
 
     assert np.allclose(out.to_numpy(), arr_np * 2.0 + 10.0 + fld_np, rtol=1e-5)
 
     # builder not consumed; re-bind the same frozen with a new scalar value
-    sp2 = Param("S", dtype=f32, mode="scalar", value=100.0, pool=pool)
+    sp2 = Param("S", dtype="f32", mode="scalar", value=100.0, pool=pool)
     bound2 = frozen.build()
     bound2.bind("K", kp)
     bound2.bind("S", sp2)
     bound2.bind("F", fp)
-    bound2.bind("arr", arr.data)
-    bound2.bind("out", out.data)
-    bound2.compile(backend, **_launch(backend, n))()
+    bound2.bind("arr", arr)
+    bound2.bind("out", out)
+    run2 = bound2.compile()
+    run2()
     assert np.allclose(out.to_numpy(), arr_np * 2.0 + 100.0 + fld_np, rtol=1e-5)
 
+    run.close()
+    bound.close()
+    run2.close()
+    bound2.close()
     pool.clear_all(force=True)
 
 
@@ -168,13 +168,13 @@ def test_helper_compose(backend):
         def k_tmpl(ctx, arr: T, out: T):
             for i in arr:
                 out[i] = ctx.h(arr[i])
-        helper = HelperBuilder().wire_param("B").ingest(bump_tmpl)
+        helper = HelperBuilder(bump_tmpl).freeze()
         ktemplate = k_tmpl
     else:
         t = f"pf{new_uid()}"
-        helper = HelperBuilder().wire_param("B").ingest(
+        helper = HelperBuilder(
             f"__device__ float {t}_bump(float x) {{ return x + $ctx.B.get(0)$; }}"
-        )
+        ).freeze()
         ktemplate = f"""
 extern "C" __global__ void {t}_k(const float* arr, float* out) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -183,23 +183,24 @@ extern "C" __global__ void {t}_k(const float* arr, float* out) {{
 }}
 """
 
-    kb = KernelBuilder()
-    kb.wire_helper("h").compose("h", helper).wire_data("arr").wire_data("out")
-    frozen = kb.ingest(ktemplate)
+    frozen = KernelBuilder(ktemplate, domain="arr").compose("h", helper).freeze()
 
     arr_np = np.arange(n, dtype=np.float32)
     arr = pool.get_data(f32, (n,))
     out = pool.get_data(f32, (n,))
     arr.from_numpy(arr_np)
 
-    bp = Param("B", dtype=f32, mode="scalar", value=7.0, pool=pool)
+    bp = Param("B", dtype="f32", mode="scalar", value=7.0, pool=pool)
     bound = frozen.build()
     bound.bind(("h", "B"), bp)
-    bound.bind("arr", arr.data)
-    bound.bind("out", out.data)
-    bound.compile(backend, **_launch(backend, n))()
+    bound.bind("arr", arr)
+    bound.bind("out", out)
+    run = bound.compile()
+    run()
 
     assert np.allclose(out.to_numpy(), arr_np + 7.0, rtol=1e-5)
+    run.close()
+    bound.close()
     pool.clear_all(force=True)
 
 
@@ -234,23 +235,26 @@ extern "C" __global__ void {t}_mul3(int* buf) {{
 }}
 """
 
-    k_add = KernelBuilder().wire_data("buf").ingest(add1)
-    k_mul = KernelBuilder().wire_data("buf").ingest(mul3)
+    k_add = KernelBuilder(add1, domain="buf").freeze()
+    k_mul = KernelBuilder(mul3, domain="buf").freeze()
 
     rb = RoutineBuilder()
-    rb.compose("add1", k_add)
-    rb.compose("mul3", k_mul)
+    rb.step("add1", k_add)
+    rb.step("mul3", k_mul)
     frozen = rb.freeze()
 
     buf = pool.get_data(i32, (n,))
     buf.from_numpy(np.full(n, 5, dtype=np.int32))
 
     bound = frozen.build()
-    bound.bind(("add1", "buf"), buf.data)
-    bound.bind(("mul3", "buf"), buf.data)
-    bound.compile(backend, **_launch(backend, n))()
+    bound.bind(("add1", "buf"), buf)
+    bound.bind(("mul3", "buf"), buf)
+    run = bound.compile()
+    run()
 
     assert np.array_equal(buf.to_numpy(), np.full(n, (5 + 1) * 3, dtype=np.int32))
+    run.close()
+    bound.close()
     pool.clear_all(force=True)
 
 
@@ -262,7 +266,6 @@ def test_sequence_host_loop(backend):
         def bump_tmpl(ctx):
             ctx.CNT.set_node(0, ctx.CNT.get(0) + 1)
         bump = bump_tmpl
-        launch = {}
     else:
         t = f"pf{new_uid()}"
         bump = f"""
@@ -271,25 +274,24 @@ extern "C" __global__ void {t}_bump() {{
     $ctx.CNT.set_node(0, cur + 1)$;
 }}
 """
-        launch = {"grid": (1,), "block": (1,)}
 
     def stop_tmpl(ctx):
         return int(ctx.CNT.read()) >= 3
 
-    k_bump = KernelBuilder().wire_param("CNT").ingest(bump)
-    stop_hb = HostBlockBuilder().wire_param("CNT").ingest(stop_tmpl)
+    k_bump = KernelBuilder(bump, domain=1, block=1).freeze()
+    stop_hb = HostBlockBuilder(stop_tmpl).freeze()
 
     sb = SequenceBuilder()
-    sb.compose("bump", k_bump)
-    sb.compose("stop", stop_hb)
+    sb.add("bump", k_bump)
+    sb.add("stop", stop_hb)
     sb.loop(body=["bump"], max_times=10, until="stop")
     frozen = sb.freeze()
 
-    cnt = Param("CNT", dtype=i32, mode="scalar", value=0, pool=pool)
+    cnt = Param("CNT", dtype="i32", mode="scalar", value=0, pool=pool)
     bound = frozen.build()
     bound.bind(("bump", "CNT"), cnt)
     bound.bind(("stop", "CNT"), cnt)
-    compiled = bound.compile(backend, **launch)
+    compiled = bound.compile()
     compiled()
 
     assert int(cnt.read()) == 3
@@ -302,11 +304,14 @@ def test_build_contracts(backend):
     f32 = dt["f32"]
     n = 256
 
-    # missing slot: template reaches ctx.Z, nothing wired
+    # missing composition: a root used as a bare call (not a `.get`/`.set_node`
+    # PARAM access) and never composed - PARAM is derived, but this is not a
+    # PARAM shape, so freeze() reports it missing. (A bare `ctx.Z.get(0)` now
+    # DERIVES a PARAM slot rather than raising - the Unit 3 semantics change.)
     if _closure(backend):
         def bad_tmpl(ctx, arr: T):
             for i in arr:
-                arr[i] = ctx.Z.get(0)
+                arr[i] = ctx.foo(i)
         bad = bad_tmpl
 
         def ok_tmpl(ctx, arr: T):
@@ -315,32 +320,29 @@ def test_build_contracts(backend):
         ok = ok_tmpl
     else:
         t = f"pf{new_uid()}"
-        bad = f'extern "C" __global__ void {t}_bad(float* arr) {{ arr[0] = $ctx.Z.get(0)$; }}'
+        bad = f'extern "C" __global__ void {t}_bad(float* arr) {{ arr[0] = $ctx.foo(0)$; }}'
         ok = f'extern "C" __global__ void {t}_ok(float* arr) {{ arr[0] = $ctx.Z.get(0)$; }}'
 
     with pytest.raises(ContractError):
-        KernelBuilder().wire_data("arr").ingest(bad)
+        KernelBuilder(bad, domain="arr").freeze()
 
-    # re-ingest of a frozen builder
-    kb = KernelBuilder()
-    kb.wire_param("Z").wire_data("arr")
-    kb.ingest(ok)
-    with pytest.raises(FrozenBuilderError):
-        kb.ingest(ok)
+    # a frozen builder cannot be reused
+    kb = KernelBuilder(ok, domain="arr")
+    kb.freeze()
+    with pytest.raises(FrozenError):
+        kb.freeze()
 
     # bind(None)
-    kb2 = KernelBuilder()
-    kb2.wire_param("Z").wire_data("arr")
-    bound = kb2.ingest(ok).build()
+    bound = KernelBuilder(ok, domain="arr").freeze().build()
     with pytest.raises(BindError):
         bound.bind("Z", None)
 
     # compile with an unbound slot
     with pytest.raises(CompileError):
-        bound.compile(backend, **_launch(backend, n))
+        bound.compile(Backend.from_name(backend))
 
     # set() on a const Parameter
-    cp = Param("Z", dtype=f32, mode="const", value=1.0, pool=pool)
+    cp = Param("Z", dtype="f32", mode="const", value=1.0, pool=pool)
     with pytest.raises(Exception):
         cp.set(2.0)
 

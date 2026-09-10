@@ -1,18 +1,4 @@
-"""
-Shared DataHandle implementation for FieldsBuilder-based backends.
-
-Taichi and Quadrants expose an identical field/FieldsBuilder API; subclasses
-only pin `_backend` to their module (ti or qd).
-
-Known cost - Taichi offline cache: each handle finalizes its own
-FieldsBuilder/SNode tree, and Taichi's kernel cache key includes field
-identity, so churning pooled buffers makes Taichi recompile textually
-identical kernels. No fix here; revisit only if Taichi cold-start compile
-time becomes a real problem. The cupy path has no equivalent issue (its
-constant-block machinery was made field-identity-robust).
-
-Author: B.G (07/2026)
-"""
+"""Shared field-backed DataHandle for Taichi and Quadrants."""
 
 from typing import Any, ClassVar
 
@@ -20,34 +6,40 @@ from .base import DataHandle, new_uid
 
 
 class FieldsBuilderDataHandle(DataHandle):
-    """
-    DataHandle backed by one field allocated via FieldsBuilder.
-
-    Composition, not inheritance: kernels take the raw field via `.data`,
-    not the handle itself - see pool/base.py design notes on why
-    subclassing a field type was rejected.
-
-    Author: B.G (07/2026)
-    """
+    """Handle backed by one field allocated through ``FieldsBuilder``."""
 
     _backend: ClassVar[Any]
 
+    @classmethod
+    def normalize_dtype(cls, dtype):
+        """Return this backend's dtype object for a short tag or native dtype."""
+        if isinstance(dtype, str):
+            try:
+                return getattr(cls._backend, dtype)
+            except AttributeError as exc:
+                raise ValueError(f"unknown dtype tag {dtype!r}") from exc
+        return dtype
+
+    @classmethod
+    def short_dtype(cls, dtype) -> str:
+        """Return this backend dtype's stable public short tag."""
+        dtype = cls.normalize_dtype(dtype)
+        for tag in ("i32", "i64", "f32", "u8", "u32"):
+            if dtype == getattr(cls._backend, tag):
+                return tag
+        raise ValueError(f"unsupported dtype {dtype!r}")
+
     def __init__(self, dtype: Any, shape: tuple[int, ...]):
-        """
-        Allocate a field of the given dtype/shape via FieldsBuilder.
-
-        shape=() allocates a 0D scalar field, indexed as field[None].
-
-        Author: B.G (07/2026)
-        """
+        """Allocate a field; ``shape=()`` creates a scalar field."""
         self._uid = new_uid()
-        self.dtype = dtype
+        self.backend_dtype = self.normalize_dtype(dtype)
+        self.dtype = self.short_dtype(self.backend_dtype)
         self.shape = tuple(shape)
         self.in_use = False
 
         backend = self._backend
         self._builder = backend.FieldsBuilder()
-        self._field = backend.field(dtype)
+        self._field = backend.field(self.backend_dtype)
 
         if len(self.shape) == 0:
             self._builder.place(self._field)
@@ -61,27 +53,20 @@ class FieldsBuilderDataHandle(DataHandle):
         self._snodetree = self._builder.finalize()
 
     @property
-    def data(self):
-        """
-        Return the underlying field, for passing straight into kernels or
-        binding as a global.
-
-        Author: B.G (07/2026)
-        """
+    def array(self):
+        """Underlying Taichi or Quadrants field."""
         return self._field
 
     def acquire(self) -> None:
         self.in_use = True
 
     def release(self) -> None:
+        self._assert_unbound("release")
         self.in_use = False
 
     def destroy(self) -> None:
-        """
-        Free the field's GPU memory. Unusable afterwards.
-
-        Author: B.G (07/2026)
-        """
+        """Destroy the underlying field."""
+        self._assert_unbound("destroy")
         if self._snodetree is not None:
             self._snodetree.destroy()
             self._snodetree = None

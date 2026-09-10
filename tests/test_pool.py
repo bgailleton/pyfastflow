@@ -46,7 +46,7 @@ def backend(request):
 
 
 def _pool_and_f32(name):
-    from pyfastflow.core.context.backends import backend_classes
+    from pyfastflow.core.context.backends import Backend
 
     if name == "taichi":
         from pyfastflow.core.pool.taichi_pool import TaichiPool as P
@@ -54,7 +54,7 @@ def _pool_and_f32(name):
         from pyfastflow.core.pool.quadrants_pool import QuadrantsPool as P
     else:
         from pyfastflow.core.pool.cupy_pool import CupyPool as P
-    return P(), backend_classes(name).dtypes["f32"]
+    return P(), Backend.from_name(name).dtypes["f32"]
 
 
 def test_pool_lifecycle(backend):

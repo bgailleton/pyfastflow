@@ -1,18 +1,10 @@
-"""
-Quadrants backend implementation of Pool.
-
-Author: B.G (07/2026)
-"""
+"""Quadrants backend pool."""
 
 from ._bucketed_pool import BucketedPool
 from .quadrants_handle import QuadrantsDataHandle
 
 
 class QuadrantsPool(BucketedPool):
-    """
-    Pool manager for QuadrantsDataHandle, bucketed by (dtype, shape).
-
-    Author: B.G (07/2026)
-    """
+    """Pool that allocates Quadrants field handles."""
 
     _handle_cls = QuadrantsDataHandle

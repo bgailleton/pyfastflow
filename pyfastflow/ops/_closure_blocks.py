@@ -1,44 +1,6 @@
-"""
-Taichi/Quadrants (closure) block templates behind ops's make_bitpack_group/
-make_scan/make_reduce, on the new builder/frozen/bound stack
-(core/context/builder.py, frozen.py, bound.py) - mirrors grid/_closure_blocks.py's
-own split (private blocks as plain python defs, public members composed under
-an explicit name) and reuses its `_helper` assembly verbatim.
+"""Python operation templates for Taichi and Quadrants."""
 
-bitpack has no PARAM slots at all - every private block below only ever needs
-`ctx.bk` (bit_cast/select/cast/the raw u32/i64/i32/f32 dtype tokens - see
-bk.py) plus whatever it composes. `make_bitpack_group` therefore returns a
-FrozenGroup with three composed HELPER members (pack/unpack_value/
-unpack_index) and zero top-level PARAM slots - composing the whole group into
-any kernel or helper mints no new bindable address at all, exactly like
-composing a Contract-empty leaf.
-
-Reduce's accumulator (`sum`/`min`/`max`/`argmin`'s running total) is wired as
-a DATA slot, not a PARAM one: PARAM access is strict get()/set_node() only
-(compile_shared.check_legal_accessors), which is a plain non-atomic
-overwrite, not the atomic accumulation a parallel reduction needs across
-threads - `ctx.bk.atomic_min(acc[None], x[i])` needs `acc` as the raw backend
-field/ndarray `ti.template()`/`qd.Tensor` already gives a DATA argument, the
-same reasoning ops/__init__.py's old (pre-rewrite) `_SUM`/`_MIN`/`_MAX`/
-`_ARGMIN` raw-field binds already used - just expressed as a DATA slot instead
-of a raw, Need-less bind, since a PARAM slot in the new stack always requires
-an actual Parameter object (bound.py's bind() checks `isinstance(obj,
-Parameter)`) and there is deliberately no atomic accessor on Parameter's
-device_view. The Parameter objects `make_reduce` hands back to its own caller
-(`sum_param`, ...) still exist and still own that same storage
-(`sum_p.get().data` IS the array bound to the "acc" DATA address) - reduce's
-own caller reads them exactly as before; only the device-side wiring differs.
-
-`ctx.bk` supplies `bit_cast`/`select`/`cast`/`atomic_min`/`atomic_max` and the
-`u32`/`i64` dtype tokens bitpack/reduce need - not part of the original grid/
-noise/visu surface, extended here (see bk.py's own module docstring for why
-this is the sanctioned way to add an intrinsic, and the extension itself).
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import GroupBuilder, HelperBuilder, KernelBuilder
-from ..core.context.slot import SlotKind
+from ..core import GroupBuilder, RoutineBuilder, freeze_helper as _helper, freeze_kernel as _kernel
 
 # ---------------------------------------------------------------------------
 # bitpack: pack(f, i) -> i64, unpack_value(p) -> f32, unpack_index(p) -> i32
@@ -82,33 +44,14 @@ def _unpack_index_tmpl(ctx, packed):
     return ctx.bk.bit_cast(i_enc, ctx.bk.i32)
 
 
-def _helper(template, *, params=(), helpers=None):
-    """
-    One private/public HelperBuilder: wire_param() every name in `params`,
-    compose() every (name, frozen) pair in `helpers` under that same name,
-    then ingest(template). Identical assembly to grid/_closure_blocks.py's
-    own `_helper`.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_bitpack_group() -> "FrozenGroup":
     """
     pack(f, i) -> i64, unpack_value(p) -> f32, unpack_index(p) -> i32: the
     IEEE-754 bit-flip trick that makes an i64 atomic_min double as a
     lexicographic argmin over (float, int), composed onto a fresh
-    GroupBuilder under those three public names. No PARAM slots anywhere in
-    this tree - see the module docstring.
+    GroupBuilder under those three public names. No PARAM slots occur in
+    this tree.
 
-    Author: B.G (08/2026)
     """
     flip = _helper(_flip_float_bits_tmpl)
     unflip = _helper(_unflip_float_bits_tmpl)
@@ -118,9 +61,9 @@ def build_bitpack_group() -> "FrozenGroup":
     unpack_index = _helper(_unpack_index_tmpl, helpers={"_UNPACKRAW": unpack_raw})
 
     group = GroupBuilder()
-    group.wire_helper("pack").compose("pack", pack)
-    group.wire_helper("unpack_value").compose("unpack_value", unpack_value)
-    group.wire_helper("unpack_index").compose("unpack_index", unpack_index)
+    group.compose("pack", pack)
+    group.compose("unpack_value", unpack_value)
+    group.compose("unpack_index", unpack_index)
     return group.freeze()
 
 
@@ -154,14 +97,13 @@ def build_math_group() -> "FrozenGroup":
     IEEE-754 bit-twiddling (no libm nextafter on GPU) - composed onto a fresh
     GroupBuilder under those two public names. No PARAM slots.
 
-    Author: B.G (08/2026)
     """
     atan = _helper(_atan_tmpl)
     nextafter = _helper(_nextafter_tmpl)
 
     group = GroupBuilder()
-    group.wire_helper("atan").compose("atan", atan)
-    group.wire_helper("nextafter").compose("nextafter", nextafter)
+    group.compose("atan", atan)
+    group.compose("nextafter", nextafter)
     return group.freeze()
 
 
@@ -176,14 +118,9 @@ def build_elementwise(backend: str, backend_mod) -> dict:
     multiply_by_scalar over a flat buffer, as unbuilt FrozenKernels - a
     caller `.build()`s the one it wants, binds data addresses, `.compile()`s.
     Buffers (array1/array2/A/scalar/weight/array) are DATA slots, not bound
-    Parameters - see parameter.py, "Data at call time, configuration at
-    compile time". `multiply_by_scalar`'s own `scalar` argument is annotated
-    `T` (a compile-time template parameter), not `F` (a plain runtime f32) -
-    ported unchanged from the pre-rewrite template; the apparent
-    inconsistency with `add_B_to_weighted_A`'s `weight: F` already existed
-    before this port and is not something this pass changes.
+    Parameters. ``multiply_by_scalar`` uses a typed scalar template argument;
+    ``add_B_to_weighted_A`` receives its weight as a runtime float.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     F = backend_mod.f32
@@ -215,10 +152,7 @@ def build_elementwise(backend: str, backend_mod) -> dict:
             A[i] *= scalar
 
     def _mk(template, names):
-        b = KernelBuilder()
-        for name in names:
-            b.wire_data(name)
-        return b.ingest(template)
+        return KernelBuilder(template).freeze()
 
     return {
         "swap": _mk(swap_tmpl, ["array1", "array2"]),
@@ -254,25 +188,6 @@ def _slope_dir_tmpl(ctx, z, i, k):
     return slope
 
 
-def _find_param_paths(frozen, leaf_name: str, prefix: tuple = ()) -> list:
-    """Every relative dotted path under `frozen`'s composed subtree whose PARAM slot is named `leaf_name` - see grid/__init__.py's own `_find_param_paths` (identical)."""
-    paths = []
-    if leaf_name in frozen.slots.names(SlotKind.PARAM):
-        paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
-        paths.extend(_find_param_paths(child, leaf_name, prefix + (name,)))
-    return paths
-
-
-def _share_leaf(group: GroupBuilder, canonical: str) -> None:
-    """Declare every occurrence of PARAM `canonical` in `group`'s composed subtree shared with its own top-level slot - see grid/__init__.py's own `_share_leaf` (identical)."""
-    paths = []
-    for name, child in group.composed.items():
-        paths.extend(_find_param_paths(child, canonical, (name,)))
-    if paths:
-        group.share(canonical, *paths)
-
-
 def build_slope_group(grid) -> "FrozenGroup":
     """
     sumslope_downstream(z, i): sum of (z[i]-z[j])/dx over every downstream
@@ -280,29 +195,20 @@ def build_slope_group(grid) -> "FrozenGroup":
     0 where there is none. Both walk `grid`'s own neighbour/dx/n_neighbours
     surface, so they follow whatever topology/boundary/nodata `grid` was
     built with - `grid` (a FrozenGroup, ../grid's own make_grid_group result)
-    is composed independently as each helper's own child (a device template
-    can only reach what is composed directly onto its own scope - builder.py's
-    module docstring), the same nested-FrozenGroup-in-FrozenGroup shape
-    visu/__init__.py's hillshade gradient blocks establish. Every name in
+    is composed independently as each helper's own child. A device template
+    reaches only children composed directly into its scope. Every name in
     `grid`'s own top-level PARAM slots is wired again at this group's own top
-    level and declared build-phase-shared with both nested occurrences (see
-    the module docstring's build-phase-sharing section, or grid/__init__.py's
-    own), so a caller binds e.g. `slope.DX` once rather than once per helper.
+    level and declared build-phase-shared with both nested occurrences, so a
+    caller binds e.g. ``slope.DX`` once rather than once per helper.
 
-    Author: B.G (08/2026)
     """
-    sumslope_downstream = HelperBuilder().compose("grid", grid).ingest(_sumslope_downstream_tmpl)
-    slope_dir = HelperBuilder().compose("grid", grid).ingest(_slope_dir_tmpl)
+    sumslope_downstream = HelperBuilder(_sumslope_downstream_tmpl).compose("grid", grid).freeze()
+    slope_dir = HelperBuilder(_slope_dir_tmpl).compose("grid", grid).freeze()
 
     group = GroupBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        group.wire_param(name)
-    group.wire_helper("sumslope_downstream").compose("sumslope_downstream", sumslope_downstream)
-    group.wire_helper("slope_dir").compose("slope_dir", slope_dir)
-
-    for name in grid_param_names:
-        _share_leaf(group, name)
+    group.compose("sumslope_downstream", sumslope_downstream)
+    group.compose("slope_dir", slope_dir)
+    group.share_identical("sumslope_downstream.grid", as_="grid")
 
     return group.freeze()
 
@@ -325,7 +231,6 @@ def _tensor_annotation(backend_mod, backend: str):
     The data-argument annotation a kernel template needs on this closure
     backend: `ti.template()` for Taichi, `qd.Tensor` for Quadrants.
 
-    Author: B.G (08/2026)
     """
     return backend_mod.template() if backend == "taichi" else backend_mod.Tensor
 
@@ -396,18 +301,6 @@ def _make_read_count_tmpl(T, n):
     return read_count_tmpl
 
 
-def _kernel(template, *, data=(), params=(), helpers=None):
-    b = KernelBuilder()
-    for d in data:
-        b.wire_data(d)
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_scan_routine(backend: str, backend_mod, n: int, work_size: int):
     """
     The Blelloch up-sweep/down-sweep FrozenRoutine (routine.py) over a
@@ -426,32 +319,29 @@ def build_scan_routine(backend: str, backend_mod, n: int, work_size: int):
     call via swap() (the buffers that vary), and binds every "work" address
     once (the internal scratch, fixed for the life of this Scan).
 
-    Author: B.G (08/2026)
     """
-    from ..core.context.routine import RoutineBuilder
-
     T = _tensor_annotation(backend_mod, backend)
 
     rb = RoutineBuilder()
-    rb.compose("copy_in", _kernel(_make_copy_input_to_work_tmpl(T, n, work_size), data=["src", "work"]))
+    rb.step("copy_in", _kernel(_make_copy_input_to_work_tmpl(T, n, work_size), data=["src", "work"]))
 
     stride = 1
     i = 0
     while stride < work_size:
-        rb.compose(f"upsweep{i}", _kernel(_make_upsweep_tmpl(T, work_size, stride), data=["work"]))
+        rb.step(f"upsweep{i}", _kernel(_make_upsweep_tmpl(T, work_size, stride), data=["work"]))
         stride *= 2
         i += 1
 
-    rb.compose("zero_root", _kernel(_make_set_root_zero_tmpl(T, work_size - 1), data=["work"]))
+    rb.step("zero_root", _kernel(_make_set_root_zero_tmpl(T, work_size - 1), data=["work"]))
 
     stride = work_size // 2
     j = 0
     while stride > 0:
-        rb.compose(f"downsweep{j}", _kernel(_make_downsweep_tmpl(T, work_size, stride), data=["work"]))
+        rb.step(f"downsweep{j}", _kernel(_make_downsweep_tmpl(T, work_size, stride), data=["work"]))
         stride //= 2
         j += 1
 
-    rb.compose("inclusive_copy", _kernel(_make_inclusive_and_copy_tmpl(T, n), data=["inp", "work", "out"]))
+    rb.step("inclusive_copy", _kernel(_make_inclusive_and_copy_tmpl(T, n), data=["inp", "work", "out"]))
 
     return rb.freeze()
 
@@ -464,7 +354,6 @@ def build_count_and_scatter_kernels(backend: str, backend_mod, n: int):
     flags[i]==1, ids[scan_out[i]-1] = i - the scatter half of scan-based
     compaction. Returns the two FrozenKernels, unbuilt.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     read_count = _kernel(_make_read_count_tmpl(T, n), data=["scan_out"], params=["COUNT"])
@@ -521,8 +410,8 @@ def _make_argmin_unpack_tmpl(T):
 def build_reduce_kernels(backend: str, backend_mod, bitpack_group, n: int):
     """
     One FrozenKernel per op (sum/min/max), each accumulating atomically into
-    its own "acc" DATA argument - see the module docstring for why this is a
-    DATA slot, not a PARAM one - by Taichi/Quadrants' automatic atomic `+=`
+    its own ``acc`` DATA argument. It is a DATA slot because reduction needs
+    atomic writes: Taichi/Quadrants use automatic atomic ``+=``
     reduction (sum) or `ctx.bk.atomic_min`/`atomic_max` (min/max). argmin
     composes the whole `bitpack_group` (a FrozenGroup - see build_bitpack_
     group) under the name "bitpack" and accumulates the packed (value,
@@ -532,7 +421,6 @@ def build_reduce_kernels(backend: str, backend_mod, bitpack_group, n: int):
 
     Returns the five FrozenKernels, unbuilt.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     sum_frozen = _kernel(_make_sum_tmpl(T, n), data=["x", "acc"])

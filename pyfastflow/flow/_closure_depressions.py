@@ -1,61 +1,6 @@
-"""
-Taichi/Quadrants (closure) block templates behind make_depressions/
-make_depression_solver: copy_field, both basin labelling variants,
-saddlesort, both carve variants, jump reroute, and the depression counter -
-on the new builder/frozen/bound/routine/sequence stack (../core/context/
-builder.py, frozen.py, bound.py, routine.py, sequence.py).
+"""Taichi and Quadrants templates for depression handling."""
 
-See _closure_receivers.py/_closure_accum.py/_closure_reconstruct.py for
-the other flow algorithms. Based on ../../flow/flow_reroute_kernels.py,
-`pack`/`unpack_value`/`unpack_index`
-composed from ops.make_bitpack_group (a FrozenGroup, `ctx.bitpack.pack(f,
-i)`) in place of legacy's f32_i32_struct module. Every array here (rec, bid,
-tag, basin_saddle, outlet, ...) is n_flat-sized, basin id = pit index + 1, so
-a per-basin array is safely indexed by any node index too - the same double
-duty the legacy kernels rely on.
-
-`grid` is the caller's FrozenGroup (../grid's make_grid_group result),
-composed under the name "grid" onto whichever KernelBuilder needs
-`ctx.grid.can_out(i)`/`ctx.grid.neighbour(i, k)`/`ctx.grid.N_NEIGHBOURS.
-get(0)` - exactly the idiom _closure_receivers.py's build_receivers already
-established; `ctx.grid.N_NEIGHBOURS.get(0)` inside `range(...)` resolves to a
-plain python int at trace time when N_NEIGHBOURS is bound const-mode (the
-make_grid_parameters default), unrolling the neighbour loop exactly as
-receivers' own does. Every site here composes its own independent occurrence
-of `grid` - basin_id_init/label_basins_walk/border_zprime/atomic_min_saddle/
-find_saddlenode/atomic_min_outlet/depression_counter each mint their own
-`{step}.grid.NX`/etc address (build-phase sharing, `share()`, only collapses
-occurrences *within* one KernelBuilder's own composed subtree - never across
-sibling steps of a routine/sequence, see bound.py's own module docstring and
-_closure_accum.py's ITER note), so a caller binds the same grid Parameter
-object at every one of those addresses - enumerated per build_* docstring
-below, the same multi-address idiom make_accumulation's `ITER`/`SOURCE`
-already established.
-
-`n_flat`, where needed (label_basins_walk's/depression_counter's guard
-bounds, saddlesort/reroute have none), is a plain build-time python int -
-this factory takes no pool and reads no Parameter for it, consistent with
-"atomic" (_closure_accum.py) requiring it explicitly rather than reading a
-bare FrozenGroup's absent bound values.
-
-A fixed, build-time-constant repeat (propagate_basin_iter's `logn+1` rounds
-inside vanilla basin labelling) is unrolled as `logn+1` distinct routine
-compose() names for the SAME propagate_basin_iter FrozenKernel - the
-instancing idiom routine.py's own module docstring documents ("composing
-the same FrozenKernel object under two different step names... two
-independently bindable slot sets") - not a SequenceBuilder loop: unlike
-rake_compress_accum's own host-invisible bump, there is no per-round host
-readback here, the round count is a plain python int fixed at build time, so
-there is nothing a loop's host-side bookkeeping buys over a flat unroll (the
-same choice ../ops/_closure_blocks.py's build_scan_routine makes for its own
-log-depth passes, contrasted with _closure_accum.py's own SequenceBuilder
-loop for rake_compress_accum's per-round-identical body).
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import KernelBuilder
-from ..core.context.routine import RoutineBuilder
+from ..core import KernelBuilder, RoutineBuilder
 from ._closure_shared import _tensor_annotation
 
 
@@ -78,7 +23,6 @@ def build_copy_field(*, backend: str, backend_mod):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -86,7 +30,7 @@ def build_copy_field(*, backend: str, backend_mod):
         for i in src:
             dst[i] = src[i]
 
-    return KernelBuilder().wire_data("src").wire_data("dst").ingest(copy_field_tmpl)
+    return KernelBuilder(copy_field_tmpl).freeze()
 
 
 def build_basin_id_init(*, backend: str, backend_mod, grid):
@@ -107,7 +51,6 @@ def build_basin_id_init(*, backend: str, backend_mod, grid):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -115,7 +58,7 @@ def build_basin_id_init(*, backend: str, backend_mod, grid):
         for i in bid:
             bid[i] = 0 if ctx.grid.can_out(i) else (i + 1)
 
-    return KernelBuilder().compose("grid", grid).wire_data("bid").ingest(basin_id_init_tmpl)
+    return KernelBuilder(basin_id_init_tmpl).compose("grid", grid).freeze()
 
 
 def build_propagate_basin_iter(*, backend: str, backend_mod):
@@ -134,7 +77,6 @@ def build_propagate_basin_iter(*, backend: str, backend_mod):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -143,7 +85,7 @@ def build_propagate_basin_iter(*, backend: str, backend_mod):
             if rec_jump[i] != rec_jump[rec_jump[i]]:
                 rec_jump[i] = rec_jump[rec_jump[i]]
 
-    return KernelBuilder().wire_data("rec_jump").ingest(propagate_basin_iter_tmpl)
+    return KernelBuilder(propagate_basin_iter_tmpl).freeze()
 
 
 def build_propagate_basin_final(*, backend: str, backend_mod):
@@ -163,7 +105,6 @@ def build_propagate_basin_final(*, backend: str, backend_mod):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -171,15 +112,15 @@ def build_propagate_basin_final(*, backend: str, backend_mod):
         for i in bid:
             bid[i] = bid[rec_jump[i]]
 
-    return KernelBuilder().wire_data("bid").wire_data("rec_jump").ingest(propagate_basin_final_tmpl)
+    return KernelBuilder(propagate_basin_final_tmpl).freeze()
 
 
 def build_basin_labelling_vanilla(*, backend: str, backend_mod, grid, copy_field, logn: int):
     """
     RoutineBuilder (routine) for vanilla basin labelling: basin_id_init(bid);
     copy_field(rec -> rec_jump); logn+1 unrolled propagate_basin_iter(rec_jump)
-    rounds (composed under "propagate_iter_0".."propagate_iter_{logn}" - see
-    the module docstring for the unroll-vs-loop choice); propagate_basin_final
+    rounds (composed under ``propagate_iter_0`` through
+    ``propagate_iter_{logn}``); propagate_basin_final
     (bid, rec_jump).
 
     Composed step names: "basin_id_init", "copy_rec_to_recjump",
@@ -210,7 +151,6 @@ def build_basin_labelling_vanilla(*, backend: str, backend_mod, grid, copy_field
         "copy_field" - the caller's own to keep track of, shared across
         every routine that needs a copy).
 
-    Author: B.G (08/2026)
     """
     basin_id_init = build_basin_id_init(backend=backend, backend_mod=backend_mod, grid=grid)
     propagate_basin_iter = build_propagate_basin_iter(backend=backend, backend_mod=backend_mod)
@@ -223,11 +163,11 @@ def build_basin_labelling_vanilla(*, backend: str, backend_mod, grid, copy_field
     }
 
     rb = RoutineBuilder()
-    rb.compose("basin_id_init", basin_id_init)
-    rb.compose("copy_rec_to_recjump", copy_field)
+    rb.step("basin_id_init", basin_id_init)
+    rb.step("copy_rec_to_recjump", copy_field)
     for k in range(logn + 1):
-        rb.compose(f"propagate_iter_{k}", propagate_basin_iter)
-    rb.compose("propagate_basin_final", propagate_basin_final)
+        rb.step(f"propagate_iter_{k}", propagate_basin_iter)
+    rb.step("propagate_basin_final", propagate_basin_final)
 
     return rb, kernels
 
@@ -256,7 +196,6 @@ def build_basin_labelling_optimized(*, backend: str, backend_mod, grid, n_flat: 
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     NFLAT = n_flat
@@ -273,12 +212,7 @@ def build_basin_labelling_optimized(*, backend: str, backend_mod, grid, n_flat: 
             root = rec_jump[i]
             bid[i] = 0 if ctx.grid.can_out(root) else root + 1
 
-    return (
-        KernelBuilder()
-        .compose("grid", grid)
-        .wire_data("rec").wire_data("rec_jump").wire_data("bid")
-        .ingest(label_basins_walk_tmpl)
-    )
+    return KernelBuilder(label_basins_walk_tmpl).compose("grid", grid).freeze()
 
 
 def build_label_from_route(*, backend: str, backend_mod, grid):
@@ -290,7 +224,6 @@ def build_label_from_route(*, backend: str, backend_mod, grid):
     via accumulated merges - unlike re-deriving from the carved receivers.
     Data args (bid, basin_route); composes `grid` for `can_out`.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -299,11 +232,7 @@ def build_label_from_route(*, backend: str, backend_mod, grid):
             root = basin_route[i]
             bid[i] = 0 if ctx.grid.can_out(root) else root + 1
 
-    return (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("bid").wire_data("basin_route")
-        .ingest(label_from_route_tmpl)
-    )
+    return KernelBuilder(label_from_route_tmpl).compose("grid", grid).freeze()
 
 
 def build_basin_labelling_route(*, backend: str, backend_mod, grid, logn: int):
@@ -321,7 +250,6 @@ def build_basin_labelling_route(*, backend: str, backend_mod, grid, logn: int):
     Returns (routine_builder, kernels_dict) with keys "propagate_basin_iter"
     (the shared unrolled kernel) and "label_from_route".
 
-    Author: B.G (08/2026)
     """
     propagate_basin_iter = build_propagate_basin_iter(backend=backend, backend_mod=backend_mod)
     label_from_route = build_label_from_route(backend=backend, backend_mod=backend_mod, grid=grid)
@@ -330,8 +258,8 @@ def build_basin_labelling_route(*, backend: str, backend_mod, grid, logn: int):
 
     rb = RoutineBuilder()
     for k in range(logn + 1):
-        rb.compose(f"contract_{k}", propagate_basin_iter)
-    rb.compose("label_from_route", label_from_route)
+        rb.step(f"contract_{k}", propagate_basin_iter)
+    rb.step("label_from_route", label_from_route)
 
     return rb, kernels
 
@@ -345,7 +273,6 @@ def build_merge_basin_route(*, backend: str, backend_mod, bitpack):
     basin_route); composes `bitpack` for `unpack_index`. basin id = pit + 1, so
     basin i's pit is node i - 1.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -357,11 +284,7 @@ def build_merge_basin_route(*, backend: str, backend_mod, bitpack):
             p_rcv = ctx.bitpack.unpack_index(outlet[i])
             basin_route[i - 1] = p_rcv
 
-    return (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("outlet").wire_data("basin_route")
-        .ingest(merge_basin_route_tmpl)
-    )
+    return KernelBuilder(merge_basin_route_tmpl).compose("bitpack", bitpack).freeze()
 
 
 def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
@@ -390,8 +313,8 @@ def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
     ".basin_saddlenode"/".z"/".outlet", "break_cycle.bid"/".outlet"/
     ".basin_saddle"/".basin_saddlenode". PARAM addresses: "border_zprime.
     grid.*", "atomic_min_saddle.grid.*", "find_saddlenode.grid.*",
-    "atomic_min_outlet.grid.*" - four independent grid occurrences, same
-    Parameter bound at each (see the module docstring).
+    ``atomic_min_outlet.grid.*`` — four independent grid occurrences, with
+    the same Parameter bound at each.
 
     Parameters
     ----------
@@ -407,7 +330,6 @@ def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -497,39 +419,12 @@ def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
                 basin_saddle[i] = invalid_c
                 basin_saddlenode[i] = -1
 
-    border_zprime = (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("bid").wire_data("z").wire_data("z_prime").wire_data("is_border")
-        .ingest(border_zprime_tmpl)
-    )
-    init_saddle_outlet = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("basin_saddle").wire_data("outlet").wire_data("basin_saddlenode").wire_data("b_rcv")
-        .ingest(init_saddle_outlet_tmpl)
-    )
-    atomic_min_saddle = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("is_border").wire_data("z_prime").wire_data("basin_saddle")
-        .ingest(atomic_min_saddle_tmpl)
-    )
-    find_saddlenode = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("is_border").wire_data("z_prime")
-        .wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .ingest(find_saddlenode_tmpl)
-    )
-    atomic_min_outlet = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .wire_data("z").wire_data("outlet").wire_data("b_rcv")
-        .ingest(atomic_min_outlet_tmpl)
-    )
-    set_keep = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("b_rcv").wire_data("outlet")
-        .wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .ingest(set_keep_tmpl)
-    )
+    border_zprime = KernelBuilder(border_zprime_tmpl).compose("grid", grid).freeze()
+    init_saddle_outlet = KernelBuilder(init_saddle_outlet_tmpl).compose("bitpack", bitpack).freeze()
+    atomic_min_saddle = KernelBuilder(atomic_min_saddle_tmpl).compose("grid", grid).compose("bitpack", bitpack).freeze()
+    find_saddlenode = KernelBuilder(find_saddlenode_tmpl).compose("grid", grid).compose("bitpack", bitpack).freeze()
+    atomic_min_outlet = KernelBuilder(atomic_min_outlet_tmpl).compose("grid", grid).compose("bitpack", bitpack).freeze()
+    set_keep = KernelBuilder(set_keep_tmpl).compose("bitpack", bitpack).freeze()
 
     kernels = {
         "border_zprime": border_zprime,
@@ -541,12 +436,12 @@ def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
     }
 
     rb = RoutineBuilder()
-    rb.compose("border_zprime", border_zprime)
-    rb.compose("init_saddle_outlet", init_saddle_outlet)
-    rb.compose("atomic_min_saddle", atomic_min_saddle)
-    rb.compose("find_saddlenode", find_saddlenode)
-    rb.compose("atomic_min_outlet", atomic_min_outlet)
-    rb.compose("break_cycle", set_keep)
+    rb.step("border_zprime", border_zprime)
+    rb.step("init_saddle_outlet", init_saddle_outlet)
+    rb.step("atomic_min_saddle", atomic_min_saddle)
+    rb.step("find_saddlenode", find_saddlenode)
+    rb.step("atomic_min_outlet", atomic_min_outlet)
+    rb.step("break_cycle", set_keep)
 
     return rb, kernels
 
@@ -567,7 +462,7 @@ def build_reroute_carve_vanilla(*, backend: str, backend_mod, bitpack, copy_fiel
     propagate `tag` quickly; the actual edge reversal in finalise operates
     on the original chain, which is why finalise's own first statement
     resets `rec` from that original snapshot before reversing anything -
-    ported exactly as legacy's flow_reroute_kernels.py has it.
+    This encoding stores the pit index plus one.
 
     Composed step names: "init_reroute_carve", "copy_recwork_to_rec",
     "copy_recwork_to_recjump", "iteration_carve_0".."iteration_carve_{logn}",
@@ -590,7 +485,6 @@ def build_reroute_carve_vanilla(*, backend: str, backend_mod, bitpack, copy_fiel
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -631,21 +525,9 @@ def build_reroute_carve_vanilla(*, backend: str, backend_mod, bitpack, copy_fiel
                 rec[saddlenode[i]] = node
                 rerouted[saddlenode[i]] = 1
 
-    init_reroute_carve = (
-        KernelBuilder().wire_data("tag").wire_data("tag_alt").wire_data("saddlenode")
-        .ingest(init_reroute_carve_tmpl)
-    )
-    iteration_reroute_carve = (
-        KernelBuilder()
-        .wire_data("tag").wire_data("tag_alt").wire_data("rec").wire_data("rec_work").wire_data("bid")
-        .ingest(iteration_reroute_carve_tmpl)
-    )
-    finalise_reroute_carve = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("rec_orig").wire_data("tag")
-        .wire_data("saddlenode").wire_data("outlet").wire_data("rerouted")
-        .ingest(finalise_reroute_carve_tmpl)
-    )
+    init_reroute_carve = KernelBuilder(init_reroute_carve_tmpl).freeze()
+    iteration_reroute_carve = KernelBuilder(iteration_reroute_carve_tmpl).freeze()
+    finalise_reroute_carve = KernelBuilder(finalise_reroute_carve_tmpl).compose("bitpack", bitpack).freeze()
 
     kernels = {
         "init_reroute_carve": init_reroute_carve,
@@ -654,13 +536,13 @@ def build_reroute_carve_vanilla(*, backend: str, backend_mod, bitpack, copy_fiel
     }
 
     rb = RoutineBuilder()
-    rb.compose("init_reroute_carve", init_reroute_carve)
-    rb.compose("copy_recwork_to_rec", copy_field)
-    rb.compose("copy_recwork_to_recjump", copy_field)
+    rb.step("init_reroute_carve", init_reroute_carve)
+    rb.step("copy_recwork_to_rec", copy_field)
+    rb.step("copy_recwork_to_recjump", copy_field)
     for k in range(logn + 1):
-        rb.compose(f"iteration_carve_{k}", iteration_reroute_carve)
-    rb.compose("finalise_reroute_carve", finalise_reroute_carve)
-    rb.compose("copy_rec_to_recwork", copy_field)
+        rb.step(f"iteration_carve_{k}", iteration_reroute_carve)
+    rb.step("finalise_reroute_carve", finalise_reroute_carve)
+    rb.step("copy_rec_to_recwork", copy_field)
 
     return rb, kernels
 
@@ -696,7 +578,6 @@ def build_reroute_carve_optimized(*, backend: str, backend_mod, bitpack, n_flat:
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     NFLAT = n_flat
@@ -719,11 +600,7 @@ def build_reroute_carve_optimized(*, backend: str, backend_mod, bitpack, n_flat:
                 nxt = nnxt
                 guard += 1
 
-    return (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("basin_saddlenode").wire_data("outlet")
-        .ingest(carve_basins_serial_tmpl)
-    )
+    return KernelBuilder(carve_basins_serial_tmpl).compose("bitpack", bitpack).freeze()
 
 
 def build_reroute_jump(*, backend: str, backend_mod, bitpack):
@@ -735,7 +612,7 @@ def build_reroute_jump(*, backend: str, backend_mod, bitpack):
 
     The write is deliberately `rec[i - 1]`, not `rec[i]`: the loop is over
     basin ids (`i` ranges over `outlet`'s own index space) and basin id =
-    pit index + 1, so `i - 1` is the pit node. Ported exactly as legacy has
+    pit index + 1, so `i - 1` is the pit node.
     it - see _cupy_depressions.py's build_reroute_jump and make_depressions'
     docstring for the same note.
 
@@ -753,7 +630,6 @@ def build_reroute_jump(*, backend: str, backend_mod, bitpack):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -767,11 +643,7 @@ def build_reroute_jump(*, backend: str, backend_mod, bitpack):
                 rec[i - 1] = rrec
                 rerouted[i - 1] = 1
 
-    return (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("outlet").wire_data("rerouted")
-        .ingest(reroute_jump_tmpl)
-    )
+    return KernelBuilder(reroute_jump_tmpl).compose("bitpack", bitpack).freeze()
 
 
 def build_depression_counter(*, backend: str, backend_mod, grid):
@@ -781,7 +653,7 @@ def build_depression_counter(*, backend: str, backend_mod, grid):
     caller must reset the backing scalar Parameter to 0 (`.set(0)`) before
     each launch - this kernel only accumulates, mirroring ops.Reduce.
     run_sum's own reset-then-launch pattern. `ndep` is wired as DATA (the raw
-    backing field, `ndep_p.get().data`), not PARAM - a genuinely concurrent
+    backing field, `ndep_p.handle().array`), not PARAM - a genuinely concurrent
     atomic accumulate needs the raw field, the same "concurrently mutated is
     DATA by definition" classification make_accumulation's own atomic `q`
     and ops.Reduce's own accumulators already use; PARAM access stays strict
@@ -800,7 +672,6 @@ def build_depression_counter(*, backend: str, backend_mod, grid):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -809,8 +680,4 @@ def build_depression_counter(*, backend: str, backend_mod, grid):
             if rec[i] == i and not ctx.grid.can_out(i) and not ctx.grid.nodata(i):
                 ctx.bk.atomic_add(ndep[None], 1)
 
-    return (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("rec").wire_data("ndep")
-        .ingest(depression_counter_tmpl)
-    )
+    return KernelBuilder(depression_counter_tmpl).compose("grid", grid).freeze()

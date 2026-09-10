@@ -1,53 +1,6 @@
-"""
-cupy (CUDA source) block templates behind make_depressions/
-make_depression_solver: the i64 atomic_min helper, copy_field, both basin
-labelling variants, saddlesort, both carve variants, jump reroute, and the
-depression counter - on the new builder/frozen/bound/routine stack (../core/
-context/builder.py, frozen.py, bound.py, routine.py). Mirrors
-_closure_depressions.py step for step - same routine composition, same
-grid/bitpack occurrence-per-site shape - CUDA text instead of python defs.
+"""CUDA templates for depression handling."""
 
-See _cupy_receivers.py/_cupy_accum.py/_cupy_reconstruct.py for the other
-flow algorithms. Based on ../../flow/flow_reroute_kernels.py; `bitpack`'s pack/
-unpack_value/unpack_index (ops.make_bitpack_group, a FrozenGroup) replace
-legacy's f32_i32_struct module. Every array here (rec, bid, tag,
-basin_saddle, outlet, ...) is n_flat-sized, basin id = pit index + 1, so a
-per-basin array is safely indexed by any node index too - the same double
-duty the legacy kernels rely on.
-
-Unlike the closure backends, cupy has no grid-wide barrier a single
-`__global__` can rely on - every ordering dependency a pass needs is a real,
-separate kernel launch (matching _cupy_accum.py's own closure/cupy split for
-the same reason): `label_basins_walk` (one closure kernel) becomes three
-launches here ("walk_copy"/"walk_halving"/"walk_finalize"),
-`iteration_reroute_carve` (one closure kernel) becomes two
-("iter_build_work"/"iter_jump"), `reroute_jump` (one closure kernel with two
-top-level loops) becomes two ("reset_rerouted"/"jump").
-
-`n_flat` is a required, explicit build-time python int (baked into every
-launch-bounds check, `{n_flat}`, the same idiom _cupy_accum.py's build_atomic
-uses) - this factory takes no pool and reads no Parameter for it. `grid`'s
-own `N_NEIGHBOURS` is read on-device (`$ctx.grid.N_NEIGHBOURS.get(0)$`,
-exactly as _cupy_receivers.py's build_receivers already does), never a
-host-side python int - no build-time n_neighbours argument needed at all.
-
-Every `__global__`/`__device__` symbol is prefixed with this build's own tag
-(a fresh new_uid()) so two make_depressions() calls in one process never
-collide inside a single compiled cupy module - matching _cupy_receivers.py/
-_cupy_accum.py.
-
-A fixed, build-time-constant repeat (propagate_basin_iter's/
-iteration_reroute_carve's `logn+1` rounds) is unrolled as `logn+1` distinct
-routine compose() names for the SAME FrozenKernel - see
-_closure_depressions.py's module docstring for why (no per-round host
-readback, so nothing a SequenceBuilder loop would buy over a flat unroll).
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import HelperBuilder, KernelBuilder
-from ..core.context.routine import RoutineBuilder
-from ..core.pool.base import new_uid
+from ..core import HelperBuilder, KernelBuilder, RoutineBuilder, new_uid
 
 
 def build_atomic_min_ll():
@@ -61,10 +14,9 @@ def build_atomic_min_ll():
     -------
     HelperBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pd{new_uid()}"
-    return HelperBuilder().ingest(
+    return HelperBuilder(
         f"""
 __device__ long long {t}_atomic_min_ll(long long* addr, long long val) {{
     long long old = *addr, assumed;
@@ -76,7 +28,7 @@ __device__ long long {t}_atomic_min_ll(long long* addr, long long val) {{
     return old;
 }}
 """
-    )
+    ).freeze()
 
 
 def build_copy_field(*, n_flat: int):
@@ -92,19 +44,17 @@ def build_copy_field(*, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pd{new_uid()}"
     return (
-        KernelBuilder().wire_data("src").wire_data("dst").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_copy_field(const int* src, int* dst) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     dst[i] = src[i];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
 
@@ -122,19 +72,19 @@ def build_basin_id_init(*, grid, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pbi{new_uid()}"
     return (
-        KernelBuilder().compose("grid", grid).wire_data("bid").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_basin_id_init(int* bid) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     bid[i] = $ctx.grid.can_out(i)$ ? 0 : (i + 1);
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )
 
 
@@ -151,7 +101,7 @@ def build_propagate_basin_iter(*, n_flat: int):
     """
     t = f"pbi{new_uid()}"
     return (
-        KernelBuilder().wire_data("rec_jump").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_propagate_basin_iter(int* rec_jump) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -160,8 +110,7 @@ __global__ void {t}_propagate_basin_iter(int* rec_jump) {{
         rec_jump[i] = rec_jump[rec_jump[i]];
     }}
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
 
@@ -178,15 +127,14 @@ def build_propagate_basin_final(*, n_flat: int):
     """
     t = f"pbf{new_uid()}"
     return (
-        KernelBuilder().wire_data("bid").wire_data("rec_jump").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_propagate_basin_final(int* bid, const int* rec_jump) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     bid[i] = bid[rec_jump[i]];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
 
@@ -209,7 +157,6 @@ def build_basin_labelling_vanilla(*, grid, copy_field, n_flat: int, logn: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     basin_id_init = build_basin_id_init(grid=grid, n_flat=n_flat)
     propagate_basin_iter = build_propagate_basin_iter(n_flat=n_flat)
@@ -222,11 +169,11 @@ def build_basin_labelling_vanilla(*, grid, copy_field, n_flat: int, logn: int):
     }
 
     rb = RoutineBuilder()
-    rb.compose("basin_id_init", basin_id_init)
-    rb.compose("copy_rec_to_recjump", copy_field)
+    rb.step("basin_id_init", basin_id_init)
+    rb.step("copy_rec_to_recjump", copy_field)
     for k in range(logn + 1):
-        rb.compose(f"propagate_iter_{k}", propagate_basin_iter)
-    rb.compose("propagate_basin_final", propagate_basin_final)
+        rb.step(f"propagate_iter_{k}", propagate_basin_iter)
+    rb.step("propagate_basin_final", propagate_basin_final)
 
     return rb, kernels
 
@@ -237,11 +184,10 @@ def build_label_from_route(*, grid, n_flat: int):
     carried-route basin labelling. Data args (bid, basin_route); composes
     `grid` for can_out. See _closure_depressions.py's build_label_from_route.
 
-    Author: B.G (08/2026)
     """
     t = f"lfr{new_uid()}"
     return (
-        KernelBuilder().compose("grid", grid).wire_data("bid").wire_data("basin_route").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_label_from_route(int* bid, const int* basin_route) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -249,8 +195,9 @@ __global__ void {t}_label_from_route(int* bid, const int* basin_route) {{
     int root = basin_route[i];
     bid[i] = $ctx.grid.can_out(root)$ ? 0 : (root + 1);
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )
 
 
@@ -264,7 +211,6 @@ def build_basin_labelling_route(*, grid, n_flat: int, logn: int):
     Data addresses: "contract_K.rec_jump" (all bound to basin_route),
     "label_from_route.bid"/".basin_route".
 
-    Author: B.G (08/2026)
     """
     propagate_basin_iter = build_propagate_basin_iter(n_flat=n_flat)
     label_from_route = build_label_from_route(grid=grid, n_flat=n_flat)
@@ -273,8 +219,8 @@ def build_basin_labelling_route(*, grid, n_flat: int, logn: int):
 
     rb = RoutineBuilder()
     for k in range(logn + 1):
-        rb.compose(f"contract_{k}", propagate_basin_iter)
-    rb.compose("label_from_route", label_from_route)
+        rb.step(f"contract_{k}", propagate_basin_iter)
+    rb.step("label_from_route", label_from_route)
 
     return rb, kernels
 
@@ -285,11 +231,10 @@ def build_merge_basin_route(*, bitpack, n_flat: int):
     (basin id = pit + 1). Data args (outlet, basin_route); composes `bitpack`
     for unpack_index. See _closure_depressions.py's build_merge_basin_route.
 
-    Author: B.G (08/2026)
     """
     t = f"mbr{new_uid()}"
     return (
-        KernelBuilder().compose("bitpack", bitpack).wire_data("outlet").wire_data("basin_route").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_merge_basin_route(const long long* outlet, int* basin_route) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -299,8 +244,9 @@ __global__ void {t}_merge_basin_route(const long long* outlet, int* basin_route)
     int p_rcv = $ctx.bitpack.unpack_index(outlet[i])$;
     basin_route[i - 1] = p_rcv;
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("bitpack", bitpack)
+        .freeze()
     )
 
 
@@ -321,23 +267,21 @@ def build_basin_labelling_optimized(*, grid, n_flat: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     t = f"pbo{new_uid()}"
 
     walk_copy = (
-        KernelBuilder().wire_data("rec").wire_data("rec_jump").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_walk_copy(const int* rec, int* rec_jump) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     rec_jump[i] = rec[i];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     walk_halving = (
-        KernelBuilder().wire_data("rec_jump").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_walk_halving(int* rec_jump) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -348,11 +292,10 @@ __global__ void {t}_walk_halving(int* rec_jump) {{
         guard++;
     }}
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     walk_finalize = (
-        KernelBuilder().compose("grid", grid).wire_data("rec_jump").wire_data("bid").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_walk_finalize(const int* rec_jump, int* bid) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -360,16 +303,17 @@ __global__ void {t}_walk_finalize(const int* rec_jump, int* bid) {{
     int root = rec_jump[i];
     bid[i] = $ctx.grid.can_out(root)$ ? 0 : root + 1;
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )
 
     kernels = {"walk_copy": walk_copy, "walk_halving": walk_halving, "walk_finalize": walk_finalize}
 
     rb = RoutineBuilder()
-    rb.compose("walk_copy", walk_copy)
-    rb.compose("walk_halving", walk_halving)
-    rb.compose("walk_finalize", walk_finalize)
+    rb.step("walk_copy", walk_copy)
+    rb.step("walk_halving", walk_halving)
+    rb.step("walk_finalize", walk_finalize)
 
     return rb, kernels
 
@@ -394,15 +338,12 @@ def build_saddlesort(*, grid, bitpack, n_flat: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     atomic_min_ll = build_atomic_min_ll()
     t = f"pss{new_uid()}"
 
     border_zprime = (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("bid").wire_data("z").wire_data("z_prime").wire_data("is_border")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_border_zprime(const int* bid, const float* z, float* z_prime, unsigned char* is_border) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -426,13 +367,12 @@ __global__ void {t}_border_zprime(const int* bid, const float* z, float* z_prime
         z_prime[i] = fmaxf(z[i], zn);
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )
     init_saddle_outlet = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("basin_saddle").wire_data("outlet").wire_data("basin_saddlenode").wire_data("b_rcv")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_init_saddle_outlet(long long* basin_saddle, long long* outlet, int* basin_saddlenode, int* b_rcv) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -443,13 +383,12 @@ __global__ void {t}_init_saddle_outlet(long long* basin_saddle, long long* outle
     basin_saddlenode[i] = -1;
     b_rcv[i] = 0;
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("bitpack", bitpack)
+        .freeze()
     )
     atomic_min_saddle = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack).compose("atomic_min_ll", atomic_min_ll)
-        .wire_data("bid").wire_data("is_border").wire_data("z_prime").wire_data("basin_saddle")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_atomic_min_saddle(const int* bid, const unsigned char* is_border, const float* z_prime, long long* basin_saddle) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -470,14 +409,12 @@ __global__ void {t}_atomic_min_saddle(const int* bid, const unsigned char* is_bo
         $ctx.atomic_min_ll(&basin_saddle[tbid], res)$;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid).compose("bitpack", bitpack).compose("atomic_min_ll", atomic_min_ll)
+        .freeze()
     )
     find_saddlenode = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("is_border").wire_data("z_prime")
-        .wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_find_saddlenode(const int* bid, const unsigned char* is_border, const float* z_prime,
                                      const long long* basin_saddle, int* basin_saddlenode) {{
@@ -499,14 +436,12 @@ __global__ void {t}_find_saddlenode(const int* bid, const unsigned char* is_bord
         basin_saddlenode[bid[i]] = i;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid).compose("bitpack", bitpack)
+        .freeze()
     )
     atomic_min_outlet = (
-        KernelBuilder().compose("grid", grid).compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .wire_data("z").wire_data("outlet").wire_data("b_rcv")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_atomic_min_outlet(const int* bid, const long long* basin_saddle, const int* basin_saddlenode,
                                        const float* z, long long* outlet, int* b_rcv) {{
@@ -536,14 +471,12 @@ __global__ void {t}_atomic_min_outlet(const int* bid, const long long* basin_sad
         b_rcv[i] = bid[rec_out];
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid).compose("bitpack", bitpack)
+        .freeze()
     )
     set_keep = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("bid").wire_data("b_rcv").wire_data("outlet")
-        .wire_data("basin_saddle").wire_data("basin_saddlenode")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_set_keep(const int* bid, const int* b_rcv, long long* outlet, long long* basin_saddle, int* basin_saddlenode) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -557,8 +490,9 @@ __global__ void {t}_set_keep(const int* bid, const int* b_rcv, long long* outlet
         basin_saddlenode[i] = -1;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("bitpack", bitpack)
+        .freeze()
     )
 
     kernels = {
@@ -571,12 +505,12 @@ __global__ void {t}_set_keep(const int* bid, const int* b_rcv, long long* outlet
     }
 
     rb = RoutineBuilder()
-    rb.compose("border_zprime", border_zprime)
-    rb.compose("init_saddle_outlet", init_saddle_outlet)
-    rb.compose("atomic_min_saddle", atomic_min_saddle)
-    rb.compose("find_saddlenode", find_saddlenode)
-    rb.compose("atomic_min_outlet", atomic_min_outlet)
-    rb.compose("break_cycle", set_keep)
+    rb.step("border_zprime", border_zprime)
+    rb.step("init_saddle_outlet", init_saddle_outlet)
+    rb.step("atomic_min_saddle", atomic_min_saddle)
+    rb.step("find_saddlenode", find_saddlenode)
+    rb.step("atomic_min_outlet", atomic_min_outlet)
+    rb.step("break_cycle", set_keep)
 
     return rb, kernels
 
@@ -602,23 +536,21 @@ def build_reroute_carve_vanilla(*, bitpack, copy_field, n_flat: int, logn: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     t = f"prc{new_uid()}"
 
     init_reset_tag = (
-        KernelBuilder().wire_data("tag").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_init_reset_tag(unsigned char* tag) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     tag[i] = 0;
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     init_scatter_tag = (
-        KernelBuilder().wire_data("tag").wire_data("saddlenode").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_init_scatter_tag(unsigned char* tag, const int* saddlenode) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -627,24 +559,20 @@ __global__ void {t}_init_scatter_tag(unsigned char* tag, const int* saddlenode) 
         tag[saddlenode[i]] = 1;
     }}
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     init_copy_tag_alt = (
-        KernelBuilder().wire_data("tag").wire_data("tag_alt").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_init_copy_tag_alt(const unsigned char* tag, unsigned char* tag_alt) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     tag_alt[i] = tag[i];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     iter_build_work = (
-        KernelBuilder()
-        .wire_data("tag").wire_data("tag_alt").wire_data("rec").wire_data("rec_work").wire_data("bid")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_iter_build_work(const unsigned char* tag, unsigned char* tag_alt, const int* rec,
                                      int* rec_work, const int* bid) {{
@@ -656,13 +584,10 @@ __global__ void {t}_iter_build_work(const unsigned char* tag, unsigned char* tag
     }}
     rec_work[i] = rec[i];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     iter_jump = (
-        KernelBuilder()
-        .wire_data("tag").wire_data("tag_alt").wire_data("rec").wire_data("rec_work").wire_data("bid")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_iter_jump(unsigned char* tag, const unsigned char* tag_alt, int* rec,
                                const int* rec_work, const int* bid) {{
@@ -674,22 +599,20 @@ __global__ void {t}_iter_jump(unsigned char* tag, const unsigned char* tag_alt, 
     }}
     tag[i] = tag_alt[i];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     finalise_reset_rec = (
-        KernelBuilder().wire_data("rec").wire_data("rec_orig").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_finalise_reset_rec(int* rec, const int* rec_orig) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     rec[i] = rec_orig[i];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     finalise_reverse = (
-        KernelBuilder().wire_data("rec").wire_data("rec_orig").wire_data("tag").wire_data("rerouted").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_finalise_reverse(int* rec, const int* rec_orig, const unsigned char* tag, unsigned char* rerouted) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -700,13 +623,10 @@ __global__ void {t}_finalise_reverse(int* rec, const int* rec_orig, const unsign
         rerouted[ro] = 1;
     }}
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     finalise_outlet = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("outlet").wire_data("saddlenode").wire_data("rerouted")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_finalise_outlet(int* rec, const long long* outlet, const int* saddlenode, unsigned char* rerouted) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -718,8 +638,9 @@ __global__ void {t}_finalise_outlet(int* rec, const long long* outlet, const int
         rerouted[saddlenode[i]] = 1;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("bitpack", bitpack)
+        .freeze()
     )
 
     kernels = {
@@ -734,18 +655,18 @@ __global__ void {t}_finalise_outlet(int* rec, const long long* outlet, const int
     }
 
     rb = RoutineBuilder()
-    rb.compose("init_reset_tag", init_reset_tag)
-    rb.compose("init_scatter_tag", init_scatter_tag)
-    rb.compose("init_copy_tag_alt", init_copy_tag_alt)
-    rb.compose("copy_recwork_to_rec", copy_field)
-    rb.compose("copy_recwork_to_recjump", copy_field)
+    rb.step("init_reset_tag", init_reset_tag)
+    rb.step("init_scatter_tag", init_scatter_tag)
+    rb.step("init_copy_tag_alt", init_copy_tag_alt)
+    rb.step("copy_recwork_to_rec", copy_field)
+    rb.step("copy_recwork_to_recjump", copy_field)
     for k in range(logn + 1):
-        rb.compose(f"iter_build_work_{k}", iter_build_work)
-        rb.compose(f"iter_jump_{k}", iter_jump)
-    rb.compose("finalise_reset_rec", finalise_reset_rec)
-    rb.compose("finalise_reverse", finalise_reverse)
-    rb.compose("finalise_outlet", finalise_outlet)
-    rb.compose("copy_rec_to_recwork", copy_field)
+        rb.step(f"iter_build_work_{k}", iter_build_work)
+        rb.step(f"iter_jump_{k}", iter_jump)
+    rb.step("finalise_reset_rec", finalise_reset_rec)
+    rb.step("finalise_reverse", finalise_reverse)
+    rb.step("finalise_outlet", finalise_outlet)
+    rb.step("copy_rec_to_recwork", copy_field)
 
     return rb, kernels
 
@@ -766,13 +687,10 @@ def build_reroute_carve_optimized(*, bitpack, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pco{new_uid()}"
     return (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("basin_saddlenode").wire_data("outlet")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_carve_basins_serial(int* rec, const int* basin_saddlenode, const long long* outlet) {{
     int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -793,8 +711,9 @@ __global__ void {t}_carve_basins_serial(int* rec, const int* basin_saddlenode, c
         guard++;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("bitpack", bitpack)
+        .freeze()
     )
 
 
@@ -805,9 +724,8 @@ def build_reroute_jump(*, bitpack, n_flat: int):
     `rerouted[i - 1]` from thread `i`, a cell a *different* thread's reset
     zeroed. The closure backends keep this as one two-loop kernel.
 
-    The write is deliberately `rec[i - 1]`, not `rec[i]` - see
-    _closure_depressions.py's build_reroute_jump docstring for why; ported
-    exactly.
+    Basin IDs are one-based, so the write targets ``rec[i - 1]`` rather than
+    ``rec[i]``.
 
     Parameters
     ----------
@@ -818,25 +736,21 @@ def build_reroute_jump(*, bitpack, n_flat: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     t = f"prj{new_uid()}"
 
     reset_rerouted = (
-        KernelBuilder().wire_data("rerouted").ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_reset_rerouted(unsigned char* rerouted) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     rerouted[i] = 0;
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     jump = (
-        KernelBuilder().compose("bitpack", bitpack)
-        .wire_data("rec").wire_data("outlet").wire_data("rerouted")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_jump(int* rec, const long long* outlet, unsigned char* rerouted) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -848,15 +762,16 @@ __global__ void {t}_jump(int* rec, const long long* outlet, unsigned char* rerou
         rerouted[i - 1] = 1;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("bitpack", bitpack)
+        .freeze()
     )
 
     kernels = {"reset_rerouted": reset_rerouted, "jump": jump}
 
     rb = RoutineBuilder()
-    rb.compose("reset_rerouted", reset_rerouted)
-    rb.compose("jump", jump)
+    rb.step("reset_rerouted", reset_rerouted)
+    rb.step("jump", jump)
 
     return rb, kernels
 
@@ -864,7 +779,7 @@ __global__ void {t}_jump(int* rec, const long long* outlet, unsigned char* rerou
 def build_depression_counter(*, grid, n_flat: int):
     """
     depression_counter KernelBuilder, data args (rec, ndep) - `ndep` is
-    `ndep_p.get().data`, passed positionally same as `rec` (a Parameter
+    `ndep_p.handle().array`, passed positionally same as `rec` (a Parameter
     reached only through `$...$` get() spans is registered read-only in the
     constant block, so atomicAdd into it needs the raw pointer as an
     ordinary DATA argument instead). The caller must reset `ndep_p` to 0
@@ -879,13 +794,10 @@ def build_depression_counter(*, grid, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pdc{new_uid()}"
     return (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("rec").wire_data("ndep")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_depression_counter(const int* rec, int* ndep) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -894,6 +806,7 @@ __global__ void {t}_depression_counter(const int* rec, int* ndep) {{
         atomicAdd(ndep, 1);
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )

@@ -1,14 +1,6 @@
-"""
-cupy (CUDA source) friction-law block behind make_graphflood's compute_qo
-step - mirrors _closure_friction.py block for block (see its module
-docstring for `law`'s dispatch role).
+"""CUDA GraphFlood friction templates."""
 
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import HelperBuilder
-from ..core.context.frozen import FrozenHelper
-from ..core.pool.base import new_uid
+from ..core import FrozenHelper, HelperBuilder, new_uid
 
 _MIN_SLOPE = 1.0e-5
 _MIN_MANNING = 1.0e-9
@@ -16,11 +8,7 @@ _MIN_MANNING = 1.0e-9
 
 def _qo_manning(grid, t: str) -> FrozenHelper:
     return (
-        HelperBuilder()
-        .wire_param("MANNING")
-        .wire_param("EXPO")
-        .compose("grid", grid)
-        .ingest(
+        HelperBuilder(
             f"""
 __device__ float {t}_qo_manning(float h, float slope) {{
     float hh = h > 0.0f ? h : 0.0f;
@@ -31,7 +19,7 @@ __device__ float {t}_qo_manning(float h, float slope) {{
     return hh * u * $ctx.grid.DX.get(0)$;
 }}
 """
-        )
+        ).compose("grid", grid).freeze()
     )
 
 
@@ -58,7 +46,6 @@ def build_friction_qo(law: str, grid) -> FrozenHelper:
     ValueError
         If `law` is not a recognised friction law.
 
-    Author: B.G (08/2026)
     """
     if law not in _LAWS:
         raise ValueError(f"build_friction_qo: law must be one of {sorted(_LAWS)}, got {law!r}")

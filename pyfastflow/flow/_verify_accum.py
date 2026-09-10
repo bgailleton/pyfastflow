@@ -1,55 +1,4 @@
-"""
-Standalone, re-runnable verification of make_accumulation, on the new
-builder/frozen/bound(/sequence) stack (../core/context/builder.py,
-frozen.py, bound.py, sequence.py), at a grid scale large enough for the
-three accumulation methods to visibly disagree at f32 precision.
-
-Why scale matters: with `source` = 1.0 per cell, `q` is literally drainage
-area in cells, so the outlet accumulates a value close to n_flat. f32 has an
-ulp of ~1.2e-4 at 1e3 and ~6e-2 at 1e6 - three methods that sum the same
-values in genuinely different orders (a strict serial walk for "atomic", a
-donor-tree rake-and-compress for "rake_compress", a power-of-two pointer-
-jump doubling for "pointer_jump_push") are expected to disagree by a
-noticeable fraction of an ulp at that magnitude, not agree to 1e-6 the way a
-small, lightly-loaded grid would make them appear to. This script exists
-because an earlier, smaller-scale (1920-node, random small `source`) run of
-this same check produced deviations that looked deceptively clean (~1e-6
-absolute against a maximum accumulated value of order 10) and was not
-actually stressing the three summation orders apart.
-
-What it checks, per backend (taichi/quadrants/cupy) and per method (atomic/
-rake_compress/pointer_jump_push): builds a 1024x1024 D8 grid (`make_grid_group`
-+ `make_grid_parameters`, ../grid/__init__.py), runs make_receivers(mode=
-"steepest") to get a real receiver graph, computes a numpy topological
-reference (summing along the same receiver chains, in float64), runs each
-accumulation method, and reports max absolute deviation, max relative
-deviation, AND the max accumulated value itself, so the deviations can be
-read against the scale they occur on. It also reports the receiver graph's
-maximum chain depth (root distance), computed by iterative path compression,
-so it's clear whether the graph exercised was actually deep or just wide.
-
-There is no fuse-check pass here: rake_compress/pointer_jump_push are
-`SequenceBuilder`s (sequence.py), where each composed step is always a
-separate real kernel launch - there is no per-Sequence fusion mechanism to
-diff against.
-
-`source` mode coverage (const/scalar/field) is exercised on taichi only, to
-prove mode-agnosticism without tripling the run time; quadrants/cupy run
-field mode only. A further "noninteger" pass, run on every backend, repeats
-the same receiver graph with a non-integer per-cell source: source=1.0
-makes every intermediate partial sum an exact integer, and f32 represents
-every integer up to 2**24 exactly regardless of summation order, so the
-const/scalar/field passes are expected to show exactly 0.0 deviation
-whenever the accumulated total stays under 2**24 - agreement there is a
-mathematical fact about IEEE-754, not evidence the three summation orders
-are equivalent in general. The noninteger pass is the actual check of that.
-
-Run (either form works - a plain path self-bootstraps its package context):
-    python -m pyfastflow.flow._verify_accum taichi
-    python pyfastflow/flow/_verify_accum.py taichi
-
-Author: B.G (07/2026)
-"""
+"""Numerical verification for flow accumulation."""
 
 import sys
 from collections import deque
@@ -74,7 +23,6 @@ def numpy_topological_accum(rec: np.ndarray, source: np.ndarray) -> np.ndarray:
     defines, in float64, via one indegree-driven topological pass (leaves
     first). O(n).
 
-    Author: B.G (07/2026)
     """
     n = rec.shape[0]
     q = source.astype(np.float64).copy()
@@ -105,7 +53,6 @@ def make_smooth_terrain(nx: int, ny: int, seed: int) -> np.ndarray:
     local minima are basin-scale rather than cell-scale and receiver chains
     actually run the width of a basin.
 
-    Author: B.G (07/2026)
     """
     rng = np.random.default_rng(seed)
     raw = rng.random((ny, nx))
@@ -121,7 +68,6 @@ def max_chain_depth(rec: np.ndarray) -> int:
     no python recursion (which would blow the recursion limit on a
     million-node chain).
 
-    Author: B.G (07/2026)
     """
     n = rec.shape[0]
     depth = np.full(n, -1, dtype=np.int64)
@@ -155,30 +101,29 @@ def _bind_pointer_jump_push(bound, closure, *, source_p, q, work, work2, q_work,
     `strict=True` on each call catches a typo'd leaf name against that
     step's own actual address set.
 
-    Author: B.G (08/2026)
     """
     bound.bind(("q_init", "SOURCE"), source_p)
-    bound.bind(("q_init", "q"), q.data)
-    bound.bind(("copy_rec_to_work", "rec"), rec.data)
-    bound.bind(("copy_rec_to_work", "work"), work.data)
+    bound.bind(("q_init", "q"), q)
+    bound.bind(("copy_rec_to_work", "rec"), rec)
+    bound.bind(("copy_rec_to_work", "work"), work)
     if closure:
         bound.bind_leaf(
-            {"rec_curr": work.data, "rec_next": work2.data, "q_curr": q.data, "q_next": q_work.data},
+            {"rec_curr": work, "rec_next": work2, "q_curr": q, "q_next": q_work},
             prefix=("step_a",), strict=True,
         )
         bound.bind_leaf(
-            {"rec_curr": work2.data, "rec_next": work.data, "q_curr": q_work.data, "q_next": q.data},
+            {"rec_curr": work2, "rec_next": work, "q_curr": q_work, "q_next": q},
             prefix=("step_b",), strict=True,
         )
     else:
-        bound.bind_leaf({"q_curr": q.data, "q_next": q_work.data}, prefix=("step_a_copy",), strict=True)
+        bound.bind_leaf({"q_curr": q, "q_next": q_work}, prefix=("step_a_copy",), strict=True)
         bound.bind_leaf(
-            {"rec_curr": work.data, "rec_next": work2.data, "q_curr": q.data, "q_next": q_work.data},
+            {"rec_curr": work, "rec_next": work2, "q_curr": q, "q_next": q_work},
             prefix=("step_a_core",), strict=True,
         )
-        bound.bind_leaf({"q_curr": q_work.data, "q_next": q.data}, prefix=("step_b_copy",), strict=True)
+        bound.bind_leaf({"q_curr": q_work, "q_next": q}, prefix=("step_b_copy",), strict=True)
         bound.bind_leaf(
-            {"rec_curr": work2.data, "rec_next": work.data, "q_curr": q_work.data, "q_next": q.data},
+            {"rec_curr": work2, "rec_next": work, "q_curr": q_work, "q_next": q},
             prefix=("step_b_core",), strict=True,
         )
 
@@ -193,19 +138,12 @@ def run(backend: str):
     elif backend != "cupy":
         raise ValueError(f"unknown backend {backend!r}")
 
-    from ..core.context.backends import backend_classes
+    from ..core import Backend
     from ..grid import make_grid_group, make_grid_parameters
     from . import make_accumulation, make_receivers
 
-    _bk = backend_classes(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
+    _bk = Backend.from_name(backend); ParamCls, dtypes = _bk.ParameterCls, _bk.dtypes
     i32, f32 = dtypes["i32"], dtypes["f32"]
-
-    if backend == "taichi":
-        from ..core.pool.taichi_pool import TaichiPool as PoolCls
-    elif backend == "quadrants":
-        from ..core.pool.quadrants_pool import QuadrantsPool as PoolCls
-    else:
-        from ..core.pool.cupy_pool import CupyPool as PoolCls
 
     closure = backend in ("taichi", "quadrants")
     nx = ny = SIDE
@@ -218,9 +156,9 @@ def run(backend: str):
     def download(handle):
         return handle.to_numpy()
 
-    pool = PoolCls()
-    grid_group = make_grid_group(backend, topology="D8", boundary="normal", outlet="edge")
-    grid_params = make_grid_parameters(backend, pool, nx, ny, DX, topology="D8", outlet="edge")
+    pool = _bk.pool()
+    grid_group = make_grid_group(_bk, topology="D8", boundary="normal", outlet="edge")
+    grid_params = make_grid_parameters(_bk, pool, nx, ny, DX, topology="D8", outlet="edge")
 
     z_np = make_smooth_terrain(nx, ny, SEED)
     source_np = np.ones(n, dtype=np.float32)
@@ -229,14 +167,13 @@ def run(backend: str):
     rec = pool.get_data(i32, (n,))
     upload(z, z_np)
 
-    launch = {"grid": ((n + 255) // 256,), "block": (256,)} if not closure else {}
 
-    recv = make_receivers(backend, grid_group, topology="D8", mode="steepest")
+    recv = make_receivers(_bk, grid_group, topology="D8", mode="steepest")
     recv_bound = recv["receivers"].build()
     recv_bound.bind_leaf(grid_params)
-    recv_bound.bind("z", z.data)
-    recv_bound.bind("rec", rec.data)
-    recv_kernel = recv_bound.compile(backend, **launch)
+    recv_bound.bind("z", z)
+    recv_bound.bind("rec", rec)
+    recv_kernel = recv_bound.compile(_bk)
     recv_kernel()
 
     rec_np = download(rec).astype(np.int64)
@@ -246,30 +183,39 @@ def run(backend: str):
 
     def make_source_param(mode, array):
         if mode in ("const", "scalar"):
-            return ParamCls("SRC", dtype=f32, mode=mode, value=1.0, pool=pool)
-        return ParamCls("SRC", dtype=f32, mode="field", value=array, pool=pool, n_flat=n)
+            return ParamCls("SRC", dtype="f32", mode=mode, value=1.0, pool=pool)
+        return ParamCls("SRC", dtype="f32", mode="field", value=array, pool=pool, shape=(n,))
+
+    def _run_once(bnd):
+        # compile, run once, then release both the compiled object and the bound
+        # object's hold on their Parameters so the
+        # source/iteration Parameters can be destroyed afterwards.
+        c = bnd.compile(_bk)
+        c()
+        c.close()
+        bnd.close()
 
     def run_atomic(source_p):
-        accum = make_accumulation(backend, grid_group, method="atomic", n_flat=n)
+        accum = make_accumulation(_bk, grid_group, method="atomic", n_flat=n)
         q = pool.get_data(f32, (n,))
         if "q_init" in accum:
             qb = accum["q_init"].build()
             qb.bind("SOURCE", source_p)
-            qb.bind("q", q.data)
-            qb.compile(backend, **launch)()
+            qb.bind("q", q)
+            _run_once(qb)
         ab = accum["accum"].build()
         ab.bind("SOURCE", source_p)
-        ab.bind("rec", rec.data)
-        ab.bind("q", q.data)
-        ab.compile(backend, **launch)()
+        ab.bind("rec", rec)
+        ab.bind("q", q)
+        _run_once(ab)
         got = download(q).astype(np.float64)
         pool.release_data(q)
         return got
 
     def run_rake_compress(source_p):
-        iteration_p = ParamCls("ITER", dtype=i32, mode="scalar", value=0, pool=pool)
-        accum = make_accumulation(backend, grid_group, method="rake_compress", n_flat=n, n_neighbours=nn)
-        bound = accum.sequence.freeze().build()
+        iteration_p = ParamCls("ITER", dtype="i32", mode="scalar", value=0, pool=pool)
+        accum = make_accumulation(_bk, grid_group, method="rake_compress", n_flat=n, n_neighbours=nn)
+        bound = accum["sequence"].freeze().build()
 
         q = pool.get_data(f32, (n,))
         donors = pool.get_data(i32, (n * nn,))
@@ -280,13 +226,13 @@ def run(backend: str):
         src = pool.get_data(i32, (n,))
 
         bound.bind_leaf({
-            "rec": rec.data, "q": q.data, "donors": donors.data, "ndonors": ndonors.data,
-            "donors_alt": donors_alt.data, "ndonors_alt": ndonors_alt.data,
-            "q_alt": q_alt.data, "src": src.data,
+            "rec": rec, "q": q, "donors": donors, "ndonors": ndonors,
+            "donors_alt": donors_alt, "ndonors_alt": ndonors_alt,
+            "q_alt": q_alt, "src": src,
         })
         bound.bind_leaf({"SOURCE": source_p, "ITER": iteration_p})
 
-        bound.compile(backend, **launch)()
+        _run_once(bound)
 
         got = download(q).astype(np.float64)
 
@@ -296,8 +242,8 @@ def run(backend: str):
         return got
 
     def run_pointer_jump_push(source_p):
-        accum = make_accumulation(backend, grid_group, method="pointer_jump_push", n_flat=n)
-        bound = accum.sequence.freeze().build()
+        accum = make_accumulation(_bk, grid_group, method="pointer_jump_push", n_flat=n)
+        bound = accum["sequence"].freeze().build()
 
         q = pool.get_data(f32, (n,))
         work = pool.get_data(i32, (n,))
@@ -308,7 +254,7 @@ def run(backend: str):
             bound, closure, source_p=source_p, q=q, work=work, work2=work2, q_work=q_work, rec=rec,
         )
 
-        bound.compile(backend, **launch)()
+        _run_once(bound)
 
         got = download(q).astype(np.float64)
         for h in (q, work, work2, q_work):
@@ -359,6 +305,8 @@ def run(backend: str):
     rows.append(("noninteger", "atomic_vs_pjp", float(np.max(np.abs(got_atomic - got_pjp))),
                  float(np.max(np.abs(got_atomic - got_pjp) / np.maximum(np.abs(got_atomic), 1.0))), None))
 
+    recv_kernel.close()
+    recv_bound.close()
     pool.release_data(z)
     pool.release_data(rec)
     return n, depth, max_q_ref, rows
@@ -367,10 +315,9 @@ def run(backend: str):
 # ---------------------------------------------------------------------------
 # persistent_mfd (cupy-only) - method="persistent_mfd" of make_accumulation.
 #
-# There is no MFD topology anywhere in this codebase yet (CLAUDE.md: "MFD is
-# entirely unported") - persistent_mfd only accumulates over a caller-built
-# receiver mask/weight pair, so this section fabricates one directly in
-# numpy rather than deriving it from a receivers factory. `_MFD_D8_DR`/
+# ``persistent_mfd`` accumulates over a supplied receiver mask and weight
+# pair. This standalone verifier constructs a small topology directly in
+# NumPy. ``_MFD_D8_DR`` and
 # `_MFD_D8_DC` are the exact same 8 offsets, same k order, as grid's own
 # `_delta` table (_cupy_blocks.py's build_helpers) - the persistent kernel
 # calls `ctx.grid.neighbour_raw(u, k)` on the real grid to resolve a set mask
@@ -406,7 +353,6 @@ def make_synthetic_mfd_topology(nx: int, ny: int, seed: int):
     Returns (dirs: u8[n], mfd_w: f32[n*8], indegree: i64[n]) - all plain
     numpy, in this grid's own flat/row-major indexing.
 
-    Author: B.G (08/2026)
     """
     n = nx * ny
     rng = np.random.default_rng(seed)
@@ -449,7 +395,6 @@ def numpy_kahn_mfd_accum(dirs: np.ndarray, mfd_w: np.ndarray, indegree: np.ndarr
     i.e. indegree==0 first) over the fabricated (dirs, mfd_w, indegree)
     graph, in float64. O(n * 8).
 
-    Author: B.G (08/2026)
     """
     n = dirs.shape[0]
     accum = source.astype(np.float64).copy()
@@ -491,15 +436,14 @@ def run_mfd_cupy():
     against numpy_kahn_mfd_accum. Returns (n_flat, max_abs, max_rel, max_got,
     max_ref, n_stuck).
 
-    Author: B.G (08/2026)
     """
-    from ..core.context.cupy_backend import CupyParameter
-    from ..core.pool.cupy_pool import CupyPool
+    from ..core import Backend
     from ..grid import make_grid_group, make_grid_parameters
     from . import make_accumulation
-    from ._cupy_mfd_accum import init_frontier_mfd, persistent_grid_block
+    from ._cupy_mfd_accum import init_frontier_mfd
 
-    Param, Pool, i32, f32 = CupyParameter, CupyPool, np.int32, np.float32
+    be = Backend.from_name("cupy")
+    Param, Pool, i32, f32 = be.ParameterCls, be.pool, be.dtypes["i32"], be.dtypes["f32"]
     nx = ny = MFD_SIDE
     n = nx * ny
     _MFD_NX[0] = nx
@@ -509,9 +453,9 @@ def run_mfd_cupy():
     ref = numpy_kahn_mfd_accum(dirs_np, mfd_w_np, indegree_np, source_np)
 
     pool = Pool()
-    grid_group = make_grid_group("cupy", topology="D8", boundary="normal", outlet="edge")
-    grid_params = make_grid_parameters("cupy", pool, nx, ny, DX, topology="D8", outlet="edge")
-    source_p = Param("SRC", dtype=f32, mode="const", value=1.0, pool=pool)
+    grid_group = make_grid_group(be, topology="D8", boundary="normal", outlet="edge")
+    grid_params = make_grid_parameters(be, pool, nx, ny, DX, topology="D8", outlet="edge")
+    source_p = Param("SRC", dtype="f32", mode="const", value=1.0, pool=pool)
 
     dirs = pool.get_data(np.dtype(np.uint8), (n,))
     mfd_w = pool.get_data(f32, (n * 8,))
@@ -522,41 +466,44 @@ def run_mfd_cupy():
     count = pool.get_data(i32, (2,))
     barrier = pool.get_data(np.dtype(np.uint32), (1,))
 
-    dirs.data.set(dirs_np)
-    mfd_w.data.set(mfd_w_np)
-    indegree.data.set(indegree_np.astype(np.int32))
+    dirs.array.set(dirs_np)
+    mfd_w.array.set(mfd_w_np)
+    indegree.array.set(indegree_np.astype(np.int32))
 
-    accum = make_accumulation("cupy", grid_group, method="persistent_mfd", n_flat=n, n_neighbours=8)
-
-    launch_grid, launch_block = ((n + 255) // 256,), (256,)
+    accum = make_accumulation(be, grid_group, method="persistent_mfd", n_flat=n, n_neighbours=8)
 
     q_init_bound = accum["q_init"].build()
     q_init_bound.bind("SOURCE", source_p)
-    q_init_bound.bind("accum", accum_h.data)
+    q_init_bound.bind("accum", accum_h)
     q_init_bound.bind_leaf(grid_params, prefix=("grid",))
-    q_init_bound.compile("cupy", grid=launch_grid, block=launch_block)()
+    _qc = q_init_bound.compile(be)
+    _qc()
+    _qc.close()
+    q_init_bound.close()
 
-    n0 = init_frontier_mfd(indegree.data, frontier0.data)
-    count.data[0] = n0
-    count.data[1] = 0
-    barrier.data[0] = 0
+    n0 = init_frontier_mfd(indegree.array, frontier0.array)
+    count.array[0] = n0
+    count.array[1] = 0
+    barrier.array[0] = 0
 
     accum_bound = accum["accum"].build()
     accum_bound.bind_leaf(grid_params, prefix=("grid",))
-    accum_bound.bind("frontier0", frontier0.data)
-    accum_bound.bind("frontier1", frontier1.data)
-    accum_bound.bind("count", count.data)
-    accum_bound.bind("barrier", barrier.data)
-    accum_bound.bind("dirs", dirs.data)
-    accum_bound.bind("mfd_w", mfd_w.data)
-    accum_bound.bind("accum", accum_h.data)
-    accum_bound.bind("indegree", indegree.data)
+    accum_bound.bind("frontier0", frontier0)
+    accum_bound.bind("frontier1", frontier1)
+    accum_bound.bind("count", count)
+    accum_bound.bind("barrier", barrier)
+    accum_bound.bind("dirs", dirs)
+    accum_bound.bind("mfd_w", mfd_w)
+    accum_bound.bind("accum", accum_h)
+    accum_bound.bind("indegree", indegree)
 
-    p_grid, p_block = persistent_grid_block()
-    accum_bound.compile("cupy", grid=p_grid, block=p_block)()
+    _ac = accum_bound.compile(be)
+    _ac()
+    _ac.close()
+    accum_bound.close()
 
-    got = accum_h.data.get().astype(np.float64)
-    n_stuck = int((indegree.data.get() > 0).sum())
+    got = accum_h.array.get().astype(np.float64)
+    n_stuck = int((indegree.array.get() > 0).sum())
 
     max_abs = float(np.max(np.abs(got - ref)))
     max_rel = float(np.max(np.abs(got - ref) / np.maximum(np.abs(ref), 1.0)))

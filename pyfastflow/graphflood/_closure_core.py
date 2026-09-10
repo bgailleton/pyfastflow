@@ -1,41 +1,9 @@
-"""
-Taichi/Quadrants (closure) block templates behind make_graphflood's per-step
-core - compute_qo/apply_divergence (the friction-law update, ported from
-../../flood/flood_graphflood_kernels.py's graphflood_core_kernel, split into
-two kernels rather than one two-pass kernel - see the module docstring of
-../graphflood/__init__.py for why the split alone already avoids the race
-the legacy two-pass dh buffer existed for) plus make_surface/h_from_filled
-(the small dedicated kernels the "fill on the z+h surface" local-minima
-option needs to move an elevation-space fill result back into h).
+"""Python GraphFlood core templates for Taichi and Quadrants."""
 
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import KernelBuilder
-from ..core.context.frozen import FrozenKernel
-from ..core.context.slot import SlotKind
+from ..core import FrozenKernel, KernelBuilder
 from ..flow._closure_receivers import build_distance_slope_helpers
 from ..flow._closure_shared import _tensor_annotation
 from ._closure_friction import build_friction_qo
-
-
-def _find_param_paths(frozen, leaf_name: str, prefix: tuple = ()) -> list:
-    """Every relative dotted path under `frozen`'s composed subtree whose PARAM slot is named `leaf_name`."""
-    paths = []
-    if leaf_name in frozen.slots.names(SlotKind.PARAM):
-        paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
-        paths.extend(_find_param_paths(child, leaf_name, prefix + (name,)))
-    return paths
-
-
-def _share_leaf(builder, canonical: str) -> None:
-    """Declare every occurrence of PARAM `canonical` in `builder`'s composed subtree shared with its own top-level slot."""
-    paths = []
-    for name, child in builder.composed.items():
-        paths.extend(_find_param_paths(child, canonical, (name,)))
-    if paths:
-        builder.share(canonical, *paths)
 
 
 _OUTLET_BEHAVIORS = frozenset({"fixed_h", "free", "fixed_s"})
@@ -102,7 +70,6 @@ def build_compute_qo(
     ValueError
         If `outlet_behavior` is not recognised.
 
-    Author: B.G (08/2026)
     """
     if outlet_behavior not in _OUTLET_BEHAVIORS:
         raise ValueError(
@@ -162,17 +129,10 @@ def build_compute_qo(
                             best_s = s
                 Qo[i] = ctx.friction(h[i], best_s)
 
-    kb = KernelBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        kb.wire_param(name)
-    if outlet_behavior == "fixed_s":
-        kb.wire_param("BOUNDARY_SLOPE")
+    kb = KernelBuilder(compute_qo_tmpl)
     kb.compose("grid", grid).compose("slope", slope).compose("friction", friction)
-    kb.wire_data("z").wire_data("h").wire_data("Qo")
-    for name in grid_param_names:
-        _share_leaf(kb, name)
-    return kb.ingest(compute_qo_tmpl)
+    kb.share_identical("grid")
+    return kb.freeze()
 
 
 def build_apply_divergence(*, backend: str, backend_mod, grid, outlet_behavior: str = "fixed_h") -> FrozenKernel:
@@ -180,7 +140,7 @@ def build_apply_divergence(*, backend: str, backend_mod, grid, outlet_behavior: 
     apply_divergence FrozenKernel, data args (h, Q_in, Qo): interior nodes
     always get h[i] = max(0, h[i] + DT*(Q_in[i] - Qo[i])/DX**2), clamped to
     GF_MIN_INCREMENT away from zero whenever Q_in/Qo disagree in sign of net
-    change (ported from graphflood_core_kernel's dh clamp). What happens on
+    change. What happens on
     a can_out node is picked, at build time, by `outlet_behavior` - see
     build_compute_qo's own docstring for the matching Qo-side half of each
     behavior:
@@ -216,7 +176,6 @@ def build_apply_divergence(*, backend: str, backend_mod, grid, outlet_behavior: 
     ValueError
         If `outlet_behavior` is not recognised.
 
-    Author: B.G (08/2026)
     """
     if outlet_behavior not in _OUTLET_BEHAVIORS:
         raise ValueError(
@@ -260,18 +219,9 @@ def build_apply_divergence(*, backend: str, backend_mod, grid, outlet_behavior: 
                 hh = h[i] + d
                 h[i] = hh if hh > 0.0 else 0.0
 
-    kb = KernelBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        kb.wire_param(name)
-    kb.wire_param("DT").wire_param("GF_MIN_INCREMENT")
-    if outlet_behavior == "fixed_h":
-        kb.wire_param("BOUNDARY_H")
+    kb = KernelBuilder(apply_divergence_tmpl)
     kb.compose("grid", grid)
-    kb.wire_data("h").wire_data("Q_in").wire_data("Qo")
-    for name in grid_param_names:
-        _share_leaf(kb, name)
-    return kb.ingest(apply_divergence_tmpl)
+    return kb.freeze()
 
 
 def build_make_surface(*, backend: str, backend_mod) -> FrozenKernel:
@@ -291,7 +241,6 @@ def build_make_surface(*, backend: str, backend_mod) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -299,7 +248,7 @@ def build_make_surface(*, backend: str, backend_mod) -> FrozenKernel:
         for i in z:
             surface[i] = z[i] + h[i]
 
-    return KernelBuilder().wire_data("z").wire_data("h").wire_data("surface").ingest(make_surface_tmpl)
+    return KernelBuilder(make_surface_tmpl).freeze()
 
 
 def build_h_from_filled(*, backend: str, backend_mod) -> FrozenKernel:
@@ -319,7 +268,6 @@ def build_h_from_filled(*, backend: str, backend_mod) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -328,7 +276,7 @@ def build_h_from_filled(*, backend: str, backend_mod) -> FrozenKernel:
             hh = filled[i] - z[i]
             h[i] = hh if hh > 0.0 else 0.0
 
-    return KernelBuilder().wire_data("z").wire_data("filled").wire_data("h").ingest(h_from_filled_tmpl)
+    return KernelBuilder(h_from_filled_tmpl).freeze()
 
 
 def build_reset_reconstruct_scratch(*, backend: str, backend_mod) -> dict:
@@ -357,7 +305,6 @@ def build_reset_reconstruct_scratch(*, backend: str, backend_mod) -> dict:
     dict
         {"counters": FrozenKernel, "queued_gen": FrozenKernel}.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -370,8 +317,8 @@ def build_reset_reconstruct_scratch(*, backend: str, backend_mod) -> dict:
             queued_gen[i] = -1
 
     return {
-        "counters": KernelBuilder().wire_data("counters").ingest(reset_counters_tmpl),
-        "queued_gen": KernelBuilder().wire_data("queued_gen").ingest(reset_queued_gen_tmpl),
+        "counters": KernelBuilder(reset_counters_tmpl).freeze(),
+        "queued_gen": KernelBuilder(reset_queued_gen_tmpl).freeze(),
     }
 
 
@@ -380,8 +327,7 @@ def build_distribute(
 ) -> FrozenKernel:
     """
     distribute FrozenKernel, data args (z, h, Q_in, Q_next) - the
-    graphflood_unstable per-step local redistribution, ported from
-    ../../flood/flood_graphflood_kernels.py's distribute_flow_local_kernel:
+    graphflood_unstable per-step local redistribution:
     no receiver graph, no accumulation, no depression handling - every node
     walks only its own immediate neighbours, splitting its own current
     inflow Q_in[i] across every downslope (h-aware) neighbour in proportion
@@ -392,7 +338,7 @@ def build_distribute(
     current (z, h)) keeps its own inflow in place (Q_next[i] += qi, so it
     is retried next step once h has risen) and nudges h[i] up by
     GF_MIN_INCREMENT - the same "dig it out gradually over many steps"
-    heuristic legacy used, replacing an exact depression solve with
+    heuristic, replacing an exact depression solve with
     something the outer step loop converges towards instead. This is what
     makes the method "unstable": no acyclic-graph guarantee, no filled
     surface, just local redistribution repeated every timestep.
@@ -416,7 +362,6 @@ def build_distribute(
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     slope = build_distance_slope_helpers(
@@ -451,16 +396,10 @@ def build_distribute(
                     if j != -1 and slopes[k] > 0.0:
                         ctx.bk.atomic_add(Q_next[j], qi * slopes[k] / sum_s)
 
-    kb = KernelBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        kb.wire_param(name)
-    kb.wire_param("SOURCE").wire_param("GF_MIN_INCREMENT")
+    kb = KernelBuilder(distribute_tmpl)
     kb.compose("grid", grid).compose("slope", slope)
-    kb.wire_data("z").wire_data("h").wire_data("Q_in").wire_data("Q_next")
-    for name in grid_param_names:
-        _share_leaf(kb, name)
-    return kb.ingest(distribute_tmpl)
+    kb.share_identical("grid")
+    return kb.freeze()
 
 
 def build_copy_q(*, backend: str, backend_mod) -> FrozenKernel:
@@ -481,7 +420,6 @@ def build_copy_q(*, backend: str, backend_mod) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -489,4 +427,4 @@ def build_copy_q(*, backend: str, backend_mod) -> FrozenKernel:
         for i in Q_next:
             Q_in[i] = Q_next[i]
 
-    return KernelBuilder().wire_data("Q_next").wire_data("Q_in").ingest(copy_q_tmpl)
+    return KernelBuilder(copy_q_tmpl).freeze()

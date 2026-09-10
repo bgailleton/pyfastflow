@@ -1,37 +1,4 @@
-"""
-cupy compile phase: turns a BoundKernel into a CompiledKernel by assembling
-CUDA source text and building a `cp.RawModule` from it.
-
-Reuses cupy_backend.py's pure text/emission utilities - dtype/literal
-formatting, the `pf_params` constant-block and `__restrict__`-local
-machinery, `__global__`/`__device__` function-name extraction - which know
-only about Parameter objects and plain text (see cupy_backend.py's module
-docstring for the block's exact shape). The span *resolver* lives here: a
-`$ctx.path$` span resolves against one BoundKernel's address tree (bound.py)
-- `$ctx.z.get(i)$`, `$ctx.grid.neighbour(i, k)$`, the same grammar
-contract.py derives.
-
-Composed helpers become `__device__` functions
-------------------------------------------------
-Every composed FrozenHelper reachable from `bound` gets its own `__device__`
-function, unconditionally (mirroring compile_closure.py's reasoning: a
-`ctx.grid.neighbour(...)` span needs `neighbour` emitted regardless of
-whether `grid` itself is ever called bare). Its C name is derived from its
-own full address (`pf_flux_grad_grid_neighbour` for address `flux.grad.grid.
-neighbour`), which is unique within one compile by construction (build()
-never mints two different composed subtrees under the same address) - no
-uid-based mangling needed, unlike `_cupy_blocks.py`'s per-make_grid-call
-`new_uid()` tag, since there is exactly one BoundKernel's address tree per
-compile here, not several independently-built grids sharing one module.
-`_emit_device_func` renames the template's own declared function name to
-that address-derived name in the emitted text (the template author's own
-choice of name in source is never seen by the caller); a helper already
-emitted once in this compile (reachable from two different addresses -
-uncommon here since addresses are already unique, but the memo guards a
-cycle regardless) is reused, not re-emitted.
-
-Author: B.G (08/2026)
-"""
+"""Compile CUDA-source kernels through CuPy."""
 
 import re
 from typing import Any
@@ -54,9 +21,12 @@ from .cupy_backend import (
     _upload_param_block,
 )
 from .ctx import CTX_PARAM_NAME
-from .frozen import FrozenGroup, _Frozen
+from .frozen import FrozenGroup, Node
 from .parameter import Parameter
 from .slot import SlotKind
+
+# Default CuPy threads per block when a kernel does not set ``block``.
+DEFAULT_BLOCK = 256
 
 _SPAN_RE = re.compile(r"\$(.*?)\$", re.S)
 _CALL_RE = re.compile(r"([\w.]+)\s*(?:\((.*)\))?\s*$", re.S)
@@ -64,16 +34,7 @@ _CONSTANT_DECL_RE = re.compile(r"__constant__\s+[\w:\*&]+\s+(\w+)\s*(?:\[[^\]]*\
 
 
 class _EmitState:
-    """
-    Everything one compile() accumulates across every `__device__`/
-    `__global__` body it parses - the pointer registry and its
-    first-encounter local-index map (handed straight to cupy_backend.py's
-    `_param_block_source`/`_upload_param_block`/`_insert_locals`), and the
-    dependency-first, dedup-by-name map of every composed helper's own
-    `__device__` source.
-
-    Author: B.G (08/2026)
-    """
+    """State accumulated while emitting one CuPy compilation unit."""
 
     def __init__(self):
         self.registry: dict[int, dict] = {}
@@ -94,7 +55,7 @@ def _register_ptr(state: _EmitState, param: Parameter, write: bool, local_ptrs: 
     uid = param.uid
     entry = state.registry.get(uid)
     if entry is None:
-        entry = {"ctype": _ctype(param.dtype), "write": False, "array": param.get().data}
+        entry = {"ctype": _ctype(param.backend_dtype), "write": False, "array": param.handle().array}
         state.registry[uid] = entry
     if write:
         entry["write"] = True
@@ -111,7 +72,7 @@ def _register_ptr(state: _EmitState, param: Parameter, write: bool, local_ptrs: 
 def _expand_param(state: _EmitState, param: Parameter, method: str, call_args: list[str], local_ptrs: dict) -> str:
     if method == "get":
         if param.mode == "const":
-            return _cuda_literal(param.get())
+            return _cuda_literal(param.value)
         argname = _register_ptr(state, param, write=False, local_ptrs=local_ptrs)
         if param.mode == "scalar":
             return f"{argname}[0]"
@@ -136,7 +97,7 @@ def _resolve_chain(
     call_args: list[str],
     argstr: "str | None",
     prefix: Address,
-    frozen: _Frozen,
+    frozen: Node,
     bound: BoundKernel,
     local_ptrs: dict,
 ) -> str:
@@ -145,7 +106,6 @@ def _resolve_chain(
     `bound`'s address tree - see the module docstring for the two shapes
     (PARAM leaf, composed HELPER call/descent).
 
-    Author: B.G (08/2026)
     """
     if not segs:
         raise CompileError("span '$ctx$' names nothing")
@@ -161,8 +121,8 @@ def _resolve_chain(
         param = bound.value_at(addr)
         return _expand_param(state, param, segs[1], call_args, local_ptrs)
 
-    if root in frozen.slots.names(SlotKind.HELPER) or root in frozen.composed:
-        child_frozen = frozen.composed[root]
+    if root in frozen.slots.names(SlotKind.HELPER) or root in frozen.children:
+        child_frozen = frozen.children[root]
         if len(segs) == 1:
             if isinstance(child_frozen, FrozenGroup):
                 raise CompileError(
@@ -176,7 +136,7 @@ def _resolve_chain(
     raise CompileError(f"{format_address(addr)!r}: no such PARAM/HELPER slot on 'ctx.{'.'.join(segs)}'")
 
 
-def _make_repl(state: "_EmitState", prefix: Address, frozen: "_Frozen", bound: BoundKernel, local_ptrs: dict):
+def _make_repl(state: "_EmitState", prefix: Address, frozen: Node, bound: BoundKernel, local_ptrs: dict):
     def _repl(match: re.Match) -> str:
         cm = _CALL_RE.match(match.group(1).strip())
         if cm is None:
@@ -192,37 +152,19 @@ def _make_repl(state: "_EmitState", prefix: Address, frozen: "_Frozen", bound: B
 
 
 def _mangle_constants(body: str, c_name: str) -> str:
-    """
-    Rename every `__constant__` symbol `body` itself declares to a name
-    derived from `c_name` (this device block's own address-mangled function
-    name), consistently everywhere it appears in `body` - the declaration
-    and every use, both already in `body` since this runs on one block's own
-    text. Extends `_ensure_emitted`'s existing per-address renaming (until
-    this, applied only to the block's own `__device__` function name) to any
-    *other* top-level symbol a template happens to declare - a `__constant__`
-    lookup table backing a runtime-data if-ladder, in practice (grid's own
-    `delta` block, _cupy_blocks.py) - which needs exactly the same
-    per-address uniqueness the function name already gets: a FrozenHelper
-    composed at two different addresses in one compile is emitted twice
-    (`_ensure_emitted` memoizes by the mangled *function* name, which already
-    differs per address), and without this, both emissions would declare the
-    identical `__constant__` symbol name and collide at NVRTC compile time.
-
-    Author: B.G (08/2026)
-    """
+    """Give constants declared by a helper an address-specific name."""
     for orig in dict.fromkeys(_CONSTANT_DECL_RE.findall(body)):
         body = re.sub(rf"\b{re.escape(orig)}\b", f"{c_name}_{orig}", body)
     return body
 
 
-def _ensure_emitted(state: _EmitState, addr: Address, frozen: _Frozen, bound: BoundKernel) -> str:
+def _ensure_emitted(state: _EmitState, addr: Address, frozen: Node, bound: BoundKernel) -> str:
     """
     This composed helper's own `__device__` C function name, emitting its
     source into `state.device_srcs` on first reach (memoized by name, so a
     cycle - or the same address reached twice, which cannot currently happen
     since addresses are already unique per compile - never re-emits).
 
-    Author: B.G (08/2026)
     """
     name = _c_name(addr)
     if name in state.device_srcs:
@@ -241,30 +183,23 @@ def _ensure_emitted(state: _EmitState, addr: Address, frozen: _Frozen, bound: Bo
     return name
 
 
-def _check_cupy_data_signature(template: str, declared_names: set[str]) -> list[str]:
+def _check_cupy_data_signature(template: str) -> list[str]:
     """
-    The `__global__` kernel's own C parameter names, in source order,
-    validated to be exactly `declared_names` as a set. cupy's text-source
-    counterpart to compile_shared.py's check_data_signature (there is no
-    python `inspect.signature` to read here).
+    The `__global__` kernel's own C parameter names, in source order. The
+    SOURCE of a cupy kernel's DATA slot set (derived at freeze, builder.py),
+    cupy's text-source counterpart to compile_shared.py's check_data_signature
+    (there is no python `inspect.signature` to read here).
 
-    Author: B.G (08/2026)
     """
     match = _KERNEL_SIG_RE.search(template)
     if match is None:
         raise CompileError("template has no recoverable __global__ signature")
     argstr = match.group(2).strip()
     parts = _split_args(argstr) if argstr else []
-    names = [p.strip().rsplit(None, 1)[-1].lstrip("*") for p in parts]
-    if set(names) != declared_names:
-        raise CompileError(
-            f"__global__ signature declares data argument(s) {names}, wire_data() declared "
-            f"{sorted(declared_names)} - these must match exactly"
-        )
-    return names
+    return [p.strip().rsplit(None, 1)[-1].lstrip("*") for p in parts]
 
 
-def compile_kernel(bound: BoundKernel, *, grid: Any = None, block: Any = None) -> CompiledKernel:
+def compile_kernel(bound: BoundKernel) -> CompiledKernel:
     """
     Compile `bound` to a cupy `cp.RawModule`. Checks unmet slots and legal
     PARAM accessors first (compile_shared.py), then emits the kernel's own
@@ -275,23 +210,17 @@ def compile_kernel(bound: BoundKernel, *, grid: Any = None, block: Any = None) -
     Parameters
     ----------
     bound : BoundKernel
-    grid, block : optional
-        Launch-dimension defaults for the returned CompiledKernel (see
-        CompiledKernel.__call__) - cupy has no auto-ranging equivalent to
-        Taichi/Quadrants, so a caller must supply them here or at call time.
-
     Returns
     -------
     CompiledKernel
 
-    Author: B.G (08/2026)
     """
     check_unmet(bound)
     check_legal_accessors(bound)
 
     frozen = bound.frozen
     template = frozen.template
-    data_names = _check_cupy_data_signature(template, frozen.slots.names(SlotKind.DATA))
+    data_names = _check_cupy_data_signature(template)
 
     state = _EmitState()
     kernel_name = _extract_name(_KERNEL_NAME_RE, template, "__global__")
@@ -317,4 +246,28 @@ def compile_kernel(bound: BoundKernel, *, grid: Any = None, block: Any = None) -
         return raw(g, b, tuple(args))
 
     data_order = [(name,) for name in data_names]
-    return CompiledKernel(bound, launch, data_order, needs_launch_dims=True, grid=grid, block=block)
+
+    # The launch domain names one of this kernel's DATA args (the
+    # launch extent is that buffer's length at launch time) or is a fixed int;
+    # block is threads/block (default DEFAULT_BLOCK).
+    domain = frozen.domain
+    domain_addr = None
+    extent = None
+    kernel_block = frozen.block or DEFAULT_BLOCK
+    if isinstance(domain, str):
+        if domain not in data_names:
+            raise CompileError(
+                f"domain={domain!r} is not one of this kernel's DATA arguments {data_names}"
+            )
+        domain_addr = (domain,)
+    elif isinstance(domain, int):
+        extent = domain
+    else:
+        raise CompileError(
+            "cupy kernels require KernelBuilder(..., domain=<a DATA arg or int>)"
+        )
+    return CompiledKernel(
+        bound, launch, data_order,
+        block=kernel_block,
+        domain_addr=domain_addr, extent=extent,
+    )

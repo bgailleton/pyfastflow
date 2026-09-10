@@ -1,35 +1,6 @@
-"""
-Taichi/Quadrants (closure) block templates behind make_noise_group, on the
-new builder/frozen/bound stack (core/context/builder.py, frozen.py,
-bound.py).
+"""Python white- and Perlin-noise templates for Taichi and Quadrants."""
 
-Same private/public split as grid/_closure_blocks.py: every block is a plain
-python def, first parameter `ctx`, PICKED by build_group() from `kind`
-("white"|"perlin") rather than branched on inside one function body.
-
-The arithmetic is a port of pyfastflow/noise/white_noise.py and
-perlin_noise.py, kept value-for-value identical: same integer hash constants,
-same fade/lerp/grad, same octave accumulation, and the same argument order
-(column first, row second) into the hash.
-
-Row/column read `ctx.NX.get(0)` directly - noise wires its own `NX`/`NY`
-PARAM slots rather than composing the grid FrozenGroup (see __init__.py's
-own module docstring for why: nothing here needs a grid HELPER, only its
-plain nx/ny values), uniform across whatever mode they end up bound to.
-
-`ctx.bk` (core/context/bk.py) supplies everything a plain python builtin
-does not: `ctx.bk.u32(...)` casts (the hash's own arithmetic, including
-`0x846CA68B` - too large for Taichi's default i32 literal typing without an
-explicit cast) and `ctx.bk.floor` (Perlin's lattice-cell math). Perlin's own
-int<->float conversions use the plain `int()`/`float()` builtins instead -
-confirmed to trace the same way grid's `abs`/`min` already do - not
-`ctx.bk`; see bk.py's own module docstring for why those two stayed out of
-its surface.
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import HelperBuilder
+from ..core import freeze_helper as _helper
 
 # ---------------------------------------------------------------------------
 # shared: flat index -> row / column
@@ -163,50 +134,17 @@ def _at_perlin_tmpl(ctx, i):
     return out
 
 
-def _helper(template, *, params=(), helpers=None):
-    """
-    One private/public HelperBuilder: wire_param() every name in `params`,
-    compose() every (name, frozen) pair in `helpers` under that same name,
-    then ingest(template). Mirrors grid/_closure_blocks.py's own `_helper`.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for p in params:
-        b.wire_param(p)
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
-
-
 def build_hash_u32():
-    """
-    The standalone hash_u32(x) FrozenHelper - no Parameters, so it can be
-    built with nothing else in hand. Used both by build_group below and by
-    __init__.py's own make_hash_u32().
-
-    Author: B.G (08/2026)
-    """
+    """Build the standalone integer hash helper."""
     return _helper(_hash_u32_tmpl)
 
 
 def build_group(group, *, kind):
-    """
-    Compose every private block and public helper for a closure backend
-    (Taichi or Quadrants) onto `group` (a GroupBuilder), picking the white or
-    Perlin chain from `kind`.
-
-    Returns nothing - every public helper (`at`, `hash_u32`, and
-    `white_unit`/`perlin_at`) is compose()d onto `group` itself, under its
-    own public name, by this call.
-
-    Author: B.G (08/2026)
-    """
+    """Compose the selected closure-backend noise helpers onto ``group``."""
     row = _helper(_row_tmpl, params=["NX"])
     col = _helper(_col_tmpl, params=["NX"])
     hash_u32 = build_hash_u32()
-    group.wire_helper("hash_u32").compose("hash_u32", hash_u32)
+    group.compose("hash_u32", hash_u32)
 
     if kind == "white":
         white_unit = _helper(
@@ -215,8 +153,8 @@ def build_group(group, *, kind):
             helpers={"_ROW": row, "_COL": col, "_HASH": hash_u32},
         )
         at = _helper(_at_white_tmpl, params=["AMPLITUDE"], helpers={"_WHITEUNIT": white_unit})
-        group.wire_helper("at").compose("at", at)
-        group.wire_helper("white_unit").compose("white_unit", white_unit)
+        group.compose("at", at)
+        group.compose("white_unit", white_unit)
         return
 
     fade = _helper(_fade_tmpl)
@@ -230,5 +168,5 @@ def build_group(group, *, kind):
         params=["NX", "NY", "FX", "FY", "OCTAVES", "PERSISTENCE", "AMPLITUDE"],
         helpers={"_ROW": row, "_COL": col, "_PERLINAT": perlin_at},
     )
-    group.wire_helper("at").compose("at", at)
-    group.wire_helper("perlin_at").compose("perlin_at", perlin_at)
+    group.compose("at", at)
+    group.compose("perlin_at", perlin_at)

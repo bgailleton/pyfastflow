@@ -1,62 +1,4 @@
-"""
-cupy implementation of Parameter, plus the text/emission utilities
-compile_cupy.py reuses to compile a BoundKernel to a `cp.RawModule`.
-
-A template is CUDA source text rather than a python function, since
-cp.RawModule compiles source and there is no function whose globals could be
-patched. Bound objects are written into that source as `$...$` spans holding a
-dotted path, which keeps the in-kernel spelling the same as on the other
-backends:
-
-    $p.get(i)$        read parameter p at flat index i
-    $p.set_node(i,v)$ write parameter p at flat index i
-    $grid.nx.get(i)$  reach a bag member
-    $helper(a, b)$    call a bound device helper
-
-Compiling substitutes each span according to the parameter's mode - a CUDA
-literal for const, or a read/write through a pointer for scalar and field.
-That pointer never travels as a kernel argument: every scalar/field Parameter
-a compilation unit reaches - the kernel's own bindings plus, recursively, its
-helpers' - is collected once, deduplicated by uid, into a module-scope
-constant block:
-
-    struct pf_params_t { float* p_<idx>; const float* p_<idx2>; ... };
-    __constant__ pf_params_t pf_params;
-
-`<idx>` is a per-compilation-unit local index (0, 1, 2, ...) assigned the
-first time this compile's traversal reaches a given Parameter, not its
-process-global `uid` - `uid` still identifies the Parameter for dedup, cycle
-detection and the ptr registry's keys, but never appears in emitted text, so
-an unrelated allocation upstream that shifts every uid does not change this
-source at all. See compile_cupy.py's `_register_ptr`.
-
-uploaded once per compile() via cp.RawModule.get_global. A member is `const`
-when nothing in the unit writes that parameter, `T*` otherwise. Every
-`__global__` and `__device__` function in the module sees the same block, so a
-helper reaches a bound Parameter exactly the way its caller does - there is no
-argument to thread through and no call site to rewrite. At the top of each
-function body one local is declared per pointer that function's own spans
-reference:
-
-    const float* __restrict__ p_<idx> = pf_params.p_<idx>;
-
-read (or written, dropping `const`) through for the rest of that body. This is
-what keeps a function's own accesses provably non-aliasing to the compiler,
-the same guarantee a `__restrict__` kernel argument used to carry - reading
-`pf_params.p_<idx>` directly, span by span, would lose it.
-
-A const parameter can also be used bare, outside any span, in which case it
-arrives as a `#define`. Only names the source actually mentions are defined,
-which keeps macros for common identifiers - N, DIM, EPS, min - from silently
-rewriting unrelated code in the translation unit.
-
-One `cp.RawModule` is built per compilation unit: the constant block, every
-`__device__` helper the unit reaches (each emitted once, however many call
-sites share it), and the unit's `__global__` kernel. See compile_cupy.py's
-module docstring for how a unit's source is assembled and cached.
-
-Author: B.G (07/2026)
-"""
+"""CuPy Parameters and CUDA-source emission helpers."""
 
 import re
 from typing import Any
@@ -87,7 +29,6 @@ def _ctype(dtype) -> str:
     """
     CUDA scalar type name for a (numpy) dtype.
 
-    Author: B.G (07/2026)
     """
     return _CTYPE[np.dtype(dtype)]
 
@@ -96,7 +37,6 @@ def _cuda_literal(value) -> str:
     """
     Format a resolved const value as a CUDA literal.
 
-    Author: B.G (07/2026)
     """
     if isinstance(value, bool):
         return "1" if value else "0"
@@ -112,7 +52,6 @@ def _extract_name(pattern: re.Pattern, template: str, kind: str) -> str:
     The `__global__`/`__device__` function's own name, read out of the source
     text - that is the entry point cp.RawModule.get_function is looked up by.
 
-    Author: B.G (07/2026)
     """
     match = pattern.search(template)
     if not match:
@@ -124,7 +63,6 @@ def _split_args(argstr: str) -> list[str]:
     """
     Split a call-argument string on top-level commas (respecting nesting).
 
-    Author: B.G (07/2026)
     """
     parts, depth, cur = [], 0, ""
     for ch in argstr:
@@ -155,7 +93,6 @@ def _param_argname(param: Parameter, local_index: dict[int, int]) -> str:
     what keeps generated source byte-stable across runs regardless of
     allocation order upstream.
 
-    Author: B.G (07/2026)
     """
     return f"p_{local_index[param.uid]}"
 
@@ -177,7 +114,6 @@ def _insert_locals(body: str, local_ptrs: dict[int, dict], local_index: dict[int
     block's text does not depend on the process-global uid values a run
     happened to assign upstream.
 
-    Author: B.G (07/2026)
     """
     if not local_ptrs:
         return body
@@ -197,7 +133,6 @@ def _argname_for(local_idx: int) -> str:
     `local_idx` in this compile - see _param_argname, which this must stay in
     lockstep with.
 
-    Author: B.G (07/2026)
     """
     return f"p_{local_idx}"
 
@@ -216,7 +151,6 @@ def _param_block_source(registry: dict[int, dict], local_index: dict[int, int]) 
     unrelated allocation upstream that shifts every uid does not change this
     text. _upload_param_block writes pointers in the same order.
 
-    Author: B.G (07/2026)
     """
     if not registry:
         return ""
@@ -236,7 +170,6 @@ def _upload_param_block(module: "cp.RawModule", registry: dict[int, dict], local
     Runs once per compile(), synchronously - safe as an ordinary host->device
     copy anywhere a kernel launch would be.
 
-    Author: B.G (07/2026)
     """
     if not registry:
         return
@@ -257,36 +190,46 @@ class CupyParameter(Parameter):
     no device_view() either: a parameter reaches device code when the span
     parser substitutes it into the source.
 
-    Author: B.G (07/2026)
     """
 
-    def __init__(self, name: str, *, dtype, mode: str, value, pool, n_flat: int | None = None):
+    _BACKEND_NAME = "cupy"
+
+    def __init__(self, name: str, *, dtype: str, mode: str, value, pool, shape: tuple = ()):
         """
         Declare and initialize one parameter. "scalar"/"field" modes allocate
         pooled storage immediately via `pool`; "const" stays a plain python
-        value, read bare in a template body as a #define.
+        value, expanded to its CUDA literal wherever a `$...$` span reads it.
 
         Parameters
         ----------
         name : str
-        dtype : numpy dtype
+        dtype : str
+            Short dtype tag (``"f32"``, ``"i32"``, ...).
         mode : str
             "const", "scalar" or "field".
         value : Any
             Initial value.
         pool : DataPool
             Backing store for "scalar"/"field" modes.
-        n_flat : int, optional
-            Required for "field" mode - the number of nodes.
-
-        Author: B.G (07/2026)
+        shape : tuple, optional
+            Field storage shape. Field parameters require a non-empty shape.
         """
         if mode not in MODES:
             raise ValueError(f"{name}: mode must be one of {sorted(MODES)}, got {mode!r}")
+        if not isinstance(dtype, str):
+            raise TypeError(f"{name}: dtype must be a short tag string, got {type(dtype).__name__}")
+        try:
+            backend_dtype = {"i32": np.dtype(np.int32), "i64": np.dtype(np.int64),
+                             "f32": np.dtype(np.float32), "u8": np.dtype(np.uint8),
+                             "u32": np.dtype(np.uint32)}[dtype]
+        except KeyError as exc:
+            raise ValueError(f"{name}: unknown dtype tag {dtype!r}") from exc
+        shape = tuple(shape)
 
         super().__init__()
         self.name = name
         self.dtype = dtype
+        self.backend_dtype = backend_dtype
         self.mode = mode
         self._pool = pool
         self._const_value: Any = None
@@ -295,17 +238,16 @@ class CupyParameter(Parameter):
         if mode == "scalar":
             self._handle = pool.get_data(dtype, ())
         elif mode == "field":
-            if n_flat is None:
-                raise ValueError(f"{name}: field mode requires n_flat")
-            self._handle = pool.get_data(dtype, (n_flat,))
+            if not shape:
+                raise ValueError(f"{name}: field mode requires shape=(...)")
+            self._handle = pool.get_data(dtype, shape)
 
         self._store(value)
 
-    def get(self):
+    def _host_value(self):
         """
         The python value for const mode, the backing CupyDataHandle otherwise.
 
-        Author: B.G (07/2026)
         """
         return self._const_value if self.mode == "const" else self._handle
 
@@ -314,12 +256,12 @@ class CupyParameter(Parameter):
         Overwrite the whole value: a device write for scalar, a full
         host->device copy for field. const is immutable - see Parameter.set.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
-            raise ValueError(
+            from .errors import ParameterError
+            raise ParameterError(
                 f"{self.name}: const parameter is immutable; build a new Parameter and "
-                f"replace() it into the bag, then recompile"
+                f"bind a new Parameter and recompile"
             )
         self._store(value)
 
@@ -329,54 +271,52 @@ class CupyParameter(Parameter):
         one path that may set a const, used by __init__ to place its initial
         value.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
-            self._const_value = np.dtype(self.dtype).type(value).item()
+            self._const_value = self.backend_dtype.type(value).item()
         elif self.mode == "scalar":
-            self._handle.data[...] = value
+            self._handle.array[...] = value
         else:  # field
-            arr = np.asarray(value, dtype=self.dtype).reshape(-1)
+            arr = np.asarray(value, dtype=self.backend_dtype).reshape(-1)
             self._handle.from_numpy(arr)
 
     def set_node(self, node, value) -> None:
         """
         Host-side single-cell write. scalar ignores node; const is read-only.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
-            raise ValueError(f"{self.name}: const parameter is read-only")
+            from .errors import ParameterError
+            raise ParameterError(f"{self.name}: const parameter is read-only")
         if self.mode == "scalar":
-            self._handle.data[...] = value
+            self._handle.array[...] = value
         else:  # field
-            self._handle.data[node] = value
+            self._handle.array[node] = value
 
     def read(self):
         """
         Host-side scalar read - see Parameter.read for the contract. dtypes
         are numpy dtypes already here, so no translation is needed.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
             return self._const_value
         if self.mode == "field":
-            raise ValueError(
+            from .errors import ParameterError
+            raise ParameterError(
                 f"{self.name}: read() is for scalar/const only; a field is not meant to be "
                 f"read back to the host as a whole"
             )
-        return np.dtype(self.dtype).type(self._handle.data.get()).item()
+        return self.backend_dtype.type(self._handle.array.get()).item()
 
     def destroy(self) -> None:
         """
         Return any pooled storage to the pool. const mode owns none, so this
-        is a no-op there.
+        is a no-op there. Raises ParameterError while a bound object still holds
+        this Parameter (see Parameter._assert_unbound).
 
-        Author: B.G (07/2026)
         """
+        self._assert_unbound("destroy")
         if self._handle is not None:
             self._pool.release_data(self._handle)
             self._handle = None
-
-

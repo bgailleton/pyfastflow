@@ -1,59 +1,10 @@
-"""
-cupy (CUDA source) block templates behind make_noise_group.
+"""CUDA white- and Perlin-noise templates for CuPy."""
 
-Mirrors _closure_blocks.py block for block - same private/public split, same
-`kind` selector deciding which chain `at(i)` is wired to - written as CUDA
-text instead of python defs. Every span reaching a PARAM is spelled
-`$ctx.NAME.get(...)$` in full, exactly like grid/_cupy_blocks.py; every span
-reaching a composed HELPER is spelled `$ctx.name(args)$`.
-
-No `ctx.bk` here - cupy stays plain C, as grid/_cupy_blocks.py's own module
-docstring already establishes for this backend: `floorf`, `(int)`/`(float)`
-casts and a plain `0x846CA68Bu` literal are the native spelling, and the
-python/cupy template surfaces are already a different grammar by design (see
-core/context/bk.py's own module docstring for why `ctx.bk` is deliberately
-excluded from cupy).
-
-Every device function name is prefixed with this noise group's own tag (a
-fresh new_uid()), so two make_noise_group() calls in one process never
-collide inside a single compiled cupy module even if both are bound into the
-same kernel - see grid/_cupy_blocks.py.
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import HelperBuilder
-from ..core.context.contract import extract_cupy_contract
-from ..core.pool.base import new_uid
-
-
-def _helper(template, *, helpers=None):
-    """
-    One private/public HelperBuilder: PARAM slots are declared implicitly by
-    every `$ctx.NAME.get(...)$`/`$ctx.NAME.set_node(...)$` span contract.py
-    derives from `template`'s own text - mirrors grid/_cupy_blocks.py's own
-    `_helper`.
-
-    Author: B.G (08/2026)
-    """
-    b = HelperBuilder()
-    for chain in extract_cupy_contract(template).chains:
-        if (not helpers) or chain[0] not in helpers:
-            b.wire_param(chain[0])
-    if helpers:
-        for name, frozen in helpers.items():
-            b.compose(name, frozen)
-    return b.ingest(template)
+from ..core import freeze_helper as _helper, new_uid
 
 
 def build_hash_u32():
-    """
-    The standalone hash_u32(x) FrozenHelper - no bound Parameters, so it can
-    be built with nothing else in hand. See _closure_blocks.py's
-    build_hash_u32 for why this exists.
-
-    Author: B.G (08/2026)
-    """
+    """Build the standalone integer hash helper."""
     t = f"pn{new_uid()}"
     return _helper(
         f"""
@@ -71,22 +22,13 @@ __device__ unsigned int {t}_hash_u32(unsigned int x) {{
 
 
 def build_group(group, *, kind):
-    """
-    Compose every private block and public helper for the cupy backend onto
-    `group` (a GroupBuilder), picking the white or Perlin chain from `kind`.
-
-    Returns nothing - every public helper (`at`, `hash_u32`, and
-    `white_unit`/`perlin_at`) is compose()d onto `group` itself, under its
-    own public name, by this call.
-
-    Author: B.G (08/2026)
-    """
+    """Compose the selected CuPy noise helpers onto ``group``."""
     t = f"pn{new_uid()}"
 
     row = _helper(f"__device__ int {t}_row(int i) {{ return i / $ctx.NX.get(0)$; }}")
     col = _helper(f"__device__ int {t}_col(int i) {{ return i % $ctx.NX.get(0)$; }}")
     hash_u32 = build_hash_u32()
-    group.wire_helper("hash_u32").compose("hash_u32", hash_u32)
+    group.compose("hash_u32", hash_u32)
 
     if kind == "white":
         white_unit = _helper(
@@ -112,8 +54,8 @@ __device__ float {t}_at(int i) {{
 """,
             helpers={"white_unit": white_unit},
         )
-        group.wire_helper("at").compose("at", at)
-        group.wire_helper("white_unit").compose("white_unit", white_unit)
+        group.compose("at", at)
+        group.compose("white_unit", white_unit)
         return
 
     fade = _helper(f"__device__ float {t}_fade(float t) {{ return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); }}")
@@ -205,5 +147,5 @@ __device__ float {t}_at(int i) {{
 """,
         helpers={"row": row, "col": col, "perlin_at": perlin_at},
     )
-    group.wire_helper("at").compose("at", at)
-    group.wire_helper("perlin_at").compose("perlin_at", perlin_at)
+    group.compose("at", at)
+    group.compose("perlin_at", perlin_at)

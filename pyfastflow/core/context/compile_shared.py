@@ -1,61 +1,4 @@
-"""
-Backend-agnostic pieces of the compile phase: the two checks every
-backend's `BoundKernel.compile()` runs before emitting anything, and
-CompiledKernel - the callable every backend's compile() returns.
-
-Legal PARAM accessors
-----------------------
-The build and bind phases deliberately leave "does this chain spell a real
-accessor" unenforced - only the emission layer knows what a PARAM slot may
-legally do in device code, per slot.py's own module docstring. Settled here,
-identically on every
-backend (Taichi, Quadrants, cupy all resolve a PARAM chain the same way, so
-there is one answer, not three): a PARAM-rooted chain must be exactly
-`(name, "get")` or `(name, "set_node")` - two segments, nothing else. A bare
-`ctx.z` with no accessor, a chain with a third segment, or any other method
-name is illegal. `set_node` is further illegal against a slot currently bound
-to a const-mode Parameter (const is baked into generated code as a literal;
-there is nothing to write). check_legal_accessors walks the whole composition
-tree - the kernel's own contract plus every composed FrozenHelper's own,
-recursively - and raises naming the exact address and the exact chain, before
-any backend touches source generation. This is a compile()-time convenience
-on top of what the backends already refuse structurally on their own -
-Taichi/Quadrants' ClosureParamDeviceView simply has no `set_node` attribute
-for a const Parameter (AttributeError at trace time), cupy's span expander
-only implements `get`/`set_node` - check_legal_accessors exists so the error
-arrives before any tracing/emission starts, naming the address plainly
-instead of surfacing as a trace-time AttributeError or a malformed-span
-ValueError deep in generated text.
-
-Unmet slots
------------
-check_unmet raises listing every address BoundKernel.unmet() reports,
-formatted exactly as inspect() would show them - pasteable, not paraphrased.
-
-Data argument signature
-------------------------
-check_data_signature/the cupy-specific text equivalent in compile_cupy.py
-validate that a template's own declared data arguments (its python
-parameters after `ctx`, or a cupy `__global__`'s own C parameter names)
-match this kernel's wire_data() slots by name exactly - this is what lets
-CompiledKernel resolve DATA addresses to launch-argument *positions* without
-either side (template author, wire_data caller) tracking an implicit order
-by hand.
-
-CompiledKernel
---------------
-What every backend's compile() returns: an immutable snapshot around a
-resolved data-address order and a `launch` callable. Data is bound by
-address, never passed positionally at call time - `swap(addr, buf)` re-points
-one DATA address's current buffer with a plain dict write, no re-trace, no
-recompile, exactly the ping-pong cost `z`/`z_prime` needs. `__call__` reads
-whatever `swap()` currently holds for every address, in the fixed order
-data_order was built with, and passes those positionally to `launch` - this
-positional pass-through is what makes swap() free: the *compiled* kernel
-itself is never touched, only a python dict entry.
-
-Author: B.G (08/2026)
-"""
+"""Shared checks and wrappers for compiled kernels."""
 
 import ast
 import inspect
@@ -63,8 +6,9 @@ import textwrap
 from functools import lru_cache
 from typing import Any, Callable
 
-from .bound import Address, BindError, _Bound, format_address, parse_address
+from .bound import Address, BindError, _Bound, _refcount, _same_dtype, format_address, parse_address
 from .ctx import CTX_PARAM_NAME
+from .errors import PyFastFlowError
 from .slot import SlotKind
 
 _LEGAL_PARAM_ACCESSORS = ("get", "set_node")
@@ -105,7 +49,6 @@ def capture_template_meta(template) -> tuple[str | None, ast.AST | None]:
         None for CUDA source text, or a python def with no recoverable/
         parseable source.
 
-    Author: B.G (07/2026)
     """
     if isinstance(template, str):
         return template, None
@@ -120,15 +63,14 @@ def capture_template_meta(template) -> tuple[str | None, ast.AST | None]:
     return source, tree
 
 
-class CompileError(Exception):
+class CompileError(PyFastFlowError):
     """
     Raised by the compile phase: unmet slots, an illegal PARAM accessor,
-    a data-argument signature mismatch between a template and its wire_data()
+    a data-argument signature mismatch between a template and its data()
     slots, or any other structural problem caught before/while emitting
     device code. Every case names the exact address (and, for accessors, the
     exact chain) involved.
 
-    Author: B.G (08/2026)
     """
 
 
@@ -138,12 +80,13 @@ def check_unmet(bound: _Bound) -> None:
     print it, if `bound` has any. Every concrete `compile()` calls this
     first.
 
-    Author: B.G (08/2026)
     """
     missing = bound.unmet()
     if missing:
         listing = ", ".join(format_address(a) for a in missing)
-        raise CompileError(f"compile: unbound slot(s): {listing}")
+        raise CompileError(
+            f"compile: unbound slot(s): {listing}\n\nfull binding contract:\n{bound.inspect()}"
+        )
 
 
 def check_legal_accessors(bound: _Bound) -> None:
@@ -153,7 +96,6 @@ def check_legal_accessors(bound: _Bound) -> None:
     illegal PARAM accessor found - see the module docstring for the exact
     legal set and why it is identical on every backend.
 
-    Author: B.G (08/2026)
     """
     _walk_accessors((), bound.frozen, bound)
 
@@ -179,22 +121,21 @@ def _walk_accessors(prefix: Address, frozen, bound: _Bound) -> None:
                     f"to write)"
                 )
 
-    for name in frozen.slots.names(SlotKind.HELPER) | set(frozen.composed):
-        _walk_accessors(prefix + (name,), frozen.composed[name], bound)
+    for name in frozen.slots.names(SlotKind.HELPER) | set(frozen.children):
+        _walk_accessors(prefix + (name,), frozen.children[name], bound)
 
 
-def check_data_signature(template, declared_names: set[str]) -> list[str]:
+def check_data_signature(template) -> list[str]:
     """
     A python template's own data-argument names, in declaration order (its
-    parameters after `ctx`), validated to be exactly `declared_names` as a
-    set - not a subset, not a superset. The order returned is what
-    CompiledKernel resolves DATA addresses against for positional launch.
+    parameters after `ctx`). This is the SOURCE of a kernel/host-block's DATA
+    slot set (derived at freeze, builder.py), not a check against a declared
+    one; the order returned is what CompiledKernel resolves DATA addresses
+    against for positional launch.
 
     Parameters
     ----------
     template : callable
-    declared_names : set[str]
-        The kernel's own wire_data() slot names.
 
     Returns
     -------
@@ -204,31 +145,18 @@ def check_data_signature(template, declared_names: set[str]) -> list[str]:
     Raises
     ------
     CompileError
-        `template`'s first parameter is not `ctx`, or its data-argument
-        names do not match `declared_names` exactly.
+        `template`'s first parameter is not `ctx`.
 
-    Author: B.G (08/2026)
     """
     label = getattr(template, "__name__", "?")
     params = list(inspect.signature(template).parameters)
     if not params or params[0] != CTX_PARAM_NAME:
         raise CompileError(f"template {label!r}: first parameter must be {CTX_PARAM_NAME!r}")
-    data_params = params[1:]
-    if set(data_params) != declared_names:
-        raise CompileError(
-            f"template {label!r} declares data argument(s) {data_params}, wire_data() "
-            f"declared {sorted(declared_names)} - these must match exactly"
-        )
-    return data_params
+    return params[1:]
 
 
 class CompiledKernel:
-    """
-    The immutable callable every backend's `BoundKernel.compile()` returns.
-    See the module docstring.
-
-    Author: B.G (08/2026)
-    """
+    """Callable produced by compiling one bound kernel."""
 
     def __init__(
         self,
@@ -236,17 +164,28 @@ class CompiledKernel:
         launch: Callable,
         data_order: list[Address],
         *,
-        needs_launch_dims: bool = False,
-        grid: Any = None,
         block: Any = None,
+        domain_addr: "Address | None" = None,
+        extent: "int | None" = None,
     ):
         self._bound = bound
         self._launch = launch
         self._data_order = list(data_order)
         self._data: dict[Address, Any] = {addr: bound.value_at(addr) for addr in self._data_order}
-        self._needs_launch_dims = needs_launch_dims
-        self._grid = grid
         self._block = block
+        # The CuPy launch extent is a fixed int, or the length
+        # of the DATA buffer at `domain_addr` read live at every launch (so
+        # swap() to a shorter buffer shrinks the launch), and grid = ceil(n /
+        # block). Both are None for closure backends, whose template loop owns
+        # its iteration space.
+        self._domain_addr = domain_addr
+        self._extent = extent
+        # This compiled kernel independently holds its
+        # DATA bindings (swap() can re-point them after compile, so they are not
+        # only the Bound's), refcounted here and released in close().
+        self._closed = False
+        for buf in self._data.values():
+            _refcount(buf, +1)
 
     @property
     def data_order(self) -> list[Address]:
@@ -270,10 +209,9 @@ class CompiledKernel:
         addr : Address or str
         buf : Any
             Validated against the slot's declared dtype
-            (wire_data(..., dtype=...)), if one was declared - the same
+            (data(..., dtype=...)), if one was declared - the same
             check bind() runs.
 
-        Author: B.G (08/2026)
         """
         a = parse_address(addr) if isinstance(addr, str) else tuple(addr)
         if a not in self._data:
@@ -284,33 +222,52 @@ class CompiledKernel:
         info = self._bound.slot_info(a)
         if info.dtype is not None:
             obj_dtype = getattr(buf, "dtype", None)
-            if obj_dtype is not None and obj_dtype != info.dtype:
+            if obj_dtype is not None and not _same_dtype(obj_dtype, info.dtype):
                 raise BindError(
                     f"swap({format_address(a)!r}, ...): dtype mismatch, slot declares "
                     f"{info.dtype}, got {obj_dtype}"
                 )
+        old = self._data.get(a)
+        if old is not buf:
+            _refcount(old, -1)
+            _refcount(buf, +1)
         self._data[a] = buf
         return self
 
-    def __call__(self, *, grid: Any = None, block: Any = None):
+    def close(self) -> None:
         """
-        Launch with whatever `swap()` currently holds for every DATA
-        address, in `data_order`. `grid`/`block` matter only on a backend
-        that needs explicit launch dimensions (cupy); ignored otherwise.
+        Release this compiled kernel's hold on its DATA bindings (decrement each
+        `_bound_by`) and mark it closed. Idempotent. It does not close the
+        caller-owned Bound it was compiled from - that is the caller's to close.
 
-        Author: B.G (08/2026)
         """
-        args = [self._data[addr] for addr in self._data_order]
-        if not self._needs_launch_dims:
+        if self._closed:
+            return
+        self._closed = True
+        for buf in self._data.values():
+            _refcount(buf, -1)
+
+    def __call__(self):
+        """
+        Launch with whatever `swap()` currently holds for every DATA address,
+        in `data_order`. Takes no arguments in normal use: a closure backend
+        ranges over the template's own loop, and cupy computes its grid from the
+        kernel's launch domain.
+
+        """
+        # DATA is represented by a DataHandle throughout the bind graph. Only
+        # the backend call boundary unwraps it to the native buffer.
+        args = [getattr(self._data[addr], "array", self._data[addr]) for addr in self._data_order]
+        if self._domain_addr is None and self._extent is None:
             return self._launch(*args)
-        g = grid if grid is not None else self._grid
-        b = block if block is not None else self._block
-        if g is None or b is None:
-            raise CompileError(
-                "this compiled kernel needs explicit launch dimensions - pass grid=/block= "
-                "to compile() or to this call"
-            )
-        return self._launch(*args, grid=g, block=b)
+        if self._extent is not None:
+            n = self._extent
+        else:
+            buf = self._data[self._domain_addr]
+            n = int(buf.array.shape[0])
+        b = self._block
+        g = (n + b - 1) // b
+        return self._launch(*args, grid=(g,), block=(b,))
 
     def __repr__(self) -> str:
         return f"CompiledKernel(data={[format_address(a) for a in self._data_order]})"

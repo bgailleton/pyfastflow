@@ -1,42 +1,6 @@
-"""
-cupy (CUDA source) block templates behind make_fill_reconstruct/
-make_fill_reconstruct_solver - grayscale morphological reconstruction
-against elevation, on the builder/frozen/bound stack (../core/context/
-builder.py, frozen.py, bound.py). Based on
-experimental/LM/fill_reconstruct_optimised.py's Round 4/5.
+"""CUDA templates for fill-and-reconstruct routing."""
 
-See _cupy_receivers.py/_cupy_accum.py/_cupy_depressions.py for the other
-flow algorithms. See fill_reconstruct_optimised.py's module docstring for
-the full derivation of the
-direct-elevation-space formulation (filled[i] = max(z[i], min over
-neighbours filled), decreasing from a +inf interior sentinel to a fixed
-point) and of every optimisation below (queued_gen dedup instead of a
-per-pass reset, gated pushes instead of unconditional ones, four directional
-sweeps seeding the frontier, counters[] replacing two scalars reset every
-pass).
-
-Framework-specific departure from that script: frontier_a/frontier_b are
-not two separate n_flat buffers here. A compiled Sequence step's data is
-bound once, at compile time (compile_shared.py's CompiledKernel) - it cannot
-re-select "the other buffer" between loop iterations the way the script's
-own host loop did (`frontier_bufs[p % 2]`). One buffer, "frontier", shape
-(2*n_flat,), replaces the pair: `base = (p % 2) * n_flat` selects the input
-half, `(1 - p % 2) * n_flat` the output half, both computed inside the
-kernel from the bound `P` Parameter - ordinary runtime pointer arithmetic
-into one already-bound array, no rebinding needed. `p` itself is `P`, a
-caller-allocated scalar i32 Parameter bumped by a host block between passes
-(host_block.py), exactly the role `ITER` plays for rake_compress
-(_cupy_accum.py) - required, not built here, since this factory takes no
-pool.
-
-atomicExch's dedup ("first writer to claim queued_gen[j] this pass wins")
-is unchanged from the script - CUDA has it natively.
-
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import KernelBuilder
-from ..core.pool.base import new_uid
+from ..core import KernelBuilder, new_uid
 
 _POS_SENTINEL = 1.0e9
 
@@ -57,13 +21,10 @@ def build_fill_reconstruct_init(*, grid, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pfi{new_uid()}"
     return (
-        KernelBuilder().compose("grid", grid)
-        .wire_data("z").wire_data("filled").wire_data("parent")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_init_filled(const float* z, float* filled, int* parent) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,8 +37,9 @@ __global__ void {t}_init_filled(const float* z, float* filled, int* parent) {{
         parent[i] = -1;
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )
 
 
@@ -98,12 +60,11 @@ def build_fill_reconstruct_sweeps(*, nx: int, ny: int):
         {"row_lr": ..., "row_rl": ..., "col_tb": ..., "col_bt": ...}, all
         KernelBuilders.
 
-    Author: B.G (08/2026)
     """
     t = f"pfs{new_uid()}"
 
-    def _kb(body):
-        return KernelBuilder().wire_data("z").wire_data("filled").wire_data("parent").ingest(body)
+    def _kb(body, domain):
+        return KernelBuilder(body, domain=domain).freeze()
 
     row_lr = _kb(
         f"""
@@ -121,8 +82,7 @@ __global__ void {t}_sweep_row_lr(const float* z, float* filled, int* parent) {{
         }}
     }}
 }}
-"""
-    )
+""", ny)
     row_rl = _kb(
         f"""
 __global__ void {t}_sweep_row_rl(const float* z, float* filled, int* parent) {{
@@ -139,8 +99,7 @@ __global__ void {t}_sweep_row_rl(const float* z, float* filled, int* parent) {{
         }}
     }}
 }}
-"""
-    )
+""", ny)
     col_tb = _kb(
         f"""
 __global__ void {t}_sweep_col_tb(const float* z, float* filled, int* parent) {{
@@ -156,8 +115,7 @@ __global__ void {t}_sweep_col_tb(const float* z, float* filled, int* parent) {{
         }}
     }}
 }}
-"""
-    )
+""", nx)
     col_bt = _kb(
         f"""
 __global__ void {t}_sweep_col_bt(const float* z, float* filled, int* parent) {{
@@ -173,8 +131,7 @@ __global__ void {t}_sweep_col_bt(const float* z, float* filled, int* parent) {{
         }}
     }}
 }}
-"""
-    )
+""", nx)
     return {"row_lr": row_lr, "row_rl": row_rl, "col_tb": col_tb, "col_bt": col_bt}
 
 
@@ -193,13 +150,10 @@ def build_fill_reconstruct_frontier_init(*, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pff{new_uid()}"
     return (
-        KernelBuilder()
-        .wire_data("z").wire_data("filled").wire_data("frontier").wire_data("counters")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_frontier_init(const float* z, const float* filled, int* frontier, int* counters) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -209,8 +163,7 @@ __global__ void {t}_frontier_init(const float* z, const float* filled, int* fron
         frontier[pos] = i;
     }}
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
 
@@ -220,21 +173,16 @@ def build_fill_reconstruct_relax(*, grid, n_flat: int):
     queued_gen): one grid-stride pass over the `counters[$ctx.P.get(0)$]`-
     sized input half of `frontier`, relaxing each active cell against its
     neighbours and pushing any neighbour whose candidate could still improve
-    into the output half, deduplicated per pass via `queued_gen` +
-    atomicExch. See ../../experimental/LM/fill_reconstruct_optimised.py's
-    module docstring for the push-gate correctness argument (an update at i
-    only pushes a neighbour j when i's own contribution alone could still
-    improve j - never a missed real activation, only a provably-futile push
-    pruned). That script additionally caches each neighbour's `filled` value
-    in local arrays to avoid re-reading it for the gate check; this version
-    re-reads `filled[j]` directly instead - same values, one more global read
-    per neighbour, no correctness difference.
+    into the output half, deduplicated per pass via ``queued_gen`` and
+    ``atomicExch``. The gate avoids work only when a local update cannot
+    improve its neighbour. This implementation reads ``filled[j]`` directly
+    for that check.
 
     `P` is this kernel's own wired PARAM slot (mode "scalar" - a host block
     bumps it between passes). Composes its own `grid` occurrence.
 
     `active` is the raw backing pointer of a caller's scalar Parameter
-    (`active_p.get().data`, same classification as `counters`/`queued_gen` -
+    (`active_p.handle().array`, same classification as `counters`/`queued_gen` -
     see _cupy_depressions.py's `build_depression_counter` for the identical
     pattern with `ndep`) - every push into the output frontier half also
     atomicAdds 1 into it, so a host block can read it back after this kernel
@@ -251,14 +199,10 @@ def build_fill_reconstruct_relax(*, grid, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pfr{new_uid()}"
     return (
-        KernelBuilder().wire_param("P").compose("grid", grid)
-        .wire_data("z").wire_data("filled").wire_data("parent")
-        .wire_data("frontier").wire_data("counters").wire_data("queued_gen").wire_data("active")
-        .ingest(
+        KernelBuilder(
             f"""
 __global__ void {t}_relax(const float* z, float* filled, int* parent, int* frontier,
                            int* counters, int* queued_gen, int* active) {{
@@ -303,6 +247,7 @@ __global__ void {t}_relax(const float* z, float* filled, int* parent, int* front
         }}
     }}
 }}
-"""
-        )
+""", domain=n_flat)
+        .compose("grid", grid)
+        .freeze()
     )

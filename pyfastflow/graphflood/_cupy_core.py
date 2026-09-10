@@ -1,35 +1,8 @@
-"""
-cupy (CUDA source) block templates behind make_graphflood's per-step core -
-mirrors _closure_core.py block for block (see its module docstring).
+"""CUDA GraphFlood core templates."""
 
-Author: B.G (08/2026)
-"""
-
-from ..core.context.builder import KernelBuilder
-from ..core.context.frozen import FrozenKernel
-from ..core.context.slot import SlotKind
-from ..core.pool.base import new_uid
+from ..core import FrozenKernel, KernelBuilder, new_uid
 from ..flow._cupy_receivers import build_distance_slope_helpers
 from ._cupy_friction import build_friction_qo
-
-
-def _find_param_paths(frozen, leaf_name: str, prefix: tuple = ()) -> list:
-    """Every relative dotted path under `frozen`'s composed subtree whose PARAM slot is named `leaf_name`."""
-    paths = []
-    if leaf_name in frozen.slots.names(SlotKind.PARAM):
-        paths.append(".".join(prefix + (leaf_name,)))
-    for name, child in frozen.composed.items():
-        paths.extend(_find_param_paths(child, leaf_name, prefix + (name,)))
-    return paths
-
-
-def _share_leaf(builder, canonical: str) -> None:
-    """Declare every occurrence of PARAM `canonical` in `builder`'s composed subtree shared with its own top-level slot."""
-    paths = []
-    for name, child in builder.composed.items():
-        paths.extend(_find_param_paths(child, canonical, (name,)))
-    if paths:
-        builder.share(canonical, *paths)
 
 
 _OUTLET_BEHAVIORS = frozenset({"fixed_h", "free", "fixed_s"})
@@ -66,7 +39,6 @@ def build_compute_qo(
     ValueError
         If `outlet_behavior` is not recognised.
 
-    Author: B.G (08/2026)
     """
     if outlet_behavior not in _OUTLET_BEHAVIORS:
         raise ValueError(
@@ -111,17 +83,10 @@ extern "C" __global__ void {t}_compute_qo(const float* z, const float* h, float*
 }}
 """
 
-    kb = KernelBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        kb.wire_param(name)
-    if outlet_behavior == "fixed_s":
-        kb.wire_param("BOUNDARY_SLOPE")
+    kb = KernelBuilder(body, domain=n_flat)
     kb.compose("grid", grid).compose("slope", slope).compose("friction", friction)
-    kb.wire_data("z").wire_data("h").wire_data("Qo")
-    for name in grid_param_names:
-        _share_leaf(kb, name)
-    return kb.ingest(body)
+    kb.share_identical("grid")
+    return kb.freeze()
 
 
 def build_apply_divergence(*, grid, n_flat: int, outlet_behavior: str = "fixed_h") -> FrozenKernel:
@@ -147,7 +112,6 @@ def build_apply_divergence(*, grid, n_flat: int, outlet_behavior: str = "fixed_h
     ValueError
         If `outlet_behavior` is not recognised.
 
-    Author: B.G (08/2026)
     """
     if outlet_behavior not in _OUTLET_BEHAVIORS:
         raise ValueError(
@@ -185,18 +149,9 @@ extern "C" __global__ void {t}_apply_divergence(float* h, const float* Q_in, con
 }}
 """
 
-    kb = KernelBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        kb.wire_param(name)
-    kb.wire_param("DT").wire_param("GF_MIN_INCREMENT")
-    if outlet_behavior == "fixed_h":
-        kb.wire_param("BOUNDARY_H")
+    kb = KernelBuilder(body, domain=n_flat)
     kb.compose("grid", grid)
-    kb.wire_data("h").wire_data("Q_in").wire_data("Qo")
-    for name in grid_param_names:
-        _share_leaf(kb, name)
-    return kb.ingest(body)
+    return kb.freeze()
 
 
 def build_make_surface(*, n_flat: int) -> FrozenKernel:
@@ -212,21 +167,17 @@ def build_make_surface(*, n_flat: int) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     t = f"gfs{new_uid()}"
     return (
-        KernelBuilder()
-        .wire_data("z").wire_data("h").wire_data("surface")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_make_surface(const float* z, const float* h, float* surface) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     surface[i] = z[i] + h[i];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
 
@@ -243,13 +194,10 @@ def build_h_from_filled(*, n_flat: int) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     t = f"gfh{new_uid()}"
     return (
-        KernelBuilder()
-        .wire_data("z").wire_data("filled").wire_data("h")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_h_from_filled(const float* z, const float* filled, float* h) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -257,8 +205,7 @@ extern "C" __global__ void {t}_h_from_filled(const float* z, const float* filled
     float hh = filled[i] - z[i];
     h[i] = hh > 0.0f ? hh : 0.0f;
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
 
@@ -279,34 +226,27 @@ def build_reset_reconstruct_scratch(*, n_flat: int, counters_size: int) -> dict:
     dict
         {"counters": FrozenKernel, "queued_gen": FrozenKernel}.
 
-    Author: B.G (08/2026)
     """
     t = f"gfr{new_uid()}"
     counters_kb = (
-        KernelBuilder()
-        .wire_data("counters")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_reset_counters(int* counters) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {counters_size}) return;
     counters[i] = 0;
 }}
-"""
-        )
+""", domain=counters_size).freeze()
     )
     queued_gen_kb = (
-        KernelBuilder()
-        .wire_data("queued_gen")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_reset_queued_gen(int* queued_gen) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     queued_gen[i] = -1;
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
     return {"counters": counters_kb, "queued_gen": queued_gen_kb}
 
@@ -336,7 +276,6 @@ def build_distribute(*, grid, n_flat: int, topology: str, diagonal_partition_cor
     dict
         {"zero": FrozenKernel, "route": FrozenKernel}.
 
-    Author: B.G (08/2026)
     """
     slope = build_distance_slope_helpers(
         grid, topology=topology, diagonal_partition_correction=diagonal_partition_correction
@@ -344,18 +283,14 @@ def build_distribute(*, grid, n_flat: int, topology: str, diagonal_partition_cor
     t = f"gfl{new_uid()}"
 
     zero_kb = (
-        KernelBuilder()
-        .wire_param("SOURCE")
-        .wire_data("Q_next")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_distribute_zero(float* Q_next) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     Q_next[i] = $ctx.SOURCE.get(i)$;
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
 
     route_body = f"""
@@ -392,17 +327,11 @@ extern "C" __global__ void {t}_distribute_route(const float* z, float* h, const 
 }}
 """
 
-    route_kb = KernelBuilder()
-    grid_param_names = grid.slots.names(SlotKind.PARAM)
-    for name in grid_param_names:
-        route_kb.wire_param(name)
-    route_kb.wire_param("GF_MIN_INCREMENT")
+    route_kb = KernelBuilder(route_body, domain=n_flat)
     route_kb.compose("grid", grid).compose("slope", slope)
-    route_kb.wire_data("z").wire_data("h").wire_data("Q_in").wire_data("Q_next")
-    for name in grid_param_names:
-        _share_leaf(route_kb, name)
+    route_kb.share_identical("grid")
 
-    return {"zero": zero_kb, "route": route_kb.ingest(route_body)}
+    return {"zero": zero_kb, "route": route_kb.freeze()}
 
 
 def build_copy_q(*, n_flat: int) -> FrozenKernel:
@@ -418,19 +347,15 @@ def build_copy_q(*, n_flat: int) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     t = f"gfq{new_uid()}"
     return (
-        KernelBuilder()
-        .wire_data("Q_next").wire_data("Q_in")
-        .ingest(
+        KernelBuilder(
             f"""
 extern "C" __global__ void {t}_copy_q(const float* Q_next, float* Q_in) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= {n_flat}) return;
     Q_in[i] = Q_next[i];
 }}
-"""
-        )
+""", domain=n_flat).freeze()
     )
