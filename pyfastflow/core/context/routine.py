@@ -1,49 +1,4 @@
-"""
-An ordered, device-only sequence of already-built kernels that share one
-address space and launch back to back as a single unit.
-
-`RoutineBuilder` / `FrozenRoutine` / `BoundRoutine` / `CompiledRoutine` follow
-the same build -> freeze -> bind -> compile lifecycle as a single kernel
-(see builder.py, frozen.py, bound.py), one level up.
-
-Composing steps
-----------------
-`compose(name, frozen_kernel)` appends a step: `name` is its address prefix
-and its position in launch order is its position in composition order - there
-is no separate ordering call. `FrozenRoutine.order` reads back exactly the
-sequence `compose()` was called in.
-
-Composing the same `FrozenKernel` under two step names runs it twice with
-independently bound data at each occurrence:
-
-    rb.step("diffuse1", diffuse).step("diffuse2", diffuse)
-
-gives two addresses (`diffuse1.*`, `diffuse2.*`), two independently bindable
-slot sets, and two independent `CompiledKernel` launches after `compile()`.
-
-`compose()` rejects a `FrozenHelper` - a helper has no standalone launch.
-Compose it into a `KernelBuilder` first, then compose that kernel here.
-
-Addressing
------------
-`build()` walks each step's own composition tree, prefixed with that step's
-name: `flux.grad.z` names the `z` PARAM slot of the `grad` helper composed
-inside the kernel composed under `flux`.
-
-Compiling
-----------
-`BoundRoutine.compile(backend)` checks this routine's own unmet
-slots, then per step: builds a fresh `BoundKernel` from that step's
-`FrozenKernel`, copies over whatever is bound at that step's addresses
-(`name.*` -> the step's own local addresses), and compiles it. The result is
-a `CompiledRoutine` wrapping each step's `CompiledKernel`, in order.
-
-`CompiledRoutine.swap(addr, buf)` routes `name.*` to that step's own
-`CompiledKernel.swap()`. Calling a `CompiledRoutine` launches every step in
-order, each with whatever its own `swap()` state currently holds.
-
-Author: B.G (08/2026)
-"""
+"""Ordered device-only kernel routines."""
 
 from typing import Any
 
@@ -61,7 +16,6 @@ class RoutineBuilderError(BuildError):
     Raised by the RoutineBuilder build phase: a step name reused, an
     attempt to compose a non-FrozenKernel, or a mutation after freeze().
 
-    Author: B.G (08/2026)
     """
 
 
@@ -70,9 +24,8 @@ class RoutineBuilder(_ShareMixin):
     Collects an ordered set of named kernel steps and freeze()s them into a
     FrozenRoutine. `share()`/`share_identical()` (from _ShareMixin, builder.py)
     collapse a bundle - a grid's helpers and their params - shared across the
-    routine's steps, addressed `step.<...>`. See the module docstring.
+    routine's steps, addressed `step.<...>`.
 
-    Author: B.G (08/2026)
     """
 
     def __init__(self):
@@ -101,7 +54,6 @@ class RoutineBuilder(_ShareMixin):
         name : str
             Address prefix for this step. Must be unique within the routine.
         frozen_kernel : FrozenKernel
-        Author: B.G (08/2026)
         """
         self._check_mutable()
         if isinstance(frozen_kernel, FrozenHelper):
@@ -128,7 +80,6 @@ class RoutineBuilder(_ShareMixin):
             No step was ever composed - an empty routine has nothing to
             launch.
 
-        Author: B.G (08/2026)
         """
         self._check_mutable()
         if not self._order:
@@ -142,9 +93,8 @@ class FrozenRoutine(Node):
     The frozen result of a RoutineBuilder's freeze(): a `Node` of kind
     "routine" whose `children` are its steps, insertion order = launch order,
     It has no template/contract/slots of its own; `.order` reports its step names in
-    launch order. build() is inherited from Node. See the module docstring.
+    launch order. build() is inherited from Node.
 
-    Author: B.G (09/2026)
     """
 
     KIND = "routine"
@@ -176,7 +126,6 @@ class BoundRoutine(_Bound):
     routine's whole `name.*` address space. See the module docstring's
     "Compiling" section for compile().
 
-    Author: B.G (08/2026)
     """
 
     def compile(self, backend=None) -> "CompiledRoutine":
@@ -187,7 +136,6 @@ class BoundRoutine(_Bound):
         `backend` is a `Backend`, or may be omitted to use the one recorded
         from bound Parameters and data handles.
 
-        Author: B.G (09/2026)
         """
         self._check_open("compile")
         check_unmet(self)
@@ -208,16 +156,15 @@ class BoundRoutine(_Bound):
 class CompiledRoutine:
     """
     An immutable, ordered sequence of already-compiled kernels, ready to
-    launch as one unit. See the module docstring.
+    launch as one unit.
 
-    Author: B.G (08/2026)
     """
 
     def __init__(self, steps: list, step_bounds: "list | None" = None):
         self._steps = list(steps)
         self._by_name = dict(steps)
         # the per-step BoundKernels this routine built and owns (destroy safety,
-        # Unit 6): close() releases their hold on the shared Parameters/handles.
+        # close() releases their hold on the shared Parameters and handles.
         self._step_bounds = list(step_bounds) if step_bounds else []
         self._closed = False
 
@@ -227,7 +174,6 @@ class CompiledRoutine:
         owns, releasing their hold on the shared Parameters/handles. Idempotent.
         Does not close the caller-owned routine Bound this was compiled from.
 
-        Author: B.G (09/2026)
         """
         if self._closed:
             return
@@ -254,7 +200,6 @@ class CompiledRoutine:
         buf : Any
             Replacement buffer.
 
-        Author: B.G (08/2026)
         """
         a = parse_address(addr) if isinstance(addr, str) else tuple(addr)
         if not a:

@@ -1,61 +1,4 @@
-"""
-Backend-agnostic pieces of the compile phase: the two checks every
-backend's `BoundKernel.compile()` runs before emitting anything, and
-CompiledKernel - the callable every backend's compile() returns.
-
-Legal PARAM accessors
-----------------------
-The build and bind phases deliberately leave "does this chain spell a real
-accessor" unenforced - only the emission layer knows what a PARAM slot may
-legally do in device code, per slot.py's own module docstring. Settled here,
-identically on every
-backend (Taichi, Quadrants, cupy all resolve a PARAM chain the same way, so
-there is one answer, not three): a PARAM-rooted chain must be exactly
-`(name, "get")` or `(name, "set_node")` - two segments, nothing else. A bare
-`ctx.z` with no accessor, a chain with a third segment, or any other method
-name is illegal. `set_node` is further illegal against a slot currently bound
-to a const-mode Parameter (const is baked into generated code as a literal;
-there is nothing to write). check_legal_accessors walks the whole composition
-tree - the kernel's own contract plus every composed FrozenHelper's own,
-recursively - and raises naming the exact address and the exact chain, before
-any backend touches source generation. This is a compile()-time convenience
-on top of what the backends already refuse structurally on their own -
-Taichi/Quadrants' ClosureParamDeviceView simply has no `set_node` attribute
-for a const Parameter (AttributeError at trace time), cupy's span expander
-only implements `get`/`set_node` - check_legal_accessors exists so the error
-arrives before any tracing/emission starts, naming the address plainly
-instead of surfacing as a trace-time AttributeError or a malformed-span
-ValueError deep in generated text.
-
-Unmet slots
------------
-check_unmet raises listing every address BoundKernel.unmet() reports,
-formatted exactly as inspect() would show them - pasteable, not paraphrased.
-
-Data argument signature
-------------------------
-check_data_signature/the cupy-specific text equivalent in compile_cupy.py
-validate that a template's own declared data arguments (its python
-parameters after `ctx`, or a cupy `__global__`'s own C parameter names)
-match this kernel's data() slots by name exactly - this is what lets
-CompiledKernel resolve DATA addresses to launch-argument *positions* without
-either side (template author, data caller) tracking an implicit order
-by hand.
-
-CompiledKernel
---------------
-What every backend's compile() returns: an immutable snapshot around a
-resolved data-address order and a `launch` callable. Data is bound by
-address, never passed positionally at call time - `swap(addr, buf)` re-points
-one DATA address's current buffer with a plain dict write, no re-trace, no
-recompile, exactly the ping-pong cost `z`/`z_prime` needs. `__call__` reads
-whatever `swap()` currently holds for every address, in the fixed order
-data_order was built with, and passes those positionally to `launch` - this
-positional pass-through is what makes swap() free: the *compiled* kernel
-itself is never touched, only a python dict entry.
-
-Author: B.G (08/2026)
-"""
+"""Shared checks and wrappers for compiled kernels."""
 
 import ast
 import inspect
@@ -106,7 +49,6 @@ def capture_template_meta(template) -> tuple[str | None, ast.AST | None]:
         None for CUDA source text, or a python def with no recoverable/
         parseable source.
 
-    Author: B.G (07/2026)
     """
     if isinstance(template, str):
         return template, None
@@ -129,7 +71,6 @@ class CompileError(PyFastFlowError):
     device code. Every case names the exact address (and, for accessors, the
     exact chain) involved.
 
-    Author: B.G (08/2026)
     """
 
 
@@ -139,7 +80,6 @@ def check_unmet(bound: _Bound) -> None:
     print it, if `bound` has any. Every concrete `compile()` calls this
     first.
 
-    Author: B.G (08/2026)
     """
     missing = bound.unmet()
     if missing:
@@ -156,7 +96,6 @@ def check_legal_accessors(bound: _Bound) -> None:
     illegal PARAM accessor found - see the module docstring for the exact
     legal set and why it is identical on every backend.
 
-    Author: B.G (08/2026)
     """
     _walk_accessors((), bound.frozen, bound)
 
@@ -208,7 +147,6 @@ def check_data_signature(template) -> list[str]:
     CompileError
         `template`'s first parameter is not `ctx`.
 
-    Author: B.G (08/2026)
     """
     label = getattr(template, "__name__", "?")
     params = list(inspect.signature(template).parameters)
@@ -218,12 +156,7 @@ def check_data_signature(template) -> list[str]:
 
 
 class CompiledKernel:
-    """
-    The immutable callable every backend's `BoundKernel.compile()` returns.
-    See the module docstring.
-
-    Author: B.G (08/2026)
-    """
+    """Callable produced by compiling one bound kernel."""
 
     def __init__(
         self,
@@ -240,14 +173,14 @@ class CompiledKernel:
         self._data_order = list(data_order)
         self._data: dict[Address, Any] = {addr: bound.value_at(addr) for addr in self._data_order}
         self._block = block
-        # Unit 4 launch domain (cupy): the extent is a fixed int, or the length
+        # The CuPy launch extent is a fixed int, or the length
         # of the DATA buffer at `domain_addr` read live at every launch (so
         # swap() to a shorter buffer shrinks the launch), and grid = ceil(n /
         # block). Both are None for closure backends, whose template loop owns
         # its iteration space.
         self._domain_addr = domain_addr
         self._extent = extent
-        # destroy safety (Unit 6): this compiled kernel independently holds its
+        # This compiled kernel independently holds its
         # DATA bindings (swap() can re-point them after compile, so they are not
         # only the Bound's), refcounted here and released in close().
         self._closed = False
@@ -279,7 +212,6 @@ class CompiledKernel:
             (data(..., dtype=...)), if one was declared - the same
             check bind() runs.
 
-        Author: B.G (08/2026)
         """
         a = parse_address(addr) if isinstance(addr, str) else tuple(addr)
         if a not in self._data:
@@ -308,7 +240,6 @@ class CompiledKernel:
         `_bound_by`) and mark it closed. Idempotent. It does not close the
         caller-owned Bound it was compiled from - that is the caller's to close.
 
-        Author: B.G (09/2026)
         """
         if self._closed:
             return
@@ -321,9 +252,8 @@ class CompiledKernel:
         Launch with whatever `swap()` currently holds for every DATA address,
         in `data_order`. Takes no arguments in normal use: a closure backend
         ranges over the template's own loop, and cupy computes its grid from the
-        kernel's launch domain (Unit 4).
+        kernel's launch domain.
 
-        Author: B.G (09/2026)
         """
         # DATA is represented by a DataHandle throughout the bind graph. Only
         # the backend call boundary unwraps it to the native buffer.

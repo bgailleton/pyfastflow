@@ -1,8 +1,4 @@
-"""
-Cupy backend implementation of DataHandle.
-
-Author: B.G (07/2026)
-"""
+"""CuPy implementation of DataHandle."""
 
 from typing import Any
 
@@ -13,11 +9,7 @@ from .base import DataHandle, new_uid
 
 
 class CupyDataHandle(DataHandle):
-    """
-    DataHandle backed by one cupy ndarray.
-
-    Author: B.G (07/2026)
-    """
+    """Handle backed by one CuPy array."""
 
     _BACKEND_NAME = "cupy"
 
@@ -42,11 +34,7 @@ class CupyDataHandle(DataHandle):
             raise ValueError(f"unsupported dtype {dtype!r}") from exc
 
     def __init__(self, dtype: Any, shape: tuple[int, ...]):
-        """
-        Allocate a cupy ndarray of the given dtype/shape.
-
-        Author: B.G (07/2026)
-        """
+        """Allocate a CuPy array of the requested dtype and shape."""
         self._uid = new_uid()
         self.backend_dtype = self.normalize_dtype(dtype)
         self.dtype = self.short_dtype(self.backend_dtype)
@@ -56,12 +44,7 @@ class CupyDataHandle(DataHandle):
 
     @property
     def array(self):
-        """
-        Return the underlying cupy ndarray, for passing straight into a
-        RawKernel launch.
-
-        Author: B.G (07/2026)
-        """
+        """Underlying CuPy array."""
         return self._array
 
     def acquire(self) -> None:
@@ -72,13 +55,7 @@ class CupyDataHandle(DataHandle):
         self.in_use = False
 
     def destroy(self) -> None:
-        """
-        Drop the reference; cupy's own memory pool reclaims the block for
-        reuse. Unusable afterwards. Raises PoolError while a bound object still
-        holds this handle directly (see _assert_unbound).
-
-        Author: B.G (07/2026)
-        """
+        """Release this handle's reference to its CuPy array."""
         self._assert_unbound("destroy")
         self._array = None
 

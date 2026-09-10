@@ -1,29 +1,4 @@
-"""
-Standalone, re-runnable sanity check of make_graphflood (kind="vanilla_sfd"),
-both fill_method values, on one backend at a time.
-
-Not a numerical-reference check against an independent implementation (no
-such reference exists for the coupled receivers/depressions-or-reconstruct/
-accumulation/core loop this factory assembles) - what it checks is that the
-assembled pipeline is well-formed and physically sane over many timesteps on
-a real (Gaussian-blurred i.i.d.) terrain with a constant rain source:
-
-  - no NaN/Inf ever appears in h, Q_in or Qo;
-  - h stays >= 0 everywhere, every step (apply_divergence's own clamp);
-  - total volume stored in h plus total Q_in arriving at can_out (edge)
-    nodes, tracked across every step, approximately matches total rain input
-    over the same steps (mass conservation, loosely - f32 accumulation over
-    hundreds of steps on a few thousand cells, not a tight tolerance; Qo
-    itself is deliberately 0 at can_out nodes - apply_divergence pins h
-    there directly rather than routing through the friction law).
-
-Run:
-    python -m pyfastflow.graphflood._verify_graphflood taichi
-    python -m pyfastflow.graphflood._verify_graphflood quadrants
-    python -m pyfastflow.graphflood._verify_graphflood cupy
-
-Author: B.G (08/2026)
-"""
+"""Numerical verification for GraphFlood."""
 
 import sys
 

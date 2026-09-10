@@ -1,39 +1,4 @@
-"""
-cupy (CUDA source) block templates behind make_fill_reconstruct/
-make_fill_reconstruct_solver - grayscale morphological reconstruction
-against elevation, on the builder/frozen/bound stack (../core/context/
-builder.py, frozen.py, bound.py). Based on
-experimental/LM/fill_reconstruct_optimised.py's Round 4/5.
-
-See _cupy_receivers.py/_cupy_accum.py/_cupy_depressions.py for the other
-flow algorithms. See fill_reconstruct_optimised.py's module docstring for
-the full derivation of the
-direct-elevation-space formulation (filled[i] = max(z[i], min over
-neighbours filled), decreasing from a +inf interior sentinel to a fixed
-point) and of every optimisation below (queued_gen dedup instead of a
-per-pass reset, gated pushes instead of unconditional ones, four directional
-sweeps seeding the frontier, counters[] replacing two scalars reset every
-pass).
-
-Framework-specific departure from that script: frontier_a/frontier_b are
-not two separate n_flat buffers here. A compiled Sequence step's data is
-bound once, at compile time (compile_shared.py's CompiledKernel) - it cannot
-re-select "the other buffer" between loop iterations the way the script's
-own host loop did (`frontier_bufs[p % 2]`). One buffer, "frontier", shape
-(2*n_flat,), replaces the pair: `base = (p % 2) * n_flat` selects the input
-half, `(1 - p % 2) * n_flat` the output half, both computed inside the
-kernel from the bound `P` Parameter - ordinary runtime pointer arithmetic
-into one already-bound array, no rebinding needed. `p` itself is `P`, a
-caller-allocated scalar i32 Parameter bumped by a host block between passes
-(host_block.py), exactly the role `ITER` plays for rake_compress
-(_cupy_accum.py) - required, not built here, since this factory takes no
-pool.
-
-atomicExch's dedup ("first writer to claim queued_gen[j] this pass wins")
-is unchanged from the script - CUDA has it natively.
-
-Author: B.G (08/2026)
-"""
+"""CUDA templates for fill-and-reconstruct routing."""
 
 from ..core import KernelBuilder, new_uid
 
@@ -56,7 +21,6 @@ def build_fill_reconstruct_init(*, grid, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pfi{new_uid()}"
     return (
@@ -96,7 +60,6 @@ def build_fill_reconstruct_sweeps(*, nx: int, ny: int):
         {"row_lr": ..., "row_rl": ..., "col_tb": ..., "col_bt": ...}, all
         KernelBuilders.
 
-    Author: B.G (08/2026)
     """
     t = f"pfs{new_uid()}"
 
@@ -187,7 +150,6 @@ def build_fill_reconstruct_frontier_init(*, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pff{new_uid()}"
     return (
@@ -211,15 +173,10 @@ def build_fill_reconstruct_relax(*, grid, n_flat: int):
     queued_gen): one grid-stride pass over the `counters[$ctx.P.get(0)$]`-
     sized input half of `frontier`, relaxing each active cell against its
     neighbours and pushing any neighbour whose candidate could still improve
-    into the output half, deduplicated per pass via `queued_gen` +
-    atomicExch. See ../../experimental/LM/fill_reconstruct_optimised.py's
-    module docstring for the push-gate correctness argument (an update at i
-    only pushes a neighbour j when i's own contribution alone could still
-    improve j - never a missed real activation, only a provably-futile push
-    pruned). That script additionally caches each neighbour's `filled` value
-    in local arrays to avoid re-reading it for the gate check; this version
-    re-reads `filled[j]` directly instead - same values, one more global read
-    per neighbour, no correctness difference.
+    into the output half, deduplicated per pass via ``queued_gen`` and
+    ``atomicExch``. The gate avoids work only when a local update cannot
+    improve its neighbour. This implementation reads ``filled[j]`` directly
+    for that check.
 
     `P` is this kernel's own wired PARAM slot (mode "scalar" - a host block
     bumps it between passes). Composes its own `grid` occurrence.
@@ -242,7 +199,6 @@ def build_fill_reconstruct_relax(*, grid, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pfr{new_uid()}"
     return (

@@ -1,55 +1,4 @@
-"""
-Standalone, re-runnable verification of make_accumulation, on the new
-builder/frozen/bound(/sequence) stack (../core/context/builder.py,
-frozen.py, bound.py, sequence.py), at a grid scale large enough for the
-three accumulation methods to visibly disagree at f32 precision.
-
-Why scale matters: with `source` = 1.0 per cell, `q` is literally drainage
-area in cells, so the outlet accumulates a value close to n_flat. f32 has an
-ulp of ~1.2e-4 at 1e3 and ~6e-2 at 1e6 - three methods that sum the same
-values in genuinely different orders (a strict serial walk for "atomic", a
-donor-tree rake-and-compress for "rake_compress", a power-of-two pointer-
-jump doubling for "pointer_jump_push") are expected to disagree by a
-noticeable fraction of an ulp at that magnitude, not agree to 1e-6 the way a
-small, lightly-loaded grid would make them appear to. This script exists
-because an earlier, smaller-scale (1920-node, random small `source`) run of
-this same check produced deviations that looked deceptively clean (~1e-6
-absolute against a maximum accumulated value of order 10) and was not
-actually stressing the three summation orders apart.
-
-What it checks, per backend (taichi/quadrants/cupy) and per method (atomic/
-rake_compress/pointer_jump_push): builds a 1024x1024 D8 grid (`make_grid_group`
-+ `make_grid_parameters`, ../grid/__init__.py), runs make_receivers(mode=
-"steepest") to get a real receiver graph, computes a numpy topological
-reference (summing along the same receiver chains, in float64), runs each
-accumulation method, and reports max absolute deviation, max relative
-deviation, AND the max accumulated value itself, so the deviations can be
-read against the scale they occur on. It also reports the receiver graph's
-maximum chain depth (root distance), computed by iterative path compression,
-so it's clear whether the graph exercised was actually deep or just wide.
-
-There is no fuse-check pass here: rake_compress/pointer_jump_push are
-`SequenceBuilder`s (sequence.py), where each composed step is always a
-separate real kernel launch - there is no per-Sequence fusion mechanism to
-diff against.
-
-`source` mode coverage (const/scalar/field) is exercised on taichi only, to
-prove mode-agnosticism without tripling the run time; quadrants/cupy run
-field mode only. A further "noninteger" pass, run on every backend, repeats
-the same receiver graph with a non-integer per-cell source: source=1.0
-makes every intermediate partial sum an exact integer, and f32 represents
-every integer up to 2**24 exactly regardless of summation order, so the
-const/scalar/field passes are expected to show exactly 0.0 deviation
-whenever the accumulated total stays under 2**24 - agreement there is a
-mathematical fact about IEEE-754, not evidence the three summation orders
-are equivalent in general. The noninteger pass is the actual check of that.
-
-Run (either form works - a plain path self-bootstraps its package context):
-    python -m pyfastflow.flow._verify_accum taichi
-    python pyfastflow/flow/_verify_accum.py taichi
-
-Author: B.G (07/2026)
-"""
+"""Numerical verification for flow accumulation."""
 
 import sys
 from collections import deque
@@ -74,7 +23,6 @@ def numpy_topological_accum(rec: np.ndarray, source: np.ndarray) -> np.ndarray:
     defines, in float64, via one indegree-driven topological pass (leaves
     first). O(n).
 
-    Author: B.G (07/2026)
     """
     n = rec.shape[0]
     q = source.astype(np.float64).copy()
@@ -105,7 +53,6 @@ def make_smooth_terrain(nx: int, ny: int, seed: int) -> np.ndarray:
     local minima are basin-scale rather than cell-scale and receiver chains
     actually run the width of a basin.
 
-    Author: B.G (07/2026)
     """
     rng = np.random.default_rng(seed)
     raw = rng.random((ny, nx))
@@ -121,7 +68,6 @@ def max_chain_depth(rec: np.ndarray) -> int:
     no python recursion (which would blow the recursion limit on a
     million-node chain).
 
-    Author: B.G (07/2026)
     """
     n = rec.shape[0]
     depth = np.full(n, -1, dtype=np.int64)
@@ -155,7 +101,6 @@ def _bind_pointer_jump_push(bound, closure, *, source_p, q, work, work2, q_work,
     `strict=True` on each call catches a typo'd leaf name against that
     step's own actual address set.
 
-    Author: B.G (08/2026)
     """
     bound.bind(("q_init", "SOURCE"), source_p)
     bound.bind(("q_init", "q"), q)
@@ -243,7 +188,7 @@ def run(backend: str):
 
     def _run_once(bnd):
         # compile, run once, then release both the compiled object and the bound
-        # object's hold on their Parameters (destroy safety, Unit 6) so the
+        # object's hold on their Parameters so the
         # source/iteration Parameters can be destroyed afterwards.
         c = bnd.compile(_bk)
         c()
@@ -370,10 +315,9 @@ def run(backend: str):
 # ---------------------------------------------------------------------------
 # persistent_mfd (cupy-only) - method="persistent_mfd" of make_accumulation.
 #
-# There is no MFD topology anywhere in this codebase yet (CLAUDE.md: "MFD is
-# entirely unported") - persistent_mfd only accumulates over a caller-built
-# receiver mask/weight pair, so this section fabricates one directly in
-# numpy rather than deriving it from a receivers factory. `_MFD_D8_DR`/
+# ``persistent_mfd`` accumulates over a supplied receiver mask and weight
+# pair. This standalone verifier constructs a small topology directly in
+# NumPy. ``_MFD_D8_DR`` and
 # `_MFD_D8_DC` are the exact same 8 offsets, same k order, as grid's own
 # `_delta` table (_cupy_blocks.py's build_helpers) - the persistent kernel
 # calls `ctx.grid.neighbour_raw(u, k)` on the real grid to resolve a set mask
@@ -409,7 +353,6 @@ def make_synthetic_mfd_topology(nx: int, ny: int, seed: int):
     Returns (dirs: u8[n], mfd_w: f32[n*8], indegree: i64[n]) - all plain
     numpy, in this grid's own flat/row-major indexing.
 
-    Author: B.G (08/2026)
     """
     n = nx * ny
     rng = np.random.default_rng(seed)
@@ -452,7 +395,6 @@ def numpy_kahn_mfd_accum(dirs: np.ndarray, mfd_w: np.ndarray, indegree: np.ndarr
     i.e. indegree==0 first) over the fabricated (dirs, mfd_w, indegree)
     graph, in float64. O(n * 8).
 
-    Author: B.G (08/2026)
     """
     n = dirs.shape[0]
     accum = source.astype(np.float64).copy()
@@ -494,7 +436,6 @@ def run_mfd_cupy():
     against numpy_kahn_mfd_accum. Returns (n_flat, max_abs, max_rel, max_got,
     max_ref, n_stuck).
 
-    Author: B.G (08/2026)
     """
     from ..core import Backend
     from ..grid import make_grid_group, make_grid_parameters

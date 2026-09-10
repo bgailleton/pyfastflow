@@ -1,41 +1,4 @@
-"""
-Taichi/Quadrants (closure) block templates behind make_receivers, on the new
-builder/frozen/bound stack (core/context/builder.py, frozen.py, bound.py).
-
-Every private block is a plain python def, first parameter `ctx`, PICKED -
-never branched on inside one function body - by build_receivers() according
-to the caller's `mode` ("steepest"|"stochastic") and `h_aware` flag. The one
-runtime branch that exists (which diagonal k values get the sqrt(2)
-correction) is inside the *corrected* distance helper only - k is genuine
-per-call device data, so it cannot be resolved by picking a function ahead of
-time.
-
-`dist_from_k_corrected`/`dist_between_nodes_corrected` always independently
-compose their own `grid` (the caller's FrozenGroup, ../grid's own
-make_grid_group result) rather than reusing one of grid's own already-
-composed sub-helpers directly - uniform whether or not
-`diagonal_partition_correction` is on, so `build_receivers` always has
-exactly two independent `grid` occurrences to collapse (its own top-level
-one, needed for can_out/N_NEIGHBOURS/neighbour, and the one nested under
-`slope.dist_from_k_corrected`), never a variable number depending on the
-flag - the same "always wrap, then share() collapses it" shape
-../ops/_closure_blocks.py's build_slope_group uses for its own two nested
-grid occurrences. `_find_param_paths`/`_share_leaf` are copied from there
-(and from ../grid/__init__.py, where they first appear) rather than
-imported - an explicit, itemized, per-factory declaration, never name-
-matching across independently-authored composites.
-
-`rand_unit(i, k)` mixes node index and neighbour direction separately
-(mirroring noise's `_white_unit_tmpl` col/row mixing), so every (node, k)
-candidate draws its own value - a node-keyed hash would scale every
-candidate by the same factor and weaken the randomisation. It composes
-`hash_u32` (../noise's public hash helper) rather than a private copy, and
-wires its own `SEED` PARAM slot - a caller binds a Parameter there (any mode)
-after `.build()`, exactly like any other PARAM slot; the host bumps it
-between calls for a fresh draw.
-
-Author: B.G (08/2026)
-"""
+"""Taichi and Quadrants templates for flow receivers."""
 
 import math
 
@@ -98,15 +61,14 @@ def _rand_unit_tmpl(ctx, i, k):
 def build_distance_slope_helpers(grid, *, topology: str, diagonal_partition_correction: bool):
     """
     dist_from_k_corrected/dist_between_nodes_corrected/slope_from_values_k/
-    slope_between_nodes, each composing its own occurrence of `grid` (see the
-    module docstring). `diagonal_partition_correction` only changes anything
+    slope_between_nodes, each composing its own occurrence of ``grid``.
+    ``diagonal_partition_correction`` only changes anything
     when `topology == "D8"` - the "corrected" distance helpers otherwise
     simply call straight through to `grid`'s own dist_from_k/
     dist_between_nodes, no correction applied.
 
     Returns {name: HelperBuilder}.
 
-    Author: B.G (08/2026)
     """
     d8 = topology == "D8"
     correct = diagonal_partition_correction and d8
@@ -139,10 +101,8 @@ def build_distance_slope_helpers(grid, *, topology: str, diagonal_partition_corr
 def build_rand_unit(hash_u32):
     """
     rand_unit(i, k) HelperBuilder, wiring its own `SEED` PARAM slot and
-    composing the caller-supplied `hash_u32` (../noise's public hash helper)
-    rather than a private copy - see the module docstring.
+    composing the caller-supplied ``hash_u32`` helper from :mod:`pyfastflow.noise`.
 
-    Author: B.G (08/2026)
     """
     return HelperBuilder(_rand_unit_tmpl).compose("hash_u32", hash_u32).freeze()
 
@@ -173,8 +133,8 @@ def build_receivers(
     `receivers`'s own top-level PARAM slots are every name `grid` itself
     wires (NX/NY/DX/N_NEIGHBOURS, plus NODATA_MASK/OUTLET_MASK if `grid` has
     them), each build-phase-shared (`_share_leaf`) with both of `grid`'s own
-    independent occurrences in this kernel's composed subtree (see the
-    module docstring) - a caller binds e.g. `NX` once on the compiled
+    independent occurrences in this kernel's composed subtree. A caller binds
+    e.g. ``NX`` once on the compiled
     receivers kernel, not once per occurrence.
 
     Parameters
@@ -199,7 +159,6 @@ def build_receivers(
         {name: HelperBuilder/KernelBuilder} - the distance/slope helpers
         plus "receivers", plus "rand_unit" when mode="stochastic".
 
-    Author: B.G (08/2026)
     """
     out = build_distance_slope_helpers(grid, topology=topology, diagonal_partition_correction=diagonal_partition_correction)
     slope = out["slope_from_values_k"]

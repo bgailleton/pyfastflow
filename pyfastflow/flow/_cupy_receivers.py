@@ -1,21 +1,4 @@
-"""
-cupy (CUDA source) block templates behind make_receivers, on the
-builder/frozen/bound stack (core/context/builder.py, frozen.py, bound.py).
-Mirrors _closure_receivers.py block for block: same private/public split,
-same `mode`/`h_aware`/`diagonal_partition_correction` selectors picking
-which CUDA text gets built, same always-wrap-then-share() shape for `grid`'s
-two independent occurrences (see _closure_receivers.py's module docstring).
-
-Every span reaching a PARAM is spelled `$ctx.NAME.get(...)$`/
-`$ctx.NAME.set_node(...)$` in full, every span reaching a composed HELPER is
-spelled `$ctx.name(args)$` (see builder.py's module docstring, "Param
-access is STRICT"). Every `__device__`/
-`__global__` symbol is prefixed with this build's own tag (a fresh
-new_uid()) so two make_receivers() calls in one process never collide inside
-a single compiled cupy module.
-
-Author: B.G (08/2026)
-"""
+"""CUDA templates for flow receivers."""
 
 from ..core import HelperBuilder, KernelBuilder, SlotKind, new_uid, share_leaf
 
@@ -29,7 +12,6 @@ def build_distance_slope_helpers(grid, *, topology: str, diagonal_partition_corr
 
     Returns {name: HelperBuilder}.
 
-    Author: B.G (08/2026)
     """
     d8 = topology == "D8"
     correct = diagonal_partition_correction and d8
@@ -95,7 +77,6 @@ def build_rand_unit(hash_u32):
     composing the caller-supplied `hash_u32` (../noise's public hash helper)
     rather than a private copy - see _closure_receivers.py's own docstring.
 
-    Author: B.G (08/2026)
     """
     t = f"fr{new_uid()}"
     return (
@@ -145,7 +126,6 @@ def build_receivers(
     dict
         {name: HelperBuilder/KernelBuilder}.
 
-    Author: B.G (08/2026)
     """
     out = build_distance_slope_helpers(grid, topology=topology, diagonal_partition_correction=diagonal_partition_correction)
     slope = out["slope_from_values_k"]

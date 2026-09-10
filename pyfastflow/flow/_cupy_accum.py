@@ -1,32 +1,4 @@
-"""
-cupy (CUDA source) block templates behind make_accumulation: the ping-pong
-src helpers, and the three accumulation methods ("atomic", "rake_compress",
-"pointer_jump_push"), on the new builder/frozen/bound/sequence stack
-(../core/context/builder.py, frozen.py, bound.py, sequence.py).
-
-See _cupy_receivers.py/_cupy_depressions.py/_cupy_reconstruct.py for the
-other flow algorithms. Mirrors _closure_accum.py's build_rake_compress/
-build_pointer_jump_push step-for-step - see that module's docstring for the
-loop-vs-unroll design
-choice and the two-address pointer_jump_push ping-pong shape, both identical
-here. Every span reaching a PARAM is spelled `$ctx.NAME.get(...)$`/
-`$ctx.NAME.set_node(...)$` in full, every span reaching a composed HELPER is
-spelled `$ctx.name(args)$` - see compile_cupy.py's module docstring: a
-composed helper's own C name is derived from its address and renamed at
-compile time, so (unlike a kernel's own `extern "C" __global__` name) the
-name chosen for it in this file's own source text is never seen by a
-caller and needs no per-build uid tag. A `__global__` kernel's own name does
-still need one (`new_uid()`), since it is a real launch entry point, not a
-composed device function - matching _cupy_receivers.py's build_atomic.
-
-Unlike closure, cupy has no source fusion (see cupy_backend.py) and no
-grid-wide barrier a single `__global__` can rely on - every ordering
-dependency a round needs is a real, separate kernel launch, exactly as
-_cupy_receivers.py/build_atomic's own two-launch q_init/accum split already
-establishes for this same reason.
-
-Author: B.G (08/2026)
-"""
+"""CUDA templates for flow accumulation."""
 
 from ..core import HelperBuilder, KernelBuilder, SequenceBuilder, new_uid
 
@@ -37,7 +9,6 @@ def build_ping_pong_helpers():
     _closure_accum.py's build_ping_pong_helpers for the sign/magnitude
     encoding and the ITER-sharing note (both apply identically here).
 
-    Author: B.G (08/2026)
     """
     get_src = HelperBuilder(
         """
@@ -75,9 +46,8 @@ def build_atomic(*, n_flat: int):
 
     `SOURCE` is each kernel's own wired PARAM slot (any mode) - a caller
     binds a Parameter there, on each, after `.build()`; there is no Need
-    indirection in this stack. `q` stays plain DATA (native CUDA
-    `atomicAdd`, no `ctx.bk` involved - cupy keeps native C, see bk.py's own
-    module docstring).
+    indirection in this stack. ``q`` remains DATA because CUDA updates it
+    with ``atomicAdd``.
 
     Parameters
     ----------
@@ -88,7 +58,6 @@ def build_atomic(*, n_flat: int):
     dict
         {"q_init": FrozenKernel, "accum": FrozenKernel}.
 
-    Author: B.G (08/2026)
     """
     t = f"pa{new_uid()}"
     q_init = (
@@ -109,7 +78,7 @@ extern "C" __global__ void {t}_q_init(float* q) {{
     # inflate wi with contributions that arrived early - exactly the bug an
     # earlier version of this kernel had (q[i] as a shortcut for wi, to avoid
     # re-binding `source`), caught by a max_abs deviation of ~1e23 at
-    # n_flat=1e6 in _verify_accum.py. Matches legacy
+    # n_flat=1e6 in _verify_accum.py.
     # accum_downstream_atomic_kernel and the closure-backend port, which
     # both re-read the weight function/Parameter directly for this reason.
     accum = (
@@ -175,7 +144,6 @@ def build_rake_compress(*, n_neighbours: int, logn: int, n_flat: int):
     -------
     tuple[SequenceBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     NN = n_neighbours
     t = f"pr{new_uid()}"
@@ -385,7 +353,6 @@ def build_pointer_jump_push(*, rounds: int, n_flat: int):
     -------
     tuple[SequenceBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     t = f"pj{new_uid()}"
     q_init = KernelBuilder(

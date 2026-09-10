@@ -1,63 +1,4 @@
-"""
-Taichi/Quadrants (closure) block templates behind make_accumulation: the
-ping-pong src helpers, and the three accumulation methods ("atomic",
-"rake_compress", "pointer_jump_push"), on the builder/frozen/bound/sequence
-stack (../core/context/builder.py, frozen.py, bound.py, sequence.py). See
-_closure_receivers.py/_closure_depressions.py/_closure_reconstruct.py for
-the other flow algorithms.
-
-`SOURCE`/`ITER` are plain PARAM slots (any mode - const,
-scalar or field, uniformly), never a Need: a caller binds a Parameter to
-each address on the built SequenceBuilder after `.build()`, exactly as
-make_receivers' `rand_unit.SEED` already does - there is no Need indirection
-anywhere in this stack. `ITER` recurs at four independent addresses
-("reset_iteration.ITER", "rake_step.ITER", "decrement_iteration.ITER",
-"fuse_accum_buffers.get_src.ITER") - one per PARAM slot that ever wires
-"ITER" anywhere in this sequence's composed tree, after rake_compress_accum's
-own `share("ITER", "get_src.ITER", "update_src.ITER")` (builder.py) collapses
-its own two composed helpers' ITER occurrences into its own top-level ITER -
-and the caller binds the same Parameter object at all four. `share()` takes
-effect here because routine.py's `FrozenRoutine.build()`/sequence.py's
-`_walk_block` dispatch to `_walk_group` (bound.py) for a step whose own
-`.shared` is non-empty, exactly as bound.py's own top-level `build()` already
-did for a standalone KernelBuilder; `fuse_accum_buffers` composes `get_src`
-but wires no ITER of its own to be a `share()` canonical against, so its own
-"fuse_accum_buffers.get_src.ITER" address stays independent - the "same
-value, several addresses" idiom ../ops/__init__.py's make_scan already uses
-for its own `work` buffer across every scan-routine step is what still
-applies to that one and to the three other steps' own ITER.
-
-rake_compress_accum/pointer_jump_push_step's repeat count (`logn+1` rounds
-for rake_compress, `rounds` - already rounded to even - for
-pointer_jump_push) is a SequenceBuilder loop with a plain int `max_times`
-(sequence.py's loop(body, max_times, until=None) - `until` omitted, runs
-to completion): no device readback decides the trip count here, unlike
-depression routing's own use of the same loop() for a host-evaluated
-predicate, but sequence.py's own module docstring documents the plain-int
-form as fully supported on its own terms. Chosen over unrolling N repeated
-compose()s of the same kernel (../ops/_closure_blocks.py's build_scan_routine
-idiom for its own log-depth passes): a scan pass's kernel body differs every
-round (`stride` baked in as a build-time constant), so each round is
-genuinely a different kernel and unrolling costs nothing extra; here the
-SAME kernel body runs unchanged every round (rake_compress_accum tracks
-which buffer is current via `ITER`-based ping-pong internally, not via a
-distinct address per round), so unrolling would only multiply the number of
-addresses a caller has to bind (N times) for zero benefit - a SequenceBuilder
-loop keeps that count fixed regardless of round count. See
-make_accumulation's own docstring (__init__.py) for the caller-facing
-contract.
-
-pointer_jump_push's ping-pong is the opposite shape: the SAME
-accum_pointer_jump_push_step kernel is composed under two sequence names,
-"step_a" (rec_curr=work, rec_next=work2, q_curr=q, q_next=q_work) and
-"step_b" (the mirror image) - two independent DATA address sets, each bound
-once by the caller to the two real buffers in the two orders a round needs,
-then alternated by `loop(body=["step_a", "step_b"], max_times=rounds // 2)`.
-No runtime swap() is needed for this ping-pong at all, unlike routine.py's
-old add_swap - the two fixed bindings already encode both directions.
-
-Author: B.G (08/2026)
-"""
+"""Taichi and Quadrants templates for flow accumulation."""
 
 from ..core import HelperBuilder, KernelBuilder, SequenceBuilder
 from ._closure_shared import _tensor_annotation
@@ -85,9 +26,8 @@ def _update_src_tmpl(ctx, src, tid, flip):
 def build_ping_pong_helpers():
     """
     get_src(src, tid)/update_src(src, tid, flip) HelperBuilders - same
-    sign/magnitude encoding as pyfastflow/general_algorithms/pingpong.py's
-    getSrc/updateSrc, each wiring its own `ITER` PARAM slot (no Need - see
-    the module docstring). A caller composing both into a kernel that also
+    sign/magnitude encoding as the shared ping-pong helpers, each wiring its
+    own ``ITER`` parameter. A caller composing both into a kernel that also
     wires its own `ITER` (rake_compress_accum does not - it only reaches
     `ITER` through these two helpers) would `share("ITER", "get_src.ITER",
     "update_src.ITER")` to collapse the two occurrences; rake_compress_accum
@@ -95,7 +35,6 @@ def build_ping_pong_helpers():
     both helpers, so it shares its own wired `ITER` with both instead (see
     build_rake_compress).
 
-    Author: B.G (08/2026)
     """
     get_src = HelperBuilder(_get_src_tmpl).freeze()
     update_src = HelperBuilder(_update_src_tmpl).freeze()
@@ -115,8 +54,7 @@ def build_atomic(*, backend: str, backend_mod, n_flat: int):
 
     `SOURCE` is this kernel's own wired PARAM slot (any mode - const,
     scalar or field) - a caller binds a Parameter there after `.build()`,
-    exactly like any other PARAM slot; there is no Need indirection in this
-    stack. `ctx.bk.atomic_add` (bk.py) is what a genuinely concurrent
+    exactly like any other PARAM slot. ``ctx.bk.atomic_add`` is what a genuinely concurrent
     accumulation into a DATA-typed `q` needs - PARAM access stays strict
     get()/set_node() (a plain, non-atomic write), so `q` is wired as DATA,
     not PARAM, the same "genuinely concurrent write" classification
@@ -134,7 +72,6 @@ def build_atomic(*, backend: str, backend_mod, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     NFLAT = n_flat
@@ -160,8 +97,7 @@ def build_atomic(*, backend: str, backend_mod, n_flat: int):
 def build_rake_compress(*, backend: str, backend_mod, n_neighbours: int, logn: int):
     """
     SequenceBuilder for the rake-and-compress accumulation, plus the
-    KernelBuilders it is made of - see the module docstring for the
-    loop-vs-unroll choice and the ITER/SOURCE binding contract.
+    KernelBuilders it is made of.
 
     Steps: zero_init (ndonors, ndonors_alt, src) -> reset_iteration (ITER=0)
     -> q_init (q[i]=SOURCE.get(i)) -> receivers_to_donors (atomic donor-list
@@ -179,8 +115,7 @@ def build_rake_compress(*, backend: str, backend_mod, n_neighbours: int, logn: i
     "reset_iteration.ITER", "rake_step.ITER", "rake_step.get_src.ITER",
     "rake_step.update_src.ITER", "decrement_iteration.ITER",
     "fuse_accum_buffers.get_src.ITER" (the same Parameter at all six ITER
-    addresses - see the module docstring for why share() does not collapse
-    any of them here). DATA addresses: this sequence's own {step}.{arg}
+    addresses. DATA addresses: this sequence's own {step}.{arg}
     for every kernel's own DATA name (see each template below).
 
     Parameters
@@ -200,7 +135,6 @@ def build_rake_compress(*, backend: str, backend_mod, n_neighbours: int, logn: i
         "rake_step" aliased as "rake_compress_accum" for parity with the
         pre-port naming), for direct standalone use if ever wanted.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     NN = n_neighbours
@@ -338,9 +272,8 @@ def build_rake_compress(*, backend: str, backend_mod, n_neighbours: int, logn: i
 
 def build_pointer_jump_push(*, backend: str, backend_mod, rounds: int):
     """
-    SequenceBuilder for the pointer-jump-push accumulation, plus the
-    KernelBuilders it is made of - see the module docstring for the
-    two-address ping-pong shape.
+    SequenceBuilder for pointer-jump-push accumulation and its constituent
+    kernels. Two independently bound steps provide the ping-pong state.
 
     Steps: q_init (q[i]=SOURCE.get(i)) -> copy_rec_to_work (rec -> work, so
     round 0 is not a special case and rec itself is never written) ->
@@ -351,16 +284,16 @@ def build_pointer_jump_push(*, backend: str, backend_mod, rounds: int):
     whichever buffers "step_a"'s own rec_curr/q_curr address was bound to,
     with no host-side conditional copy-back.
 
-    Composed names: "q_init", "copy_rec_to_work", "step_a", "step_b" (the
-    SAME accum_pointer_jump_push_step FrozenKernel, composed twice under two
-    names with two different DATA bindings - see the module docstring).
+    Composed names: ``q_init``, ``copy_rec_to_work``, ``step_a``, and
+    ``step_b``. The same ``accum_pointer_jump_push_step`` FrozenKernel is
+    composed twice with different DATA bindings.
     PARAM addresses needing a bound Parameter: "q_init.SOURCE". DATA
     addresses: "q_init.q", "copy_rec_to_work.rec"/"copy_rec_to_work.work",
     "step_a.rec_curr"/"step_a.rec_next"/"step_a.q_curr"/"step_a.q_next" bound
     to (work, work2, q, q_work), "step_b"'s own four bound to the mirror
     (work2, work, q_work, q).
 
-    Retirement rule (kept exactly, not restructured): when a node's parent
+    Retirement rule: when a node's parent
     is a sink in the current jumped graph (grandparent == parent), the node
     pushes once more and then points at itself, so it never re-pushes a
     growing sum into the sink.
@@ -378,7 +311,6 @@ def build_pointer_jump_push(*, backend: str, backend_mod, rounds: int):
     -------
     tuple[SequenceBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 

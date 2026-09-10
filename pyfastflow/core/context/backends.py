@@ -1,35 +1,4 @@
-"""
-`Backend`: the one object that knows everything backend-specific, built once
-per name and cached, so the rest of the core never carries its own
-"taichi"/"quadrants"/"cupy" if-ladder.
-
-`Backend.from_name("cupy")` returns the cached instance (idempotent: handed a
-Backend, it returns it). Two backends compare equal by name. Everything
-backend-specific is resolved lazily inside construction - the concrete
-Parameter/Pool classes and the backend module (`ti`/`qd`) are imported there,
-never at module load, so importing this module pulls in no GPU runtime and
-there is no Backend <-> Parameter/Pool import cycle.
-
-Fields:
-  name          "taichi" | "quadrants" | "cupy"
-  family        "closure" | "cupy" - feature packages pick their block module
-                on this, not on the name
-  module        ti / qd / None (cupy blocks call plain C)
-  ParameterCls  the backend's Parameter subclass
-  PoolCls       the backend's Pool subclass
-  dtypes        "f32" -> ti.f32 / qd.f32 / np.float32 (device/emit dtype)
-  np_dtypes     "f32" -> np.float32 (host-side checks, every backend)
-  tensor        data-argument annotation for closure templates
-                (ti.template() / qd.Tensor); None for cupy
-  bk            the backend-intrinsics node (bk.ClosureBkNode) or None
-  default_block cupy threads per block (256)
-
-Methods: compile_kernel(bound, **kw) dispatches to compile_closure/compile_cupy;
-pool() constructs a fresh Pool; wrap(array, owned=) wraps foreign storage in a
-DataHandle (the Unit 9 embedding path).
-
-Author: B.G (09/2026)
-"""
+"""Backend selection and backend-specific runtime wiring."""
 
 from typing import Any
 
@@ -107,10 +76,9 @@ class _ForeignDataHandle(DataHandle):
 
 class Backend:
     """
-    One backend's wiring, cached per name. See the module docstring. Construct
+    One backend's wiring, cached per name. Construct
     through `from_name`, never directly.
 
-    Author: B.G (09/2026)
     """
 
     _cache: "dict[str, Backend]" = {}
@@ -144,9 +112,8 @@ class Backend:
         """
         The cached Backend for `name` ("taichi"/"quadrants"/"cupy"). Idempotent:
         a Backend passed in is returned unchanged, so callers can accept either
-        a name or a Backend during the string -> Backend migration.
+        a Backend unchanged when one is already supplied.
 
-        Author: B.G (09/2026)
         """
         if isinstance(name, Backend):
             return name
@@ -199,7 +166,6 @@ class Backend:
         this backend's module) or compile_cupy. Launch dimensions belong to the
         frozen kernel's `domain`/`block` declaration.
 
-        Author: B.G (09/2026)
         """
         if self.family == "closure":
             from . import compile_closure
@@ -217,7 +183,6 @@ class Backend:
         """
         Wrap caller-owned backend storage in a DataHandle without copying.
 
-        Author: B.G (09/2026)
         """
         if self.name == "cupy":
             import cupy as cp
@@ -242,7 +207,6 @@ class Backend:
 def require_backend(be) -> Backend:
     """Return ``be`` when it is a Backend; feature factories reject strings.
 
-    Author: B.G (09/2026)
     """
     if not isinstance(be, Backend):
         raise TypeError(f"feature factories require a Backend, got {type(be).__name__}")

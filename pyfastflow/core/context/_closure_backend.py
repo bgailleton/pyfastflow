@@ -1,29 +1,4 @@
-"""
-Machinery shared by the two backends whose templates are python functions:
-Taichi and Quadrants.
-
-Specialization works by rebuilding the template function around a globals dict
-that carries the bound objects, so a name like `phys` in the template body
-resolves to the bound object when the backend traces it. The rebuilt function
-is then decorated with ti.func/qd.func or ti.kernel/qd.kernel.
-
-The two backends can share all of this because the pieces used here - func,
-kernel, static, u8, i32, i64 - carry the same names and the same behaviour in
-both modules. A backend subclass therefore only pins `_backend` to the ti or qd
-module; nothing else varies.
-
-What lives here is only what a Parameter's device view (ClosureBackendParameter,
-_build_device_view) needs to compile its own tiny get/set_node funcs -
-specialize_closure and the two supporting classes. The kernel/helper/routine
-compile path for Taichi/Quadrants is compile_closure.py, which composes a
-BoundKernel's `ctx` tree instead of splicing bound objects into template
-globals - see its own module docstring for why.
-
-cupy does not appear here: CUDA source text has no globals to patch, and that
-backend substitutes into the source directly instead.
-
-Author: B.G (07/2026)
-"""
+"""Shared Parameter support for Python-template backends."""
 
 from types import FunctionType
 from typing import Any, ClassVar
@@ -56,7 +31,6 @@ def specialize_closure(template, globals_: dict[str, Any]) -> FunctionType:
         A new function sharing `template`'s code object but with `globals_`
         merged into its globals.
 
-    Author: B.G (07/2026)
     """
     source = getattr(template, "__wrapped__", template)
     func_globals = dict(source.__globals__)
@@ -85,7 +59,6 @@ class ClosureParamDeviceView:
     parameter's mode. A const parameter is read-only and carries no `.set_node`
     at all, which turns a write to one into a trace-time error.
 
-    Author: B.G (07/2026)
     """
 
     def __init__(self, name: str, get_fn, set_fn=None):
@@ -103,7 +76,6 @@ class ClosureBackendParameter(Parameter):
     dtype mapping and the device view are written once here against the names
     both modules share.
 
-    Author: B.G (07/2026)
     """
 
     _backend: ClassVar[Any]
@@ -134,7 +106,6 @@ class ClosureBackendParameter(Parameter):
             If `mode` is not in MODES, or field mode is given without a
             shape.
 
-        Author: B.G (07/2026)
         """
         if mode not in MODES:
             raise ValueError(f"{name}: mode must be one of {sorted(MODES)}, got {mode!r}")
@@ -171,7 +142,6 @@ class ClosureBackendParameter(Parameter):
         Map a backend dtype (`ti.*`/`qd.*`) to the numpy dtype used for
         host-side (de)serialization.
 
-        Author: B.G (07/2026)
         """
         backend = cls._backend
         if dtype == backend.u8:
@@ -186,7 +156,6 @@ class ClosureBackendParameter(Parameter):
         """
         The python value for const mode, the backing DataHandle otherwise.
 
-        Author: B.G (07/2026)
         """
         return self._const_value if self.mode == "const" else self._handle
 
@@ -200,14 +169,13 @@ class ClosureBackendParameter(Parameter):
         ValueError
             If this parameter's mode is const.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
             from .errors import ParameterError
 
             raise ParameterError(
                 f"{self.name}: const parameter is immutable; build a new Parameter and "
-                f"replace() it into the bag, then recompile"
+                f"bind a new Parameter and recompile"
             )
         self._store(value)
 
@@ -217,7 +185,6 @@ class ClosureBackendParameter(Parameter):
         one path that may set a const, used by __init__ to place its initial
         value.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
             self._const_value = self._numpy_dtype(self.backend_dtype)(value).item()
@@ -236,7 +203,6 @@ class ClosureBackendParameter(Parameter):
         ValueError
             If this parameter's mode is const.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
             from .errors import ParameterError
@@ -256,7 +222,6 @@ class ClosureBackendParameter(Parameter):
         ValueError
             If this parameter's mode is field.
 
-        Author: B.G (07/2026)
         """
         if self.mode == "const":
             return self._const_value
@@ -275,7 +240,6 @@ class ClosureBackendParameter(Parameter):
         is a no-op there. Raises ParameterError while a bound object still holds
         this Parameter (see Parameter._assert_unbound).
 
-        Author: B.G (07/2026)
         """
         self._assert_unbound("destroy")
         if self._handle is not None:
@@ -295,7 +259,6 @@ class ClosureBackendParameter(Parameter):
         that storage - and that does not reach kernels compiled earlier, which
         still hold it (see parameter.py, "Lifetime of a compiled object").
 
-        Author: B.G (07/2026)
         """
         if self._device_view is None:
             self._device_view = self._build_device_view()
@@ -311,7 +274,6 @@ class ClosureBackendParameter(Parameter):
         for field. set_node is built for scalar and field only. MODE, VALUE and
         HANDLE are ordinary python values spliced in as globals.
 
-        Author: B.G (07/2026)
         """
         backend = self._backend
         mode = self.mode

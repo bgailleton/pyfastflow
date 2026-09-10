@@ -1,89 +1,7 @@
-"""
-Small device-op factories built on the builder/frozen/bound stack
-(../core/context/builder.py, frozen.py, bound.py; see parameter.py for
-Parameter) - bit packing, missing math, generic flat-buffer kernels, a
-grid-aware slope helper, a parallel inclusive scan / stream compaction,
-plain reductions, and (cupy only) a cub::BlockReduce wrapper.
+"""General-purpose GPU operations.
 
-Four shapes, mirroring grid/noise/visu's own split
--------------------------------------------------------
-Helper-group factories (`make_bitpack_group`, `make_math_group`,
-`make_slope_group`, `make_block_reduce_group`) return a FrozenGroup composed
-by name into whatever kernel/helper needs it (`kb.compose("bitpack",
-bitpack_group)`, `ctx.bitpack.pack(f, i)` in a template) - the same
-two-call structure/data split grid/__init__.py's own docstring explains,
-just with an empty data half for every one of these (none of the four owns
-any Parameter). `make_elementwise` is the kernel-builder shape: a
-dict[str, FrozenKernel], unbuilt - a caller `.build()`s the member it wants,
-binds its DATA addresses, `.compile()`s. `make_scan`/`make_reduce` are
-host-orchestrated: each returns a plain python object (Scan/Reduce)
-wrapping one or more compiled kernels/routines plus device-side 0-d scalar
-Parameters for their results - not representable as a single composable
-structure, since calling them runs a short host-side sequence. Unlike the
-helper-group factories, `make_scan`/`make_reduce` DO take a `pool` and hand
-Parameters back to the caller, unlike `flow/`'s factories (which take no
-pool at all): a scan/reduce result is a value the caller consumes, not
-scratch state the caller already owns.
-
-`make_slope_group` is this pass's first nested-FrozenGroup-in-FrozenGroup
-case within `ops/` itself (mirroring visu's own hillshade gradient blocks,
-../visu/__init__.py): `sumslope_downstream`/`slope_dir` each independently
-compose the caller's own grid FrozenGroup as a child (a device template can
-only reach what is composed directly onto its own scope), and `make_slope_
-group` promotes every one of grid's own top-level PARAM names to its own top
-level, build-phase-shared into both nested occurrences via `_share_leaf` -
-identical mechanism to grid/visu's own, copied rather than imported for the
-same reason those two modules copy it from each other (an explicit,
-itemized, per-factory declaration, never name-matching across independently
-authored composites).
-
-`make_block_reduce_group` is cupy-only (raises otherwise) - Taichi/Quadrants
-have no block-level reduction primitive this wraps.
-
-`make_scan`'s returned Parameter (`Scan.count_param`) is handed back bare,
-not wrapped in anything - there is no Need-shaped wrapper in this stack to
-reach for; a caller wanting it bound into its own KernelBuilder does so
-exactly like any other Parameter (`kb.param("count"); bound.bind(
-"count", scan.count_param)`). `make_reduce`'s returned handles
-(`Reduce.{sum,min,max,argmin}_data`) are bare DataHandles instead, not
-Parameters - see "Reduce's DATA-not-PARAM accumulator" below for why a
-Parameter wrapper has nothing to add there.
-
-Reduce's DATA-not-PARAM accumulator
--------------------------------------
-PARAM access in this stack is strict get()/set_node() (compile_shared.
-check_legal_accessors) - a plain, non-atomic single write, never an atomic
-accumulate. sum/min/max/argmin genuinely need atomic accumulation across
-threads (`ctx.bk.atomic_min(acc[None], x[i])`, Taichi's automatic atomic `+=`
-for sum), which needs the raw backend field/ndarray itself, not a Parameter's
-device_view - so the running total is wired as a DATA slot on the kernel
-(`acc`), never a PARAM one, and is never reached through a PARAM slot
-anywhere in this factory's own kernels. A Parameter's only two jobs beyond
-raw storage - a device_view() for PARAM-slot binding, and dtype/mode
-bookkeeping for that binding - are therefore both unused here, so
-`make_reduce` hands its own caller the pooled DataHandle directly
-(`sum_data`, ...) rather than a Parameter wrapping it: `.from_numpy()`/
-`.to_numpy()` cover the host write/read this module itself needs, and a
-caller wanting to chain a result into another kernel binds the handle
-straight into that kernel's own DATA slot, no Parameter indirection either
-side. See _closure_blocks.py's own module docstring for the fuller reasoning
-on why atomic accumulation forces DATA over PARAM in the first place.
-
-Scan's cupy compaction
------------------------
-`.inclusive()` on cupy stays `cp.cumsum` (CUB's own DeviceScan is already
-the accelerator cupy dispatches to by default on this build). Compaction's
-count-read and scatter are a 2-step FrozenRoutine (routine.py): "read_count"
-declares a one-thread domain and "scatter" declares an `n`-thread domain; see
-_cupy_blocks.build_count_and_scatter_routine's own docstring.
-
-One consequence: scatter always launches on cupy, even when `count == 0`
-(Taichi/Quadrants' `compact_fn` short-circuits before its own scatter
-launch, since those two kernels are not bundled into one Routine call and
-can be skipped independently) - a harmless extra launch in the all-flags-
-zero case, not a correctness difference.
-
-Author: B.G (08/2026)
+This module provides composable device helpers (bit packing, math, slopes),
+plain elementwise kernels, and host-driven scan and reduction utilities.
 """
 
 import numpy as np
@@ -92,13 +10,7 @@ from ..core import Backend, require_backend
 
 
 def _blocks_for(be: Backend):
-    """
-    The private block module implementing one of this package's factories
-    for a given backend name: the closure blocks (shared by Taichi and
-    Quadrants) or the cupy blocks.
-
-    Author: B.G (08/2026)
-    """
+    """Return the implementation module for one backend family."""
     if be.family == "closure":
         from . import _closure_blocks as blocks
     elif be.family == "cupy":
@@ -109,83 +21,20 @@ def _blocks_for(be: Backend):
 
 
 def make_bitpack_group(be: Backend) -> "FrozenGroup":
-    """
-    pack(f, i) -> i64, unpack_value(p) -> f32, unpack_index(p) -> i32: pack a
-    float and an int32 index into one i64 so that an atomic_min over the
-    packed value behaves as a lexicographic argmin over (value, index) -
-    composed by name into whatever kernel/helper needs it
-    (`kb.compose("bitpack", group)`, `ctx.bitpack.pack(f, i)`). No PARAM
-    slots - see this module's own docstring.
-
-    Parameters
-    ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
-
-    Returns
-    -------
-    FrozenGroup
-
-    Author: B.G (08/2026)
-    """
+    """Return helpers for packing a float and index into one sortable integer."""
     return _blocks_for(require_backend(be)).build_bitpack_group()
 
 
 def make_math_group(be: Backend) -> "FrozenGroup":
-    """
-    atan(x) and nextafter(x, y) (f32), filling in for the two functions
-    Taichi/Quadrants/CUDA device code has no direct equivalent for - composed
-    by name (`ctx.math.atan(x)`, `ctx.math.nextafter(x, y)`). No PARAM slots.
-
-    Parameters
-    ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
-
-    Returns
-    -------
-    FrozenGroup
-
-    Author: B.G (08/2026)
-    """
+    """Return device helpers for ``atan`` and ``nextafter``."""
     return _blocks_for(require_backend(be)).build_math_group()
 
 
 def make_elementwise(be: Backend, *, n: "int | None" = None) -> dict:
-    """
-    swap, add_B_to_A, add_B_to_weighted_A, weighted_mean_B_in_A, arange,
-    multiply_by_scalar over a flat buffer, as unbuilt FrozenKernels - call
-    `.build()` then bind DATA addresses then `.compile()` on the member you
-    want. Buffers (and, on cupy, the buffer length `n`, required here since a
-    `cp.RawModule` kernel has no auto-ranging equivalent to Taichi/Quadrants'
-    `for i in array`) are DATA slots, not bound Parameters.
+    """Return unbound kernels for common flat-array operations.
 
-    `n` is required on cupy (baked into the generated launch-bounds check at
-    build time - see _cupy_blocks.build_elementwise) and ignored on Taichi/
-    Quadrants (whose `for i in array` ranges over the buffer's own runtime
-    shape, needing no baked length at all).
-
-    Parameters
-    ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
-    n : int, optional
-        Buffer length, required on cupy.
-
-    Returns
-    -------
-    dict
-        {"swap": ..., "add_B_to_A": ..., "add_B_to_weighted_A": ...,
-        "weighted_mean_B_in_A": ..., "arange": ..., "multiply_by_scalar":
-        ...}, each an unbuilt FrozenKernel.
-
-    Raises
-    ------
-    ValueError
-        On cupy, if `n` is not given.
-
-    Author: B.G (08/2026)
-    """
+CuPy needs ``n`` to define the fixed launch domain.
+"""
     be = require_backend(be)
     blocks = _blocks_for(be)
     if be.family == "cupy":
@@ -196,58 +45,15 @@ def make_elementwise(be: Backend, *, n: "int | None" = None) -> dict:
 
 
 def make_slope_group(be: Backend, grid: "FrozenGroup") -> "FrozenGroup":
-    """
-    sumslope_downstream(z, i): sum of (z[i]-z[j])/dx over every downstream
-    neighbour of i. slope_dir(z, i, k): the signed slope towards neighbour k,
-    0 where there is none. Both walk `grid`'s own neighbour/dx/n_neighbours
-    surface (../grid's make_grid_group result), so they follow whatever
-    topology/boundary/nodata `grid` was built with - see this module's own
-    docstring for the nested-FrozenGroup mechanism involved.
-
-    Parameters
-    ----------
-    backend : str
-        "taichi", "quadrants" or "cupy".
-    grid : FrozenGroup
-        Grid structure to walk (../grid's make_grid_group result).
-
-    Returns
-    -------
-    FrozenGroup
-
-    Author: B.G (08/2026)
-    """
+    """Return slope helpers using a supplied grid structure."""
     return _blocks_for(require_backend(be)).build_slope_group(grid)
 
 
 def make_block_reduce_group(be: Backend, *, block_size: int = 128) -> "FrozenGroup":
-    """
-    cupy only: `sum(val)`, one cub::BlockReduce<float, 128>::Sum() per
-    calling CUDA block - composed under the name "sum". Raises on Taichi/
-    Quadrants, which have no block-level primitive this wraps.
+    """Return CuPy block-reduction helpers.
 
-    The first compile that reaches this triggers a one-time jitify header
-    cache warm-up for <cub/block/block_reduce.cuh>, roughly two minutes; that
-    is expected, not a hang.
-
-    Parameters
-    ----------
-    backend : str
-        Must be "cupy".
-    block_size : int, optional
-        CUDA block size, default 128.
-
-    Returns
-    -------
-    FrozenGroup
-
-    Raises
-    ------
-    ValueError
-        If `backend` is not "cupy".
-
-    Author: B.G (08/2026)
-    """
+This helper is unavailable on Taichi and Quadrants.
+"""
     be = require_backend(be)
     if be.family != "cupy":
         raise ValueError(f"make_block_reduce_group: only supported on cupy, got {be.name!r}")
@@ -276,7 +82,6 @@ class Scan:
     from the most recent `.compact()` call, readable by another kernel via
     `.get(0)` with no host sync; `.count()` is the syncing host equivalent.
 
-    Author: B.G (08/2026)
     """
 
     def __init__(self, inclusive_fn, compact_fn, count_param):
@@ -320,7 +125,6 @@ def make_scan(be: Backend, pool, n: int) -> Scan:
     -------
     Scan
 
-    Author: B.G (08/2026)
     """
     be = require_backend(be)
     ParamCls, dtypes = be.ParameterCls, be.dtypes
@@ -417,8 +221,7 @@ class Reduce:
 
     The four handles this hands back (`sum_data`, ...) are bare pooled
     storage, not Parameters: the accumulator is wired as a DATA slot on the
-    underlying kernel (see the module docstring, "Reduce's DATA-not-PARAM
-    accumulator"), and a Parameter wrapping storage that is never read
+    underlying kernel. A Parameter wrapping storage that is never read
     through a PARAM slot anywhere has nothing left to add over the DataHandle
     itself - see `sum_value`/etc. for the host read, or bind a handle
     directly into another kernel's DATA slot to chain results device-side
@@ -428,7 +231,6 @@ class Reduce:
     i64 index, not the packed (value, index) pair the Taichi/Quadrants
     reduction accumulates into on its way there.
 
-    Author: B.G (08/2026)
     """
 
     def __init__(self, sum_h, min_h, max_h, argmin_h, run, host):
@@ -499,7 +301,6 @@ def make_reduce(be: Backend, pool, n: int) -> Reduce:
     -------
     Reduce
 
-    Author: B.G (08/2026)
     """
     be = require_backend(be)
     dtypes = be.dtypes
@@ -614,7 +415,6 @@ def _closure_pack_identity() -> int:
     _closure_blocks._pack_tmpl - the identity element atomic_min starts
     argmin's accumulator field at, so any real (value, index) pair wins.
 
-    Author: B.G (07/2026)
     """
     f = np.float32(float("inf"))
     u = int(f.view(np.uint32))

@@ -1,24 +1,4 @@
-"""
-cupy (CUDA source) block templates behind ops's make_bitpack_group/make_scan/
-make_reduce, on the builder/frozen/bound stack (core/context/builder.py,
-frozen.py, bound.py). Mirrors _closure_blocks.py's split and
-../grid/_cupy_blocks.py's own conventions: every span reaching a PARAM is
-spelled `$ctx.NAME.get(...)$`/`$ctx.NAME.set_node(...)$` in full, every span
-reaching a composed HELPER is spelled `$ctx.name(args)$`. Every device/
-global function name is prefixed with this build's own tag (a fresh
-new_uid()), matching grid/noise/visu's own belt-and-braces convention
-(compile_cupy.py already mangles by address - see its own module docstring
-- this is redundant safety, not load bearing).
-
-`.inclusive()` on cupy stays `cp.cumsum` (ops/__init__.py's own module
-docstring: CUB's DeviceScan is already the accelerator cupy dispatches to by
-default) - no RoutineBuilder involved for that half. Compaction's count-read
-and scatter are a two-step FrozenRoutine (routine.py): "read_count" declares
-`domain=1`, while "scatter" declares `domain=n`. Each kernel owns its launch
-geometry.
-
-Author: B.G (08/2026)
-"""
+"""CUDA operation templates for CuPy."""
 
 from ..core import GroupBuilder, RoutineBuilder, freeze_helper as _helper, freeze_kernel as _kernel, new_uid
 
@@ -34,7 +14,6 @@ def build_bitpack_group() -> "FrozenGroup":
     CUDA's __float_as_uint/__uint_as_float. No PARAM slots anywhere in this
     tree.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     flip = _helper(
@@ -114,7 +93,6 @@ def build_math_group() -> "FrozenGroup":
     the same bit-twiddling as _closure_blocks.build_math_group - composed
     onto a fresh GroupBuilder under those two public names. No PARAM slots.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     atan = _helper(f"__device__ float {t}_atan(float x) {{ return atan2f(x, 1.0f); }}")
@@ -146,11 +124,7 @@ __device__ float {t}_nextafter(float x, float y) {{
 
 
 # ---------------------------------------------------------------------------
-# elementwise (kernels, returned unbuilt) - `n` is baked as a python int at
-# build time (this build's own closure), not a data argument - see
-# _closure_blocks.build_elementwise's own docstring; the pre-rewrite cupy
-# text carried `n` as a real kernel argument instead, which this port
-# tightens to match every other backend's already-closed-over `n`.
+# Elementwise kernels close over ``n`` as a build-time Python integer.
 # ---------------------------------------------------------------------------
 
 
@@ -160,7 +134,6 @@ def build_elementwise(n: int) -> dict:
     multiply_by_scalar over a flat f32 buffer of length `n`, as unbuilt
     FrozenKernels.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
 
@@ -247,7 +220,6 @@ def build_slope_group(grid) -> "FrozenGroup":
     independently as each helper's own child, same nested-FrozenGroup shape
     as the closure port (see that module's own docstring).
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     sumslope_downstream = _helper(
@@ -304,7 +276,6 @@ def build_block_reduce_group(block_size: int = 128) -> "FrozenGroup":
     warm-up for <cub/block/block_reduce.cuh>, roughly two minutes; that is
     expected, not a hang.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     sum_helper = _helper(
@@ -335,7 +306,6 @@ def build_count_and_scatter_routine(n: int, *, block: int = 256) -> "FrozenRouti
     compaction half of scan-based stream compaction. Each kernel declares its
     own domain: one thread for "read_count", and `n` threads for "scatter".
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     read_count = _kernel(

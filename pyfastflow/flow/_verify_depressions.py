@@ -1,67 +1,4 @@
-"""
-Standalone, re-runnable verification of make_depressions + the
-make_depression_solver Sequence, at a grid scale where the depression graph
-is deep enough for the outer pass count to matter.
-
-What it checks, per backend (taichi/quadrants/cupy), per terrain, and per
-`method` x `reroute` combination: builds a 1024x1024 D8 grid, runs
-make_receivers(mode="steepest") to get an unresolved receiver graph, then
-runs the compiled solver Sequence and inspects the receiver graph it leaves
-behind against a numpy reference:
-
-  - depression_counter == 0 - the device's own count of self-receiving nodes
-    that cannot drain, as the Sequence's last block left it;
-  - the graph is acyclic and every node reaches an outlet - one indegree
-    peel, which processes all n_flat nodes exactly when there is no cycle,
-    plus the check that every root is a can_out node;
-  - every node's receiver is itself or one of its eight grid neighbours -
-    the check that rerouting never wrote a wild index. This one applies to
-    reroute="carve" only: reroute="jump" points a pit straight at its basin's
-    outlet node, which is by construction somewhere across the basin and not
-    a neighbour, so a non-zero `bad_neighbour` there is the algorithm, not a
-    failure. It is measured and printed for both, since the count is what
-    tells the two apart;
-  - flow is conserved - a unit source accumulated over the resolved graph
-    totals n_flat across the roots.
-
-Two terrains, because they stress completely different parts of the pass
-count. The smoothed one (make_smooth_terrain, shared with _verify_accum)
-has basin-scale local minima and long receiver chains. The i.i.d. one has no
-spatial correlation at all, which makes roughly 1/(n_neighbours+1) of the
-interior nodes a local minimum - hundreds of thousands of shallow one-cell
-pits, which is the real stress case for how many passes the outer loop
-needs.
-
-The vanilla/optimized diff is the point of having ported both. Two things
-are compared directly, GPU against GPU:
-
-  - basin labelling. `label_basins_walk` (optimized) is one kernel whose
-    per-thread path-halving races on `rec_jump` and is argued benign because
-    entries only ever move rootward; the vanilla labelling is a fixed
-    logn+1 pointer-jump sweep that cannot race that way. Both are run over
-    the *same* unresolved receiver graph, through a label-only Sequence
-    built here for exactly that purpose, and their `bid` buffers diffed
-    node-for-node.
-  - the resolved receiver graph. `carve_basins_serial` (optimized) walks one
-    serial chain per basin and is argued safe because distinct basins'
-    chains are node-disjoint; the vanilla carve is a tagged pointer-jump
-    sweep. Both, and both jump reroutes, are run from the same starting
-    graph and their final `rec` diffed node-for-node.
-
-Both arguments hold trivially on a small grid and are exactly the kind that
-fails silently at scale, so what is reported is the measured node count that
-disagrees, not the argument.
-
-Pass counts actually taken are read off `Sequence.last_trip_counts` and
-reported per combination - the number a Sequence exists to make observable.
-
-Run:
-    python -m pyfastflow.flow._verify_depressions taichi
-    python -m pyfastflow.flow._verify_depressions quadrants
-    python -m pyfastflow.flow._verify_depressions cupy
-
-Author: B.G (07/2026)
-"""
+"""Numerical verification for depression handling."""
 
 import os
 import sys
@@ -93,7 +30,6 @@ def make_noisy_terrain(nx: int, ny: int, seed: int) -> np.ndarray:
     nodes are pits. Every basin is a handful of cells, and the outer loop has
     to resolve hundreds of thousands of them at once.
 
-    Author: B.G (07/2026)
     """
     rng = np.random.default_rng(seed)
     return rng.random((ny, nx)).astype(np.float32).ravel()
@@ -104,7 +40,6 @@ def edge_mask(nx: int, ny: int) -> np.ndarray:
     The can_out predicate of a grid built boundary="normal", outlet="edge":
     True on the four borders, False everywhere inside.
 
-    Author: B.G (07/2026)
     """
     mask = np.zeros((ny, nx), dtype=bool)
     mask[0, :] = True
@@ -119,7 +54,6 @@ def count_pits(rec: np.ndarray, can_out: np.ndarray) -> int:
     Self-receiving nodes that cannot drain - the same quantity the
     depression_counter kernel accumulates, computed on the host.
 
-    Author: B.G (07/2026)
     """
     return int(np.count_nonzero((rec == np.arange(rec.shape[0])) & ~can_out))
 
@@ -134,7 +68,6 @@ def peel_all_reached(rec: np.ndarray) -> tuple[bool, int]:
     exactly "no cycle", and - since every node's chain then terminates at a
     self-receiver - also "every node reaches a root".
 
-    Author: B.G (07/2026)
     """
     n = rec.shape[0]
     is_root = rec == np.arange(n)
@@ -158,7 +91,6 @@ def check_neighbour(rec: np.ndarray, nx: int, ny: int) -> int:
     Number of nodes whose receiver is neither itself nor one of its eight
     grid neighbours - a D8 receiver is at most one row and one column away.
 
-    Author: B.G (07/2026)
     """
     n = rec.shape[0]
     if rec.min() < 0 or rec.max() >= n:
@@ -176,7 +108,6 @@ def check_all(rec: np.ndarray, nx: int, ny: int, can_out: np.ndarray) -> dict:
     when the graph has a cycle - accumulating over a cyclic graph is not
     defined.
 
-    Author: B.G (07/2026)
     """
     n = rec.shape[0]
     in_range = bool(rec.min() >= 0 and rec.max() < n)
@@ -206,7 +137,6 @@ def _label_only_sequence(backend, deps, grid_params, n_flat, rec, rec_jump, bid,
     labelling block exactly as the solver itself drives it, not a
     re-implementation of the binding logic.
 
-    Author: B.G (08/2026)
     """
     from ..core import SequenceBuilder
     from . import _bind_grid_everywhere, _bind_if_present
@@ -251,7 +181,6 @@ def run(backend: str):
     return (n_flat, rows) - one row per (terrain, method, reroute) plus the
     vanilla-vs-optimized diff rows.
 
-    Author: B.G (08/2026)
     """
     if backend == "taichi":
         import taichi as ti
@@ -390,7 +319,7 @@ def run(backend: str):
             rows.append((terrain_name, f"rec_{reroute}", "vanilla_vs_optimized", None,
                          {"rec_mismatch": int(np.count_nonzero(a != b))}))
 
-    for _solver in solvers.values():  # release each compiled solver's hold on NDEP (Unit 6)
+    for _solver in solvers.values():  # release each compiled solver's hold on NDEP
         _solver.close()
     for _labeller in labellers.values():
         _labeller.close()

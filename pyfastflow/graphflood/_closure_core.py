@@ -1,15 +1,4 @@
-"""
-Taichi/Quadrants (closure) block templates behind make_graphflood's per-step
-core - compute_qo/apply_divergence (the friction-law update, ported from
-../../flood/flood_graphflood_kernels.py's graphflood_core_kernel, split into
-two kernels rather than one two-pass kernel - see the module docstring of
-../graphflood/__init__.py for why the split alone already avoids the race
-the legacy two-pass dh buffer existed for) plus make_surface/h_from_filled
-(the small dedicated kernels the "fill on the z+h surface" local-minima
-option needs to move an elevation-space fill result back into h).
-
-Author: B.G (08/2026)
-"""
+"""Python GraphFlood core templates for Taichi and Quadrants."""
 
 from ..core import FrozenKernel, KernelBuilder
 from ..flow._closure_receivers import build_distance_slope_helpers
@@ -81,7 +70,6 @@ def build_compute_qo(
     ValueError
         If `outlet_behavior` is not recognised.
 
-    Author: B.G (08/2026)
     """
     if outlet_behavior not in _OUTLET_BEHAVIORS:
         raise ValueError(
@@ -152,7 +140,7 @@ def build_apply_divergence(*, backend: str, backend_mod, grid, outlet_behavior: 
     apply_divergence FrozenKernel, data args (h, Q_in, Qo): interior nodes
     always get h[i] = max(0, h[i] + DT*(Q_in[i] - Qo[i])/DX**2), clamped to
     GF_MIN_INCREMENT away from zero whenever Q_in/Qo disagree in sign of net
-    change (ported from graphflood_core_kernel's dh clamp). What happens on
+    change. What happens on
     a can_out node is picked, at build time, by `outlet_behavior` - see
     build_compute_qo's own docstring for the matching Qo-side half of each
     behavior:
@@ -188,7 +176,6 @@ def build_apply_divergence(*, backend: str, backend_mod, grid, outlet_behavior: 
     ValueError
         If `outlet_behavior` is not recognised.
 
-    Author: B.G (08/2026)
     """
     if outlet_behavior not in _OUTLET_BEHAVIORS:
         raise ValueError(
@@ -254,7 +241,6 @@ def build_make_surface(*, backend: str, backend_mod) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -282,7 +268,6 @@ def build_h_from_filled(*, backend: str, backend_mod) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -320,7 +305,6 @@ def build_reset_reconstruct_scratch(*, backend: str, backend_mod) -> dict:
     dict
         {"counters": FrozenKernel, "queued_gen": FrozenKernel}.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -343,8 +327,7 @@ def build_distribute(
 ) -> FrozenKernel:
     """
     distribute FrozenKernel, data args (z, h, Q_in, Q_next) - the
-    graphflood_unstable per-step local redistribution, ported from
-    ../../flood/flood_graphflood_kernels.py's distribute_flow_local_kernel:
+    graphflood_unstable per-step local redistribution:
     no receiver graph, no accumulation, no depression handling - every node
     walks only its own immediate neighbours, splitting its own current
     inflow Q_in[i] across every downslope (h-aware) neighbour in proportion
@@ -355,7 +338,7 @@ def build_distribute(
     current (z, h)) keeps its own inflow in place (Q_next[i] += qi, so it
     is retried next step once h has risen) and nudges h[i] up by
     GF_MIN_INCREMENT - the same "dig it out gradually over many steps"
-    heuristic legacy used, replacing an exact depression solve with
+    heuristic, replacing an exact depression solve with
     something the outer step loop converges towards instead. This is what
     makes the method "unstable": no acyclic-graph guarantee, no filled
     surface, just local redistribution repeated every timestep.
@@ -379,7 +362,6 @@ def build_distribute(
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     slope = build_distance_slope_helpers(
@@ -438,7 +420,6 @@ def build_copy_q(*, backend: str, backend_mod) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 

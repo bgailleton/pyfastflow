@@ -1,10 +1,4 @@
-"""
-New backend-agnostic context architecture (Parameter/Specializable ABCs +
-backends, plus RoutineBuilder/Routine for a linear sequence of kernels
-sharing one bag).
-
-Author: B.G (07/2026)
-"""
+"""Public interfaces for PyFastFlow computation assembly."""
 
 from ..pool.base import DataHandle, Pool, PoolError, new_uid
 from .backends import Backend, require_backend

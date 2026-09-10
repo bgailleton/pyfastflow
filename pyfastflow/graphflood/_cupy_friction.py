@@ -1,10 +1,4 @@
-"""
-cupy (CUDA source) friction-law block behind make_graphflood's compute_qo
-step - mirrors _closure_friction.py block for block (see its module
-docstring for `law`'s dispatch role).
-
-Author: B.G (08/2026)
-"""
+"""CUDA GraphFlood friction templates."""
 
 from ..core import FrozenHelper, HelperBuilder, new_uid
 
@@ -52,7 +46,6 @@ def build_friction_qo(law: str, grid) -> FrozenHelper:
     ValueError
         If `law` is not a recognised friction law.
 
-    Author: B.G (08/2026)
     """
     if law not in _LAWS:
         raise ValueError(f"build_friction_qo: law must be one of {sorted(_LAWS)}, got {law!r}")

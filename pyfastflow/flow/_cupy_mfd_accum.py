@@ -1,72 +1,4 @@
-"""
-cupy-only persistent-kernel MFD accumulation ("persistent_mfd" method of
-make_accumulation), on the new builder/frozen/bound stack (../core/context/
-builder.py, frozen.py, bound.py) - see make_accumulation's own docstring for
-the call-site contract.
-
-No Taichi/Quadrants counterpart, and there never should be one: the
-mechanism is a hand-rolled, monotonic grid-wide barrier (a global atomic
-counter every block increments then spins on, level by level) around a
-persistent kernel that is launched exactly once and loops internally over
-levels - built on CUDA's raw `__global__`/`__shared__`/`atomicAdd`/
-`__threadfence()` primitives, none of which the closure backends' kernel
-model (one `ti.kernel`/Quadrants kernel per launch, no persistent-thread
-loop, no portable grid-wide barrier inside one kernel) can express.
-
-Algorithm (level-synchronous, double-buffered frontier, shared-memory
-staging): each level, every resident thread of a fixed, small grid pulls
-node indices from `frontier[p]` (size `count[p]`, grid-stride loop). For
-node u, the receiver mask `dirs[u]` (bit k set == direction k, this grid's
-own D8 numbering) picks which of `mfd_w[u*NN + k]` weights to atomic-add
-`accum[u]` into `accum[neighbour]` (`ctx.grid.neighbour_raw(u, k)` - the
-grid's own raw neighbour arithmetic, trusted the same way the mask itself is
-trusted to have only ever set bits for directions the topology already
-validated). A `__threadfence()` publishes every one of those writes before
-any thread decrements `indegree[neighbour]`; a decrement that lands the
-count exactly on zero stages that neighbour into a per-block shared buffer
-(`s_buf`, capacity `fr_stage`), spilling to a direct `atomicAdd` into
-`count[1-p]` past that capacity. After the grid-stride loop, each block
-flushes its staged cells into `frontier[1-p]` through one reserved
-contiguous range (one `atomicAdd` per block, not per cell), fences again,
-then every block increments the global `barrier` counter and spins until it
-reads `(level+1) * gridDim.x` - the point every block has published
-everything for this level - before moving on. The loop exits once
-`count[p]`, reloaded through a volatile pointer each iteration, is zero.
-
-`accum` is seeded through a `SOURCE` PARAM slot (any mode - a caller binds a
-Parameter there after `.build()`) by a separate `q_init` kernel, not
-hardcoded to 1.0: the persistent kernel's very first level reads `accum[u]`
-for every cell already in the initial frontier before any atomic_add has
-landed on it, so that seed must be a prior, real, finished launch - the same
-reasoning `_cupy_accum.py`'s `build_atomic` splits `q_init`/`accum` on.
-
-`dirs`, `mfd_w`, `indegree`, `frontier0`, `frontier1`, `count`, `barrier`
-are all caller-supplied data args, exactly like `rec` is for the SFD
-methods in `_cupy_accum.py` - this module does not build MFD topology
-(mask/weights/indegree computation), only accumulation over an
-already-built one. `count` is 2 int32 (`count[0]`, `count[1]`, the two
-ping-pong frontier sizes) and `barrier` is 1 uint32; initializing them
-(`count[p] = n0` from the ready-cell count, `count[1-p] = 0`,
-`barrier[0] = 0`, `frontier[p][:n0] = <ready cell indices>`) is the
-caller's job before every call - see `init_frontier_mfd` below for the
-host-side compaction step, kept as a plain function rather than a builder
-member since it is pure host/cupy indexing, not a kernel.
-
-`n_neighbours` (D4=4/D8=8) is a required build-time python int, not read off
-`grid` the way the pre-port script read it from a bound Parameter: this
-factory's `grid` is a bare `make_grid_group` FrozenGroup (structure only, no
-bound Parameter values - see ../grid/__init__.py's own module docstring), so
-there is no build-time value to read off it, the same reason
-make_accumulation's own `method="atomic"` requires `n_flat` explicitly under
-this stack. Baking it in as `{NN}` (rather than reading it at runtime via
-`ctx.grid.N_NEIGHBOURS.get(0)`, the pattern every other ported flow block
-uses) preserves the pre-port script's `#pragma unroll` on the two per-node
-direction loops - deliberately kept, not dropped for uniformity with those
-other blocks, since this is the one hot loop in the package still doing a
-fully unrolled fixed-trip-count neighbour walk.
-
-Author: B.G (08/2026)
-"""
+"""Persistent CUDA kernel for multiple-flow accumulation."""
 
 import cupy as cp
 
@@ -94,7 +26,6 @@ def persistent_grid_block(*, blocks_per_sm: int = 2, threads: int = 256) -> tupl
     tuple
         (grid, block) launch dims.
 
-    Author: B.G (08/2026)
     """
     sm_count = cp.cuda.Device().attributes["MultiProcessorCount"]
     return (blocks_per_sm * sm_count,), (threads,)
@@ -121,7 +52,6 @@ def init_frontier_mfd(indegree_data, frontier_data) -> int:
     int
         Count of cells with indegree 0.
 
-    Author: B.G (08/2026)
     """
     ready = cp.nonzero(indegree_data == 0)[0].astype(cp.int32)
     n = int(ready.size)
@@ -174,7 +104,6 @@ def build_persistent_mfd(
     dict
         {"q_init": FrozenKernel, "accum": FrozenKernel}.
 
-    Author: B.G (08/2026)
     """
     NN = int(n_neighbours)
     t = f"pm{new_uid()}"

@@ -1,38 +1,10 @@
-"""
-cupy (CUDA source) block templates behind make_noise_group.
-
-Mirrors _closure_blocks.py block for block - same private/public split, same
-`kind` selector deciding which chain `at(i)` is wired to - written as CUDA
-text instead of python defs. Every span reaching a PARAM is spelled
-`$ctx.NAME.get(...)$` in full, exactly like grid/_cupy_blocks.py; every span
-reaching a composed HELPER is spelled `$ctx.name(args)$`.
-
-No `ctx.bk` here - cupy stays plain C, as grid/_cupy_blocks.py's own module
-docstring already establishes for this backend: `floorf`, `(int)`/`(float)`
-casts and a plain `0x846CA68Bu` literal are the native spelling, and the
-python/cupy template surfaces are already a different grammar by design (see
-core/context/bk.py's own module docstring for why `ctx.bk` is deliberately
-excluded from cupy).
-
-Every device function name is prefixed with this noise group's own tag (a
-fresh new_uid()), so two make_noise_group() calls in one process never
-collide inside a single compiled cupy module even if both are bound into the
-same kernel - see grid/_cupy_blocks.py.
-
-Author: B.G (08/2026)
-"""
+"""CUDA white- and Perlin-noise templates for CuPy."""
 
 from ..core import freeze_helper as _helper, new_uid
 
 
 def build_hash_u32():
-    """
-    The standalone hash_u32(x) FrozenHelper - no bound Parameters, so it can
-    be built with nothing else in hand. See _closure_blocks.py's
-    build_hash_u32 for why this exists.
-
-    Author: B.G (08/2026)
-    """
+    """Build the standalone integer hash helper."""
     t = f"pn{new_uid()}"
     return _helper(
         f"""
@@ -50,16 +22,7 @@ __device__ unsigned int {t}_hash_u32(unsigned int x) {{
 
 
 def build_group(group, *, kind):
-    """
-    Compose every private block and public helper for the cupy backend onto
-    `group` (a GroupBuilder), picking the white or Perlin chain from `kind`.
-
-    Returns nothing - every public helper (`at`, `hash_u32`, and
-    `white_unit`/`perlin_at`) is compose()d onto `group` itself, under its
-    own public name, by this call.
-
-    Author: B.G (08/2026)
-    """
+    """Compose the selected CuPy noise helpers onto ``group``."""
     t = f"pn{new_uid()}"
 
     row = _helper(f"__device__ int {t}_row(int i) {{ return i / $ctx.NX.get(0)$; }}")

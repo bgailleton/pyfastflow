@@ -1,43 +1,4 @@
-"""
-Standalone, re-runnable verification of make_fill_reconstruct +
-make_fill_reconstruct_solver, against an independent numpy/heapq
-priority-flood reference (Barnes 2014) - a different algorithm computing the
-same fixed point, not a second copy of the frontier-relaxation logic under
-test.
-
-What it checks, per backend (taichi/quadrants/cupy), per terrain: builds a
-grid, runs the solver, and inspects `filled`/`parent` against the reference:
-
-  - `filled` matches the numpy priority-flood reference to within a small f32
-    tolerance, everywhere - the actual correctness question, independent of
-    how the device got there;
-  - `filled[i] >= z[i]` everywhere (never fills below true elevation) and
-    `filled[i] == z[i]` at every can_out (root) node - the two boundary
-    conditions the fixed point must satisfy;
-  - the local fixed-point condition itself: `filled[i] == max(z[i],
-    filled[parent[i]])` for every non-root i - if this fails while `filled`
-    still matches the reference, relax converged to the right values through
-    a parent graph that doesn't actually explain them;
-  - `parent` never left at -1 (every node claimed) and never wanders outside
-    self-or-a-D8-neighbour (a wild write during relax) - the same
-    `bad_neighbour` check _verify_depressions.py uses for reroute="carve";
-  - the receiver graph `parent` forms is acyclic and every node reaches a
-    can_out root - one indegree peel, reused from _verify_depressions;
-  - flow is conserved - a unit source accumulated over `parent` totals n_flat
-    across the roots.
-
-SIDE is smaller than _verify_depressions.py's 1024: the reference here is a
-pure-python heapq priority flood (no numpy vectorization is possible for a
-priority queue), so its own cost, not the GPU solver's, sets the practical
-grid size for a script meant to be run once and read.
-
-Run:
-    python -m pyfastflow.flow._verify_fill_reconstruct taichi
-    python -m pyfastflow.flow._verify_fill_reconstruct quadrants
-    python -m pyfastflow.flow._verify_fill_reconstruct cupy
-
-Author: B.G (07/2026)
-"""
+"""Numerical verification for fill-and-reconstruct routing."""
 
 import heapq
 import sys
@@ -62,7 +23,6 @@ def numpy_priority_flood(z: np.ndarray, nx: int, ny: int, can_out: np.ndarray) -
     the same fixed point grayscale reconstruction converges to, computed by
     a completely different (serial, heap-ordered) algorithm.
 
-    Author: B.G (07/2026)
     """
     n = nx * ny
     filled = np.full(n, np.inf, dtype=np.float64)
@@ -96,7 +56,6 @@ def check_all(filled: np.ndarray, parent: np.ndarray, z: np.ndarray, ref: np.nda
     Every post-solve invariant plus the reference comparison, as a dict of
     measured counts/values (0 / small means the invariant holds).
 
-    Author: B.G (07/2026)
     """
     n = filled.shape[0]
     out = {}
@@ -128,7 +87,6 @@ def run(backend: str):
     """
     Build the solver once, run it over two terrains, and return (n_flat, rows).
 
-    Author: B.G (08/2026)
     """
     if backend == "taichi":
         import taichi as ti
@@ -206,7 +164,7 @@ def run(backend: str):
         checks["active_final"] = int(active_p.read())
         rows.append((terrain_name, checks))
 
-    solver.close()  # release the compiled sequence's hold on the Parameters (Unit 6)
+    solver.close()  # release the compiled sequence's hold on the Parameters
     pass_p.destroy()
     active_p.destroy()
     for h in (z, filled, parent, frontier, queued_gen, counters):

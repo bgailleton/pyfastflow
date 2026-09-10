@@ -1,9 +1,4 @@
-"""
-cupy (CUDA source) block templates behind make_graphflood's per-step core -
-mirrors _closure_core.py block for block (see its module docstring).
-
-Author: B.G (08/2026)
-"""
+"""CUDA GraphFlood core templates."""
 
 from ..core import FrozenKernel, KernelBuilder, new_uid
 from ..flow._cupy_receivers import build_distance_slope_helpers
@@ -44,7 +39,6 @@ def build_compute_qo(
     ValueError
         If `outlet_behavior` is not recognised.
 
-    Author: B.G (08/2026)
     """
     if outlet_behavior not in _OUTLET_BEHAVIORS:
         raise ValueError(
@@ -118,7 +112,6 @@ def build_apply_divergence(*, grid, n_flat: int, outlet_behavior: str = "fixed_h
     ValueError
         If `outlet_behavior` is not recognised.
 
-    Author: B.G (08/2026)
     """
     if outlet_behavior not in _OUTLET_BEHAVIORS:
         raise ValueError(
@@ -174,7 +167,6 @@ def build_make_surface(*, n_flat: int) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     t = f"gfs{new_uid()}"
     return (
@@ -202,7 +194,6 @@ def build_h_from_filled(*, n_flat: int) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     t = f"gfh{new_uid()}"
     return (
@@ -235,7 +226,6 @@ def build_reset_reconstruct_scratch(*, n_flat: int, counters_size: int) -> dict:
     dict
         {"counters": FrozenKernel, "queued_gen": FrozenKernel}.
 
-    Author: B.G (08/2026)
     """
     t = f"gfr{new_uid()}"
     counters_kb = (
@@ -286,7 +276,6 @@ def build_distribute(*, grid, n_flat: int, topology: str, diagonal_partition_cor
     dict
         {"zero": FrozenKernel, "route": FrozenKernel}.
 
-    Author: B.G (08/2026)
     """
     slope = build_distance_slope_helpers(
         grid, topology=topology, diagonal_partition_correction=diagonal_partition_correction
@@ -358,7 +347,6 @@ def build_copy_q(*, n_flat: int) -> FrozenKernel:
     -------
     FrozenKernel
 
-    Author: B.G (08/2026)
     """
     t = f"gfq{new_uid()}"
     return (

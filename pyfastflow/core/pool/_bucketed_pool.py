@@ -1,8 +1,4 @@
-"""
-Shared bucketed Pool implementation, parameterized by a DataHandle subclass.
-
-Author: B.G (07/2026)
-"""
+"""Pool implementation that reuses buffers with matching dtype and shape."""
 
 from typing import Any, ClassVar
 
@@ -10,12 +6,7 @@ from .base import DataHandle, Pool, PoolError
 
 
 class BucketedPool(Pool):
-    """
-    Pool manager bucketed by (dtype, shape). Subclasses only pin
-    `_handle_cls` to the DataHandle implementation they allocate.
-
-    Author: B.G (07/2026)
-    """
+    """Shared pool implementation; subclasses select the handle type."""
 
     _handle_cls: ClassVar[type]
 

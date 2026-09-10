@@ -1,58 +1,4 @@
-"""
-Taichi/Quadrants (closure) block templates behind make_depressions/
-make_depression_solver: copy_field, both basin labelling variants,
-saddlesort, both carve variants, jump reroute, and the depression counter -
-on the new builder/frozen/bound/routine/sequence stack (../core/context/
-builder.py, frozen.py, bound.py, routine.py, sequence.py).
-
-See _closure_receivers.py/_closure_accum.py/_closure_reconstruct.py for
-the other flow algorithms. Based on ../../flow/flow_reroute_kernels.py,
-`pack`/`unpack_value`/`unpack_index`
-composed from ops.make_bitpack_group (a FrozenGroup, `ctx.bitpack.pack(f,
-i)`) in place of legacy's f32_i32_struct module. Every array here (rec, bid,
-tag, basin_saddle, outlet, ...) is n_flat-sized, basin id = pit index + 1, so
-a per-basin array is safely indexed by any node index too - the same double
-duty the legacy kernels rely on.
-
-`grid` is the caller's FrozenGroup (../grid's make_grid_group result),
-composed under the name "grid" onto whichever KernelBuilder needs
-`ctx.grid.can_out(i)`/`ctx.grid.neighbour(i, k)`/`ctx.grid.N_NEIGHBOURS.
-get(0)` - exactly the idiom _closure_receivers.py's build_receivers already
-established; `ctx.grid.N_NEIGHBOURS.get(0)` inside `range(...)` resolves to a
-plain python int at trace time when N_NEIGHBOURS is bound const-mode (the
-make_grid_parameters default), unrolling the neighbour loop exactly as
-receivers' own does. Every site here composes its own independent occurrence
-of `grid` - basin_id_init/label_basins_walk/border_zprime/atomic_min_saddle/
-find_saddlenode/atomic_min_outlet/depression_counter each mint their own
-`{step}.grid.NX`/etc address (build-phase sharing, `share()`, only collapses
-occurrences *within* one KernelBuilder's own composed subtree - never across
-sibling steps of a routine/sequence, see bound.py's own module docstring and
-_closure_accum.py's ITER note), so a caller binds the same grid Parameter
-object at every one of those addresses - enumerated per build_* docstring
-below, the same multi-address idiom make_accumulation's `ITER`/`SOURCE`
-already established.
-
-`n_flat`, where needed (label_basins_walk's/depression_counter's guard
-bounds, saddlesort/reroute have none), is a plain build-time python int -
-this factory takes no pool and reads no Parameter for it, consistent with
-"atomic" (_closure_accum.py) requiring it explicitly rather than reading a
-bare FrozenGroup's absent bound values.
-
-A fixed, build-time-constant repeat (propagate_basin_iter's `logn+1` rounds
-inside vanilla basin labelling) is unrolled as `logn+1` distinct routine
-compose() names for the SAME propagate_basin_iter FrozenKernel - the
-instancing idiom routine.py's own module docstring documents ("composing
-the same FrozenKernel object under two different step names... two
-independently bindable slot sets") - not a SequenceBuilder loop: unlike
-rake_compress_accum's own host-invisible bump, there is no per-round host
-readback here, the round count is a plain python int fixed at build time, so
-there is nothing a loop's host-side bookkeeping buys over a flat unroll (the
-same choice ../ops/_closure_blocks.py's build_scan_routine makes for its own
-log-depth passes, contrasted with _closure_accum.py's own SequenceBuilder
-loop for rake_compress_accum's per-round-identical body).
-
-Author: B.G (08/2026)
-"""
+"""Taichi and Quadrants templates for depression handling."""
 
 from ..core import KernelBuilder, RoutineBuilder
 from ._closure_shared import _tensor_annotation
@@ -77,7 +23,6 @@ def build_copy_field(*, backend: str, backend_mod):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -106,7 +51,6 @@ def build_basin_id_init(*, backend: str, backend_mod, grid):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -133,7 +77,6 @@ def build_propagate_basin_iter(*, backend: str, backend_mod):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -162,7 +105,6 @@ def build_propagate_basin_final(*, backend: str, backend_mod):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -177,8 +119,8 @@ def build_basin_labelling_vanilla(*, backend: str, backend_mod, grid, copy_field
     """
     RoutineBuilder (routine) for vanilla basin labelling: basin_id_init(bid);
     copy_field(rec -> rec_jump); logn+1 unrolled propagate_basin_iter(rec_jump)
-    rounds (composed under "propagate_iter_0".."propagate_iter_{logn}" - see
-    the module docstring for the unroll-vs-loop choice); propagate_basin_final
+    rounds (composed under ``propagate_iter_0`` through
+    ``propagate_iter_{logn}``); propagate_basin_final
     (bid, rec_jump).
 
     Composed step names: "basin_id_init", "copy_rec_to_recjump",
@@ -209,7 +151,6 @@ def build_basin_labelling_vanilla(*, backend: str, backend_mod, grid, copy_field
         "copy_field" - the caller's own to keep track of, shared across
         every routine that needs a copy).
 
-    Author: B.G (08/2026)
     """
     basin_id_init = build_basin_id_init(backend=backend, backend_mod=backend_mod, grid=grid)
     propagate_basin_iter = build_propagate_basin_iter(backend=backend, backend_mod=backend_mod)
@@ -255,7 +196,6 @@ def build_basin_labelling_optimized(*, backend: str, backend_mod, grid, n_flat: 
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     NFLAT = n_flat
@@ -284,7 +224,6 @@ def build_label_from_route(*, backend: str, backend_mod, grid):
     via accumulated merges - unlike re-deriving from the carved receivers.
     Data args (bid, basin_route); composes `grid` for `can_out`.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -311,7 +250,6 @@ def build_basin_labelling_route(*, backend: str, backend_mod, grid, logn: int):
     Returns (routine_builder, kernels_dict) with keys "propagate_basin_iter"
     (the shared unrolled kernel) and "label_from_route".
 
-    Author: B.G (08/2026)
     """
     propagate_basin_iter = build_propagate_basin_iter(backend=backend, backend_mod=backend_mod)
     label_from_route = build_label_from_route(backend=backend, backend_mod=backend_mod, grid=grid)
@@ -335,7 +273,6 @@ def build_merge_basin_route(*, backend: str, backend_mod, bitpack):
     basin_route); composes `bitpack` for `unpack_index`. basin id = pit + 1, so
     basin i's pit is node i - 1.
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -376,8 +313,8 @@ def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
     ".basin_saddlenode"/".z"/".outlet", "break_cycle.bid"/".outlet"/
     ".basin_saddle"/".basin_saddlenode". PARAM addresses: "border_zprime.
     grid.*", "atomic_min_saddle.grid.*", "find_saddlenode.grid.*",
-    "atomic_min_outlet.grid.*" - four independent grid occurrences, same
-    Parameter bound at each (see the module docstring).
+    ``atomic_min_outlet.grid.*`` — four independent grid occurrences, with
+    the same Parameter bound at each.
 
     Parameters
     ----------
@@ -393,7 +330,6 @@ def build_saddlesort(*, backend: str, backend_mod, grid, bitpack):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -526,7 +462,7 @@ def build_reroute_carve_vanilla(*, backend: str, backend_mod, bitpack, copy_fiel
     propagate `tag` quickly; the actual edge reversal in finalise operates
     on the original chain, which is why finalise's own first statement
     resets `rec` from that original snapshot before reversing anything -
-    ported exactly as legacy's flow_reroute_kernels.py has it.
+    This encoding stores the pit index plus one.
 
     Composed step names: "init_reroute_carve", "copy_recwork_to_rec",
     "copy_recwork_to_recjump", "iteration_carve_0".."iteration_carve_{logn}",
@@ -549,7 +485,6 @@ def build_reroute_carve_vanilla(*, backend: str, backend_mod, bitpack, copy_fiel
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -643,7 +578,6 @@ def build_reroute_carve_optimized(*, backend: str, backend_mod, bitpack, n_flat:
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
     NFLAT = n_flat
@@ -678,7 +612,7 @@ def build_reroute_jump(*, backend: str, backend_mod, bitpack):
 
     The write is deliberately `rec[i - 1]`, not `rec[i]`: the loop is over
     basin ids (`i` ranges over `outlet`'s own index space) and basin id =
-    pit index + 1, so `i - 1` is the pit node. Ported exactly as legacy has
+    pit index + 1, so `i - 1` is the pit node.
     it - see _cupy_depressions.py's build_reroute_jump and make_depressions'
     docstring for the same note.
 
@@ -696,7 +630,6 @@ def build_reroute_jump(*, backend: str, backend_mod, bitpack):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 
@@ -739,7 +672,6 @@ def build_depression_counter(*, backend: str, backend_mod, grid):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     T = _tensor_annotation(backend_mod, backend)
 

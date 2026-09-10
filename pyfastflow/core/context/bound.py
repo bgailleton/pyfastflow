@@ -1,82 +1,4 @@
-"""
-The bind phase: `Node.build()` (frozen.py) mints one of these, then bind() its
-slots freely, any number of times, in any order, before compile() emits the
-real device callable. See parameter.py's module docstring for the overall
-build -> bind -> compile scheme.
-
-One walk, one address table
-----------------------------
-`walk(node) -> (table, redirect, roots)` is the single walker for every node
-kind (kernel, helper, group, hostblock, routine, sequence). It recurses
-`node.children`, mints one PARAM/DATA leaf per full dotted path under each
-child's own name, and returns:
-
-  table     {full address -> _LeafInfo} - every independently-bindable leaf.
-  redirect  {collapsed address -> canonical address} - build-phase-shared
-            leaves that were NOT minted independently (see below).
-  roots     {full child address -> Node} - every addressable child root
-            reached, metadata for structural validation, not a bindable leaf.
-
-Addressing is by qualified dotted path rooted at the explicit name a slot or a
-child was given - `flux.grad.z`, never a positional `step0.*`. Every address is
-a segment tuple (`Address`) internally so a path/glob layer can match per
-segment; `parse_address`/`format_address` convert to and from a dotted string.
-Only PARAM/DATA leaves get a table entry - a prefix naming a child rather than
-one of its leaves (`flux.grad.grid` vs `flux.grad.grid.NX`) is in `roots`, not
-`table`, so binding it raises "unknown address" like any other typo.
-
-Build-phase sharing
---------------------
-A node may declare (`_Builder.share()`, builder.py; `node.shared`) that several
-paths in its own composed subtree mean the same value as one canonical path -
-grid's `neighbour_raw.row.NX` and `is_on_edge.row.NX` both mean the grid's own
-`NX`, because a device template can only call what is composed directly onto
-its own scope, so grid's public helpers each re-compose the same private
-`row`/`col` blocks under their own local names. Left alone, walk would mint one
-independent address per occurrence; sharing collapses them so a caller binds
-one `NX`, not seventeen.
-
-A shared entry's path may name a PARAM leaf, a DATA leaf, or a whole child root
-(then every leaf under it redirects to the same leaf under the canonical
-child). Collapsed leaves are recorded in `redirect` (collapsed -> canonical)
-instead of `table`; the canonical is minted normally. `value_at()` resolves a
-redirect in one hop; bind()/unmet()/addresses()/inspect() never consult it, so
-a collapsed address is genuinely absent from every caller-facing listing -
-`.addresses()` after composing a D8 grid reports one `NX`.
-
-Nested sharing: `_ShareScope` and outermost-wins
--------------------------------------------------
-A shared node may itself compose another shared node (visu's hillshade group
-composing grid under each of two private gradient blocks). Both layers apply at
-once, so each node's `.shared` is captured as a `_ShareScope` tagged with the
-full address (`start`) its paths are relative to, and scopes are threaded
-through the recursion outermost-first. `_resolve_shared` checks every active
-scope against each leaf, OUTERMOST first, first match winning outright.
-
-Outermost-first is deliberate and load-bearing: an outer scope's canonical is
-always an unconditionally minted address (a node's own top-level slots are
-checked only against ENCLOSING scopes, never its own, so a canonical never
-itself redirects), so resolving outer-first can never produce a redirect that
-points at another redirect. Inner-first could: an inner scope might collapse a
-leaf onto an address that the outer scope collapses further, leaving a redirect
-whose target is itself redirected - which `value_at`'s single hop would not
-chase. `_compress_redirects` resolves any such chain to its terminal minted
-address at the end of the walk, so `value_at`'s single hop always lands.
-
-`split` (transitional, no live caller) exempts specific relative paths from one
-scope's collapse; an exempted leaf falls through to the next scope or mints
-independently.
-
-bind
-----
-`bind(addr, obj)` fills a leaf; rebinding is normal (immutability belongs to
-the compiled artifact, not a slot). PARAM accepts any Parameter of any mode;
-DATA checks the dtype declared with data(), if any. `None` is rejected -
-it is reserved to mean "unbound" (see value_at). `bind_leaf` is the bulk form;
-`bind_into` is the copy-down routine/sequence compile use.
-
-Author: B.G (09/2026)
-"""
+"""Bind concrete parameters and data handles to frozen computation recipes."""
 
 from typing import Any, NamedTuple
 
@@ -97,7 +19,6 @@ class BindError(PyFastFlowError):
     wrong kind of object or the wrong dtype, or walk() finding a wired HELPER
     slot with nothing composed into it. Every case names the exact address.
 
-    Author: B.G (08/2026)
     """
 
 
@@ -118,9 +39,8 @@ def _refcount(obj: Any, delta: int) -> None:
     Adjust `obj._bound_by` by `delta` if `obj` has one (a Parameter or a
     DataHandle). Objects with no `_bound_by` - a raw backend array bound to a
     DATA slot today - are left alone; DATA refcounting activates when DATA binds
-    handles (Unit 8). `None` (an unbound slot) is skipped.
+    handles. `None` (an unbound slot) is skipped.
 
-    Author: B.G (09/2026)
     """
     if obj is not None and hasattr(obj, "_bound_by"):
         obj._bound_by += delta
@@ -133,7 +53,6 @@ class _LeafInfo(NamedTuple):
     left open). Distinct from the bound value, which lives in `_Bound._values`
     and changes freely via bind().
 
-    Author: B.G (08/2026)
     """
 
     kind: SlotKind
@@ -150,7 +69,6 @@ class _ShareScope(NamedTuple):
     is `full_addr[len(start):]`. `shared_paths` maps a relative path (a leaf, or
     a child root) to this scope's canonical FULL address.
 
-    Author: B.G (09/2026)
     """
 
     start: Address
@@ -168,7 +86,6 @@ def _resolve_shared(full_addr: Address, scopes: "list[_ShareScope]") -> "Address
     the leaf. A returned canonical may itself be redirected further; the walk's
     final compression pass resolves such chains to their terminal address.
 
-    Author: B.G (09/2026)
     """
     for scope in scopes:
         rel = full_addr[len(scope.start) :]
@@ -198,7 +115,6 @@ def _mint_leaf(
     collapses it, an independent `table` entry otherwise. The canonical may be
     another redirect key; `_compress_redirects` resolves the chain at the end.
 
-    Author: B.G (09/2026)
     """
     canonical = _resolve_shared(full, scopes)
     if canonical is not None:
@@ -220,9 +136,8 @@ def _walk_node(
     against ENCLOSING `scopes` only - a node's canonical is never redirected by
     its own sharing), pushes this node's own scope (from `node.shared`) for the
     descent, walks its synthetic roots/leaves (the targets share(as_=...)
-    minted), then recurses each real child. See the module docstring.
+    minted), then recurses each real child.
 
-    Author: B.G (09/2026)
     """
     for name in node.slots.names(SlotKind.PARAM):
         _mint_leaf(prefix + (name,), _LeafInfo(SlotKind.PARAM, None), table, redirect, scopes)
@@ -265,7 +180,6 @@ def _compress_redirects(
     (nested sharing over an already-internally-sharing node) is followed to the
     end; a cycle, or a terminal that names no minted address, raises BindError.
 
-    Author: B.G (09/2026)
     """
     for src in list(redirect):
         target = redirect[src]
@@ -288,7 +202,6 @@ def walk(node: Node) -> "tuple[dict[Address, _LeafInfo], dict[Address, Address],
     Walk `node`'s whole tree and return `(table, redirect, roots)` - see the
     module docstring for each. The single walker behind every `Node.build()`.
 
-    Author: B.G (09/2026)
     """
     table: dict[Address, _LeafInfo] = {}
     redirect: dict[Address, Address] = {}
@@ -308,7 +221,6 @@ def collect_share_decls(node: Node) -> "list[tuple[Address, Address]]":
     own internal leaf sharing - are that child's business and stay out of this
     listing; the collapse still shows in `.addresses()` reporting one canonical.
 
-    Author: B.G (09/2026)
     """
     return [(src, can) for src, can in node.shared.items()]
 
@@ -317,7 +229,6 @@ def _format_state(info: _LeafInfo, value: Any) -> str:
     """
     The state column of one inspect() line - see _Bound.inspect.
 
-    Author: B.G (08/2026)
     """
     if value is None:
         return "UNBOUND"
@@ -345,7 +256,6 @@ def _short_dtype(dtype: Any) -> str:
     back to `str(dtype)` for a Taichi/Quadrants token, which already prints
     short.
 
-    Author: B.G (08/2026)
     """
     try:
         name = np.dtype(dtype).name
@@ -364,7 +274,6 @@ class _Bound:
     Shared machinery behind every Bound* kind. Not instantiated directly - see
     `Node.build()` (frozen.py) and `walk` above.
 
-    Author: B.G (09/2026)
     """
 
     def __init__(
@@ -410,7 +319,6 @@ class _Bound:
         either transparently. `None` unambiguously means "unbound" (bind()
         rejects None), which the copy-down in `bind_into` relies on.
 
-        Author: B.G (09/2026)
         """
         return self._values.get(self._addr_or_redirect(addr))
 
@@ -421,7 +329,6 @@ class _Bound:
         neither. Only value_at() uses this; bind() uses `_addr` (a collapsed
         address is not independently bindable).
 
-        Author: B.G (09/2026)
         """
         a = parse_address(addr) if isinstance(addr, str) else tuple(addr)
         if a in self._table:
@@ -444,7 +351,6 @@ class _Bound:
         walk() minted is filled - the precondition compile() checks first
         (compile_shared.check_unmet).
 
-        Author: B.G (09/2026)
         """
         return sorted(addr for addr in self._table if self._values.get(addr) is None)
 
@@ -468,10 +374,9 @@ class _Bound:
         The child root Node at `path` - a real composed child or a synthetic
         root minted by share(as_=...) - resolved by exact path. Raises
         BindError for a leaf address or an unknown path. This is the structural
-        surface Program bundle validation (Unit 9) resolves a bundle root
+        surface Program bundle validation resolves a bundle root
         against, rather than inferring roots from string prefixes.
 
-        Author: B.G (09/2026)
         """
         a = parse_address(path) if isinstance(path, str) else tuple(path)
         node = self._roots.get(a)
@@ -493,7 +398,6 @@ class _Bound:
         Raises BindError if `addr` is unknown, `obj` is None (reserved for
         "unbound"), or `obj` is the wrong kind/dtype for its slot.
 
-        Author: B.G (09/2026)
         """
         self._check_open("bind")
         if obj is None:
@@ -549,9 +453,8 @@ class _Bound:
         `_bound_by` of every Parameter/handle it still holds, clear its values,
         and mark it closed. Idempotent. bind()/compile() after close raise. A
         Parameter/handle can be destroyed/released only once every Bound and
-        compiled object holding it has been closed. See the module docstring.
+        compiled object holding it has been closed.
 
-        Author: B.G (09/2026)
         """
         if self._closed:
             return
@@ -576,7 +479,6 @@ class _Bound:
         fill a freshly-built per-step/per-block bound object from this outer
         address space before compiling it.
 
-        Author: B.G (09/2026)
         """
         for local_addr in child_bound.addresses():
             val = self.value_at(prefix + local_addr)
@@ -593,7 +495,6 @@ class _Bound:
         recurring under two different meanings at two different prefixes.
         `strict=True` raises if any key matched no address under `prefix`.
 
-        Author: B.G (09/2026)
         """
         p = parse_address(prefix) if isinstance(prefix, str) else tuple(prefix)
         plen = len(p)
@@ -629,7 +530,6 @@ class _Bound:
         -> grid.*`) or leaf (`slope.z -> z`) - so a caller sees exactly what is
         not independently bindable and which canonical to bind instead.
 
-        Author: B.G (09/2026)
         """
         rows: list[tuple[str, str, str, str]] = []
         for addr in sorted(self._table):
@@ -683,7 +583,6 @@ class _Bound:
         bound Parameter/handle. Raises CompileError on a mismatch or when none
         can be determined.
 
-        Author: B.G (09/2026)
         """
         from .backends import Backend
         from .compile_shared import CompileError
@@ -713,9 +612,8 @@ class _Bound:
 
 class BoundKernel(_Bound):
     """
-    The bound result of build()-ing a FrozenKernel. See the module docstring.
+    The bound result of build()-ing a FrozenKernel.
 
-    Author: B.G (08/2026)
     """
 
     def compile(self, backend=None) -> Any:
@@ -729,7 +627,6 @@ class BoundKernel(_Bound):
         binding a Parameter/handle - the recorded one is used. Passing a backend
         that differs from the recorded one raises CompileError.
 
-        Author: B.G (09/2026)
         """
         self._check_open("compile")
         be = self._resolve_backend(backend)
@@ -743,7 +640,6 @@ class _BoundNonCallable(_Bound):
     only as part of the BoundKernel that composes them. See the module
     docstring.
 
-    Author: B.G (09/2026)
     """
 
     def compile(self, backend=None) -> Any:
@@ -752,7 +648,6 @@ class _BoundNonCallable(_Bound):
         backend. Compose its frozen node into a KernelBuilder and compile the
         resulting BoundKernel.
 
-        Author: B.G (09/2026)
         """
         raise BindError(
             f"{type(self).__name__}.compile() is not supported: it has no standalone compiled "
@@ -764,9 +659,8 @@ class _BoundNonCallable(_Bound):
 class BoundHelper(_BoundNonCallable):
     """
     The bound result of build()-ing a FrozenHelper. Compiled only as part of
-    the BoundKernel that composes it. See the module docstring.
+    the BoundKernel that composes it.
 
-    Author: B.G (09/2026)
     """
 
 
@@ -774,9 +668,8 @@ class BoundGroup(_BoundNonCallable):
     """
     The bound result of build()-ing a FrozenGroup. A group is a navigable
     composite with no callable form of its own; compiled only as part of the
-    BoundKernel that composes it. See the module docstring.
+    BoundKernel that composes it.
 
-    Author: B.G (09/2026)
     """
 
 

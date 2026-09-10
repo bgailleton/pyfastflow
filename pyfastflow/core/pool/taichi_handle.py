@@ -1,8 +1,4 @@
-"""
-Taichi backend implementation of DataHandle.
-
-Author: B.G (07/2026)
-"""
+"""Taichi field-backed DataHandle."""
 
 import taichi as ti
 
@@ -10,11 +6,7 @@ from ._fields_handle import FieldsBuilderDataHandle
 
 
 class TaichiDataHandle(FieldsBuilderDataHandle):
-    """
-    DataHandle backed by one Taichi field.
-
-    Author: B.G (07/2026)
-    """
+    """Handle backed by one Taichi field."""
 
     _BACKEND_NAME = "taichi"
 

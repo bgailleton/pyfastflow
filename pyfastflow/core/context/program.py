@@ -1,9 +1,4 @@
-"""The stateful, embeddable orchestration layer for frozen PyFastFlow nodes.
-
-``ProgramBuilder`` only records schema and factories. A built Program owns
-parameters and data, builds each frozen node once dimensions are known, binds
-it through one declarative map, and compiles it lazily or eagerly.
-"""
+"""Build stateful, embeddable PyFastFlow programs from frozen nodes."""
 
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -373,10 +368,7 @@ class _Program:
         if state.compiled is not None: return
         if not self._allocated: raise ProgramError("shapes are unresolved")
         spec = self._recipe.sequences[name]
-        # Factories do not receive a separate legacy ``dims`` argument.  The
-        # resolved dimension values are nevertheless useful for feature
-        # structures whose immutable recipe needs an extent (notably CUDA), so
-        # expose them alongside user configuration in this read-only snapshot.
+        # Factories receive resolved dimensions alongside user configuration.
         factory_config = {**self._config, **self._dim_vals}
         node = spec.factory(self._be, _BundleView(self), factory_config)
         if not isinstance(node, Node): raise ProgramError(f"sequence {name!r} factory must return a frozen Node")

@@ -1,34 +1,10 @@
-"""
-cupy (CUDA source) block templates behind make_hillshade_group /
-make_hillshade_kernel.
-
-Mirrors _closure_blocks.py: same gradient rewrite (grid.neighbour(i, k),
-falling back to z[i] where there is no neighbour - see that module's own
-docstring for why), same hillshade formula, written as CUDA text. No
-`ctx.bk` here - cupy stays plain C (`sqrtf`/`atan2f`/`cosf`/`sinf`,
-`fmaxf`/`fminf`), same as grid/_cupy_blocks.py and noise/_cupy_blocks.py.
-Every `__device__`/`__global__` symbol is prefixed with this build's own tag
-(a fresh new_uid()) so two make_hillshade_group()/make_hillshade_kernel()
-calls in one process never collide inside a single compiled cupy module.
-
-Author: B.G (08/2026)
-"""
+"""CUDA hillshade templates for CuPy."""
 
 from ..core import KernelBuilder, freeze_helper as _helper, new_uid
 
 
 def build_group(group, *, grid, k_top, k_left, k_right, k_bottom):
-    """
-    Compose `at(z, i)` (and its private `grad_x`/`grad_y`) onto `group` (a
-    GroupBuilder) for the cupy backend. `grid` (a FrozenGroup) is composed
-    independently under `grad_x` and `grad_y` - see __init__.py's own module
-    docstring.
-
-    Returns nothing - `at` is compose()d onto `group` itself, under its own
-    public name, by this call.
-
-    Author: B.G (08/2026)
-    """
+    """Compose CuPy hillshade helpers onto ``group``."""
     t = f"pf{new_uid()}"
 
     grad_x = _helper(
@@ -89,7 +65,6 @@ def build_kernel(hillshade_group):
     has no auto-ranging equivalent to Taichi/Quadrants' `for i in
     range(n)`.
 
-    Author: B.G (08/2026)
     """
     t = f"pf{new_uid()}"
     template = f"""

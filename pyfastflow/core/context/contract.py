@@ -1,57 +1,4 @@
-"""
-A composite's structural contract - the set of ctx.* chains its template
-actually touches - derived, never hand-authored, from the template's own
-source.
-
-Two extractors read that source and produce the same kind of thing, a
-Contract: a frozen set of chains, each chain the maximal tuple of dotted
-segments following `ctx` - every reference through ctx counts, whether or not
-it is ever called. `ctx.z.get(i)` and a hypothetical bare `ctx.grid.nx` used
-as a value both contribute a chain; nothing about the grammar privileges a
-call over any other use. What a chain's own trailing segment means for
-device emission - is it a required `.get`, is a bare non-call reference even
-legal - is a backend question, deliberately not decided here (see slot.py's
-module docstring on PARAM access being uniform across modes, and the compile
-phase's `check_legal_accessors`, compile_shared.py, for where "is this
-spelling legal" actually gets enforced).
-
-extract_python_contract(template)   a python def, read by inspect.getsource +
-                                     ast - STATIC ANALYSIS, the template is
-                                     never called. A Taichi/Quadrants template
-                                     cannot run outside kernel-trace context,
-                                     so this is the only sound way to find out
-                                     what it touches, and it is also why `ctx`
-                                     must appear only in the template body
-                                     itself - a lambda, an exec'd function, or
-                                     `ctx` passed into a nested python def the
-                                     walk cannot see through, all raise
-                                     ContractError rather than silently
-                                     under-reporting the contract.
-extract_cupy_contract(source)       CUDA text already carrying `$...$` spans.
-                                     The template is an f-string fully
-                                     materialised at build time, so this reads
-                                     the final string directly - no
-                                     inspect.getsource, and none of the
-                                     python surface's restrictions apply,
-                                     since there is no python callable to lose
-                                     sight of in the first place.
-
-`ctx.bk` (RESERVED_BK_NAME, bk.py) is grammar the python surface recognises
-and drops rather than records: a chain rooted at `bk` is the reserved
-backend-intrinsics namespace (`ctx.bk.sqrt(x)`, ...), never a slot
-requirement, so extract_python_contract never adds one to the returned
-Contract - see bk.py's module docstring for the full mechanism, including why
-this namespace exists at all and why cupy's own extractor is deliberately
-left untouched (`ctx.bk` is not part of the cupy template surface).
-
-A Contract carries only its chains; nothing here decides whether a chain is
-satisfied. That check moved to freeze() (builder.py): every chain rooted at a
-composed child is resolved to its end through the child's own children/slots
-(the whole tree is known by then), and every other root is classified PARAM
-(a two-segment `.get`/`.set_node`) or reported missing.
-
-Author: B.G (08/2026)
-"""
+"""Extract a template's declared dependencies from its source."""
 
 import ast
 import inspect
@@ -73,7 +20,6 @@ class ContractError(BuildError):
     when a derived contract is checked against a candidate that does not
     satisfy it.
 
-    Author: B.G (08/2026)
     """
 
 
@@ -85,9 +31,8 @@ class ContractError(BuildError):
 class Contract:
     """
     A composite's derived structural contract: the frozen set of ctx.* chains
-    its template touches. See the module docstring.
+    its template touches.
 
-    Author: B.G (08/2026)
     """
 
     def __init__(self, chains: frozenset[Chain]):
@@ -126,7 +71,6 @@ def _ctx_chain(node: ast.AST) -> Chain | None:
     If `node` is an Attribute/Name chain rooted at `ctx`, its segments in
     source order (`ctx.grid.neighbour` -> `("grid", "neighbour")`); else None.
 
-    Author: B.G (08/2026)
     """
     segments: list[str] = []
     cur = node
@@ -156,12 +100,11 @@ class _ChainVisitor(ast.NodeVisitor):
     docstring).
 
     A chain rooted at RESERVED_BK_NAME (`ctx.bk.sqrt(x)`, ...) is dropped
-    instead of recorded - see the module docstring and bk.py. Nothing further
+    instead of recorded Nothing further
     down such a chain needs a visit of its own (it resolves entirely to
     Attribute/Name nodes already fully consumed by `_ctx_chain`), so this is
     a plain early return, not a call into generic_visit.
 
-    Author: B.G (08/2026)
     """
 
     def __init__(self):
@@ -184,7 +127,6 @@ def _get_function_ast(template: Callable) -> ast.FunctionDef:
     cannot be recovered (a lambda, an exec'd function) or does not parse down
     to one function definition.
 
-    Author: B.G (08/2026)
     """
     name = getattr(template, "__name__", repr(template))
     try:
@@ -211,7 +153,7 @@ def _get_function_ast(template: Callable) -> ast.FunctionDef:
 def extract_python_contract(template: Callable) -> Contract:
     """
     The Contract a python template requires, by static AST walk over its own
-    source. Never calls `template` - see the module docstring for why.
+    source. Never calls `template`
 
     Enforces that `ctx` is the template's first parameter (positional or
     positional-or-keyword) - a template reaching a `ctx` handed to it under
@@ -228,7 +170,6 @@ def extract_python_contract(template: Callable) -> Contract:
     ContractError
         Source cannot be recovered, or `ctx` is not the first parameter.
 
-    Author: B.G (08/2026)
     """
     fn = _get_function_ast(template)
     name = getattr(template, "__name__", fn.name)
@@ -278,7 +219,6 @@ def extract_cupy_contract(source: str) -> Contract:
     ContractError
         A `$...$` span's contents do not start with a dotted path.
 
-    Author: B.G (08/2026)
     """
     chains: set[Chain] = set()
     for match in _SPAN_RE.finditer(source):

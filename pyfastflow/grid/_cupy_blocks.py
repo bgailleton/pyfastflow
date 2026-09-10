@@ -1,36 +1,4 @@
-"""
-cupy (CUDA source) block templates behind make_grid, on the
-builder/frozen/bound stack (core/context/builder.py, frozen.py, bound.py).
-
-Mirrors _closure_blocks.py block for block - same private/public split, same
-per-axis composability (a periodic boundary swaps in the "periodic"
-__device__ variant of a row or column block, the untouched axis keeps its
-"identity"/"bounded" variant) - written as CUDA text instead of python defs.
-
-Every span reaching a PARAM is spelled `$ctx.NAME.get(...)$` in full - an
-explicit, `ctx`-rooted, `.get`/`.set_node`-terminated chain is required
-(contract.py, compile_shared.py's check_legal_accessors). Every span
-reaching a composed HELPER is spelled `$ctx.name(args)$`.
-
-`_delta(k)` is the one runtime-if-ladder equivalent: k is per-call device
-data, not a structural choice, so here it is a `__constant__` int table
-indexed by k at runtime instead - a dynamically-indexed local array would
-live in local memory on GPU, `__constant__` does not.
-
-Every device function name is prefixed with this grid's own tag (a fresh
-new_uid()), so two make_grid() calls in one process never collide inside a
-single compiled cupy module even if both are bound into the same kernel -
-compile_cupy.py's own address-derived naming for composed helpers already
-guards two different composed *addresses* under one compile, but two
-independently-built grids' `row`/`col`/... FrozenHelpers could still share
-an address suffix (e.g. two grids both composed as `gridA.row`/`gridB.row`
-already differ - the tag here additionally guards two grids sharing a
-*module-level* declared name like `__constant__ int ..._DELTA_DR[]` if ever
-emitted more than once into one compile, belt-and-braces with the
-address-based naming compile_cupy.py already does).
-
-Author: B.G (08/2026)
-"""
+"""CUDA grid-helper templates for CuPy."""
 
 import math
 
@@ -40,16 +8,7 @@ _SQRT2 = math.sqrt(2.0)
 
 
 def build_group(group, *, topology, boundary, nodata, outlet):
-    """
-    Compose every private block and public helper for the cupy backend onto
-    `group` (a GroupBuilder), picking each block's variant from
-    `topology`/`boundary`/`nodata`/`outlet`.
-
-    Returns nothing - every public helper is compose()d onto `group` itself,
-    under its own public name, by this call.
-
-    Author: B.G (08/2026)
-    """
+    """Compose the selected CuPy grid helpers onto ``group``."""
     t = f"pf{new_uid()}"
     d8 = topology == "D8"
 
@@ -57,15 +16,7 @@ def build_group(group, *, topology, boundary, nodata, outlet):
     col = _helper(f"__device__ int {t}_col(int i) {{ return i % $ctx.NX.get(0)$; }}")
     index = _helper(f"__device__ int {t}_index(int row, int col) {{ return row * $ctx.NX.get(0)$ + col; }}")
 
-    # A __constant__ lookup table, not a dynamically-indexed local array: k
-    # is per-call device data, so a local array indexed by k would spill to
-    # local memory on GPU (see the module docstring). `delta` is composed at
-    # two different addresses within one grid (under move_allowed and under
-    # neighbour_raw), so it is emitted twice per compile - compile_cupy.py's
-    # `_ensure_emitted` mangles the *declared* names this block's own text
-    # introduces (its device function, and any __constant__ symbol it
-    # declares) by that address, so the two emissions no longer collide even
-    # though both start from this same literal template text.
+    # ``k`` varies at runtime, so keep the direction lookup in constant memory.
     if d8:
         delta = _helper(
             f"""

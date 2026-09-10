@@ -1,37 +1,4 @@
-"""
-cupy compile phase: turns a BoundKernel into a CompiledKernel by assembling
-CUDA source text and building a `cp.RawModule` from it.
-
-Reuses cupy_backend.py's pure text/emission utilities - dtype/literal
-formatting, the `pf_params` constant-block and `__restrict__`-local
-machinery, `__global__`/`__device__` function-name extraction - which know
-only about Parameter objects and plain text (see cupy_backend.py's module
-docstring for the block's exact shape). The span *resolver* lives here: a
-`$ctx.path$` span resolves against one BoundKernel's address tree (bound.py)
-- `$ctx.z.get(i)$`, `$ctx.grid.neighbour(i, k)$`, the same grammar
-contract.py derives.
-
-Composed helpers become `__device__` functions
-------------------------------------------------
-Every composed FrozenHelper reachable from `bound` gets its own `__device__`
-function, unconditionally (mirroring compile_closure.py's reasoning: a
-`ctx.grid.neighbour(...)` span needs `neighbour` emitted regardless of
-whether `grid` itself is ever called bare). Its C name is derived from its
-own full address (`pf_flux_grad_grid_neighbour` for address `flux.grad.grid.
-neighbour`), which is unique within one compile by construction (build()
-never mints two different composed subtrees under the same address) - no
-uid-based mangling needed, unlike `_cupy_blocks.py`'s per-make_grid-call
-`new_uid()` tag, since there is exactly one BoundKernel's address tree per
-compile here, not several independently-built grids sharing one module.
-`_emit_device_func` renames the template's own declared function name to
-that address-derived name in the emitted text (the template author's own
-choice of name in source is never seen by the caller); a helper already
-emitted once in this compile (reachable from two different addresses -
-uncommon here since addresses are already unique, but the memo guards a
-cycle regardless) is reused, not re-emitted.
-
-Author: B.G (08/2026)
-"""
+"""Compile CUDA-source kernels through CuPy."""
 
 import re
 from typing import Any
@@ -58,8 +25,7 @@ from .frozen import FrozenGroup, Node
 from .parameter import Parameter
 from .slot import SlotKind
 
-# Default cupy threads-per-block when a kernel's `block=` is unset. Moves to
-# Backend.default_block in Unit 5.
+# Default CuPy threads per block when a kernel does not set ``block``.
 DEFAULT_BLOCK = 256
 
 _SPAN_RE = re.compile(r"\$(.*?)\$", re.S)
@@ -68,16 +34,7 @@ _CONSTANT_DECL_RE = re.compile(r"__constant__\s+[\w:\*&]+\s+(\w+)\s*(?:\[[^\]]*\
 
 
 class _EmitState:
-    """
-    Everything one compile() accumulates across every `__device__`/
-    `__global__` body it parses - the pointer registry and its
-    first-encounter local-index map (handed straight to cupy_backend.py's
-    `_param_block_source`/`_upload_param_block`/`_insert_locals`), and the
-    dependency-first, dedup-by-name map of every composed helper's own
-    `__device__` source.
-
-    Author: B.G (08/2026)
-    """
+    """State accumulated while emitting one CuPy compilation unit."""
 
     def __init__(self):
         self.registry: dict[int, dict] = {}
@@ -149,7 +106,6 @@ def _resolve_chain(
     `bound`'s address tree - see the module docstring for the two shapes
     (PARAM leaf, composed HELPER call/descent).
 
-    Author: B.G (08/2026)
     """
     if not segs:
         raise CompileError("span '$ctx$' names nothing")
@@ -196,24 +152,7 @@ def _make_repl(state: "_EmitState", prefix: Address, frozen: Node, bound: BoundK
 
 
 def _mangle_constants(body: str, c_name: str) -> str:
-    """
-    Rename every `__constant__` symbol `body` itself declares to a name
-    derived from `c_name` (this device block's own address-mangled function
-    name), consistently everywhere it appears in `body` - the declaration
-    and every use, both already in `body` since this runs on one block's own
-    text. Extends `_ensure_emitted`'s existing per-address renaming (until
-    this, applied only to the block's own `__device__` function name) to any
-    *other* top-level symbol a template happens to declare - a `__constant__`
-    lookup table backing a runtime-data if-ladder, in practice (grid's own
-    `delta` block, _cupy_blocks.py) - which needs exactly the same
-    per-address uniqueness the function name already gets: a FrozenHelper
-    composed at two different addresses in one compile is emitted twice
-    (`_ensure_emitted` memoizes by the mangled *function* name, which already
-    differs per address), and without this, both emissions would declare the
-    identical `__constant__` symbol name and collide at NVRTC compile time.
-
-    Author: B.G (08/2026)
-    """
+    """Give constants declared by a helper an address-specific name."""
     for orig in dict.fromkeys(_CONSTANT_DECL_RE.findall(body)):
         body = re.sub(rf"\b{re.escape(orig)}\b", f"{c_name}_{orig}", body)
     return body
@@ -226,7 +165,6 @@ def _ensure_emitted(state: _EmitState, addr: Address, frozen: Node, bound: Bound
     cycle - or the same address reached twice, which cannot currently happen
     since addresses are already unique per compile - never re-emits).
 
-    Author: B.G (08/2026)
     """
     name = _c_name(addr)
     if name in state.device_srcs:
@@ -252,7 +190,6 @@ def _check_cupy_data_signature(template: str) -> list[str]:
     cupy's text-source counterpart to compile_shared.py's check_data_signature
     (there is no python `inspect.signature` to read here).
 
-    Author: B.G (08/2026)
     """
     match = _KERNEL_SIG_RE.search(template)
     if match is None:
@@ -277,7 +214,6 @@ def compile_kernel(bound: BoundKernel) -> CompiledKernel:
     -------
     CompiledKernel
 
-    Author: B.G (08/2026)
     """
     check_unmet(bound)
     check_legal_accessors(bound)
@@ -311,7 +247,7 @@ def compile_kernel(bound: BoundKernel) -> CompiledKernel:
 
     data_order = [(name,) for name in data_names]
 
-    # Launch domain (Unit 4): domain names one of this kernel's DATA args (the
+    # The launch domain names one of this kernel's DATA args (the
     # launch extent is that buffer's length at launch time) or is a fixed int;
     # block is threads/block (default DEFAULT_BLOCK).
     domain = frozen.domain

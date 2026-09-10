@@ -1,49 +1,4 @@
-"""
-cupy (CUDA source) block templates behind make_depressions/
-make_depression_solver: the i64 atomic_min helper, copy_field, both basin
-labelling variants, saddlesort, both carve variants, jump reroute, and the
-depression counter - on the new builder/frozen/bound/routine stack (../core/
-context/builder.py, frozen.py, bound.py, routine.py). Mirrors
-_closure_depressions.py step for step - same routine composition, same
-grid/bitpack occurrence-per-site shape - CUDA text instead of python defs.
-
-See _cupy_receivers.py/_cupy_accum.py/_cupy_reconstruct.py for the other
-flow algorithms. Based on ../../flow/flow_reroute_kernels.py; `bitpack`'s pack/
-unpack_value/unpack_index (ops.make_bitpack_group, a FrozenGroup) replace
-legacy's f32_i32_struct module. Every array here (rec, bid, tag,
-basin_saddle, outlet, ...) is n_flat-sized, basin id = pit index + 1, so a
-per-basin array is safely indexed by any node index too - the same double
-duty the legacy kernels rely on.
-
-Unlike the closure backends, cupy has no grid-wide barrier a single
-`__global__` can rely on - every ordering dependency a pass needs is a real,
-separate kernel launch (matching _cupy_accum.py's own closure/cupy split for
-the same reason): `label_basins_walk` (one closure kernel) becomes three
-launches here ("walk_copy"/"walk_halving"/"walk_finalize"),
-`iteration_reroute_carve` (one closure kernel) becomes two
-("iter_build_work"/"iter_jump"), `reroute_jump` (one closure kernel with two
-top-level loops) becomes two ("reset_rerouted"/"jump").
-
-`n_flat` is a required, explicit build-time python int (baked into every
-launch-bounds check, `{n_flat}`, the same idiom _cupy_accum.py's build_atomic
-uses) - this factory takes no pool and reads no Parameter for it. `grid`'s
-own `N_NEIGHBOURS` is read on-device (`$ctx.grid.N_NEIGHBOURS.get(0)$`,
-exactly as _cupy_receivers.py's build_receivers already does), never a
-host-side python int - no build-time n_neighbours argument needed at all.
-
-Every `__global__`/`__device__` symbol is prefixed with this build's own tag
-(a fresh new_uid()) so two make_depressions() calls in one process never
-collide inside a single compiled cupy module - matching _cupy_receivers.py/
-_cupy_accum.py.
-
-A fixed, build-time-constant repeat (propagate_basin_iter's/
-iteration_reroute_carve's `logn+1` rounds) is unrolled as `logn+1` distinct
-routine compose() names for the SAME FrozenKernel - see
-_closure_depressions.py's module docstring for why (no per-round host
-readback, so nothing a SequenceBuilder loop would buy over a flat unroll).
-
-Author: B.G (08/2026)
-"""
+"""CUDA templates for depression handling."""
 
 from ..core import HelperBuilder, KernelBuilder, RoutineBuilder, new_uid
 
@@ -59,7 +14,6 @@ def build_atomic_min_ll():
     -------
     HelperBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pd{new_uid()}"
     return HelperBuilder(
@@ -90,7 +44,6 @@ def build_copy_field(*, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pd{new_uid()}"
     return (
@@ -119,7 +72,6 @@ def build_basin_id_init(*, grid, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pbi{new_uid()}"
     return (
@@ -205,7 +157,6 @@ def build_basin_labelling_vanilla(*, grid, copy_field, n_flat: int, logn: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     basin_id_init = build_basin_id_init(grid=grid, n_flat=n_flat)
     propagate_basin_iter = build_propagate_basin_iter(n_flat=n_flat)
@@ -233,7 +184,6 @@ def build_label_from_route(*, grid, n_flat: int):
     carried-route basin labelling. Data args (bid, basin_route); composes
     `grid` for can_out. See _closure_depressions.py's build_label_from_route.
 
-    Author: B.G (08/2026)
     """
     t = f"lfr{new_uid()}"
     return (
@@ -261,7 +211,6 @@ def build_basin_labelling_route(*, grid, n_flat: int, logn: int):
     Data addresses: "contract_K.rec_jump" (all bound to basin_route),
     "label_from_route.bid"/".basin_route".
 
-    Author: B.G (08/2026)
     """
     propagate_basin_iter = build_propagate_basin_iter(n_flat=n_flat)
     label_from_route = build_label_from_route(grid=grid, n_flat=n_flat)
@@ -282,7 +231,6 @@ def build_merge_basin_route(*, bitpack, n_flat: int):
     (basin id = pit + 1). Data args (outlet, basin_route); composes `bitpack`
     for unpack_index. See _closure_depressions.py's build_merge_basin_route.
 
-    Author: B.G (08/2026)
     """
     t = f"mbr{new_uid()}"
     return (
@@ -319,7 +267,6 @@ def build_basin_labelling_optimized(*, grid, n_flat: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     t = f"pbo{new_uid()}"
 
@@ -391,7 +338,6 @@ def build_saddlesort(*, grid, bitpack, n_flat: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     atomic_min_ll = build_atomic_min_ll()
     t = f"pss{new_uid()}"
@@ -590,7 +536,6 @@ def build_reroute_carve_vanilla(*, bitpack, copy_field, n_flat: int, logn: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     t = f"prc{new_uid()}"
 
@@ -742,7 +687,6 @@ def build_reroute_carve_optimized(*, bitpack, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pco{new_uid()}"
     return (
@@ -780,9 +724,8 @@ def build_reroute_jump(*, bitpack, n_flat: int):
     `rerouted[i - 1]` from thread `i`, a cell a *different* thread's reset
     zeroed. The closure backends keep this as one two-loop kernel.
 
-    The write is deliberately `rec[i - 1]`, not `rec[i]` - see
-    _closure_depressions.py's build_reroute_jump docstring for why; ported
-    exactly.
+    Basin IDs are one-based, so the write targets ``rec[i - 1]`` rather than
+    ``rec[i]``.
 
     Parameters
     ----------
@@ -793,7 +736,6 @@ def build_reroute_jump(*, bitpack, n_flat: int):
     -------
     tuple[RoutineBuilder, dict]
 
-    Author: B.G (08/2026)
     """
     t = f"prj{new_uid()}"
 
@@ -852,7 +794,6 @@ def build_depression_counter(*, grid, n_flat: int):
     -------
     KernelBuilder
 
-    Author: B.G (08/2026)
     """
     t = f"pdc{new_uid()}"
     return (

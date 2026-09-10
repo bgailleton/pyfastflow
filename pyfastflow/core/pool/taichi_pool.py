@@ -1,18 +1,10 @@
-"""
-Taichi backend implementation of Pool.
-
-Author: B.G (07/2026)
-"""
+"""Taichi backend pool."""
 
 from ._bucketed_pool import BucketedPool
 from .taichi_handle import TaichiDataHandle
 
 
 class TaichiPool(BucketedPool):
-    """
-    Pool manager for TaichiDataHandle, bucketed by (dtype, shape).
-
-    Author: B.G (07/2026)
-    """
+    """Pool that allocates Taichi field handles."""
 
     _handle_cls = TaichiDataHandle

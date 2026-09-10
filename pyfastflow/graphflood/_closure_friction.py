@@ -1,21 +1,4 @@
-"""
-Taichi/Quadrants (closure) friction-law block behind make_graphflood's
-compute_qo step, on the builder/frozen/bound stack (../core/context/
-builder.py, frozen.py, bound.py).
-
-`build_friction_qo(law, grid)` returns one FrozenHelper computing `qo(h,
-slope)`, composed onto compute_qo's own KernelBuilder under the name
-"friction" so a caller reaches it directly as `ctx.friction(h, slope)` (a
-composed HelperBuilder is itself the callable - "friction" is only the
-compose() name, not a namespace with a "qo" member). `law`
-picks which private template gets ingested - only "manning" exists so far,
-selected the same way grid/flow pick a block variant at build time
-(`_blocks_for`/`mode`) - `qo`'s call-site shape (h, slope) -> Q stays fixed
-regardless of which law backs it, so a future law is a second template
-picked by this same dispatch, not a change to any caller.
-
-Author: B.G (08/2026)
-"""
+"""Python GraphFlood friction templates for Taichi and Quadrants."""
 
 from ..core import FrozenHelper, HelperBuilder
 
@@ -57,7 +40,6 @@ def build_friction_qo(law: str, grid) -> FrozenHelper:
     ValueError
         If `law` is not a recognised friction law.
 
-    Author: B.G (08/2026)
     """
     if law not in _LAWS:
         raise ValueError(f"build_friction_qo: law must be one of {sorted(_LAWS)}, got {law!r}")

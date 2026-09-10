@@ -1,42 +1,4 @@
-"""
-HostBlockBuilder / FrozenHostBlock / BoundHostBlock: a leaf builder, in the
-same build -> freeze -> bind -> compile family as KernelBuilder/
-HelperBuilder (builder.py/frozen.py/bound.py), for host-side python code that
-needs to read/write Parameters between device launches - the layer
-Sequence's (sequence.py) loop control (`loop`'s `max_times`/`until`) and
-inter-block bookkeeping (a depression solver zeroing a counter Parameter
-before each pass) run on.
-
-A host block is a leaf, not a composite: it declares PARAM slots (from its
-`ctx.X.value`/`.handle()`/`.set()/.read()` contract) and DATA slots (its signature after
-`ctx`, like a kernel). A DATA argument resolves at compile to the bound
-DataHandle, so the block's own source reads `h.to_numpy()` and the
-device->host copy is visible there. compose() raises - a device
-helper cannot run on the host, and a host block composes no sub-structure.
-
-`ctx` resolves unwrapped
---------------------------
-Where a kernel/helper's `ctx.z` resolves to a Parameter's `device_view()`
-(compile_closure.py/compile_cupy.py), a host block's `ctx.z` resolves to the
-bound Parameter itself - parameter.py's host-facing surface, `.value`/
-`.handle()`/`.set(value)`/`.read()`, not `.get(node)`/`.set_node(node, value)`. A device
-view genuinely cannot run outside kernel-trace context, so there is nothing
-else `ctx.z` could mean here. `check_legal_host_accessors` enforces the
-matching legal-chain set - `(name, "value"|"handle"|"set"|"read")`, two segments, one of
-those three - the same role compile_shared.py's `check_legal_accessors` plays
-for device code, just against a different legal set.
-
-One class for every backend
------------------------------
-"Compiling" a host block is resolving names, not emitting device code: build
-the ctx tree of raw Parameters and the DATA-argument list, and return
-`lambda: template(ctx, *data)`. There is no Taichi/Quadrants/cupy variant of
-that, so `BoundHostBlock.compile()` takes no backend argument (it accepts and
-ignores `backend`, only to keep a call site that already carries a `backend`
-variable from having to special-case this block kind).
-
-Author: B.G (08/2026)
-"""
+"""Host-side blocks used between device launches."""
 
 import inspect
 from typing import Any
@@ -61,7 +23,6 @@ class HostBlockBuilder(_Builder):
     `h.to_numpy()` and the device->host sync is visible in the block's source.
     compose() raises - a host block composes no sub-structure.
 
-    Author: B.G (09/2026)
     """
 
     _LEGAL_ACCESSORS = ("get", "set", "read")
@@ -83,7 +44,6 @@ class HostBlockBuilder(_Builder):
         (signature after ctx) and return the FrozenHostBlock. See
         _Builder._build().
 
-        Author: B.G (09/2026)
         """
         slots, composed, contract = self._build()
         return FrozenHostBlock(self._template, slots, composed, contract)
@@ -96,7 +56,6 @@ class FrozenHostBlock(Node):
     `.provides` reports only this block's own wired PARAM names, and the walk
     mints one bindable address per PARAM slot. build() is inherited from Node.
 
-    Author: B.G (09/2026)
     """
 
     KIND = "hostblock"
@@ -111,7 +70,6 @@ def check_legal_host_accessors(bound: "_Bound") -> None:
     unlike compile_shared.check_legal_accessors - there is no composition
     tree to walk, just this block's own contract.
 
-    Author: B.G (08/2026)
     """
     frozen = bound.frozen
     param_names = frozen.slots.names(SlotKind.PARAM)
@@ -129,10 +87,9 @@ def check_legal_host_accessors(bound: "_Bound") -> None:
 class _HostCtxNode:
     """
     What `ctx` resolves to inside a compiled host block's template body - a
-    plain attribute bag holding this block's Parameters unwrapped. See the
+    plain attribute namespace holding this block's Parameters unwrapped. See the
     module docstring's "ctx resolves unwrapped" section.
 
-    Author: B.G (08/2026)
     """
 
 
@@ -141,7 +98,6 @@ class BoundHostBlock(_Bound):
     The bound result of build()-ing a FrozenHostBlock. See the module
     docstring.
 
-    Author: B.G (08/2026)
     """
 
     def compile(self) -> Any:
@@ -151,7 +107,6 @@ class BoundHostBlock(_Bound):
         order), and return `lambda: template(ctx, *data)`. Checks unmet slots
         and legal host accessors first.
 
-        Author: B.G (09/2026)
         """
         check_unmet(self)
         check_legal_host_accessors(self)

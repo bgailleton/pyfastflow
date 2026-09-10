@@ -1,18 +1,4 @@
-"""
-Shared DataHandle implementation for FieldsBuilder-based backends.
-
-Taichi and Quadrants expose an identical field/FieldsBuilder API; subclasses
-only pin `_backend` to their module (ti or qd).
-
-Known cost - Taichi offline cache: each handle finalizes its own
-FieldsBuilder/SNode tree, and Taichi's kernel cache key includes field
-identity, so churning pooled buffers makes Taichi recompile textually
-identical kernels. No fix here; revisit only if Taichi cold-start compile
-time becomes a real problem. The cupy path has no equivalent issue (its
-constant-block machinery was made field-identity-robust).
-
-Author: B.G (07/2026)
-"""
+"""Shared field-backed DataHandle for Taichi and Quadrants."""
 
 from typing import Any, ClassVar
 
@@ -20,15 +6,7 @@ from .base import DataHandle, new_uid
 
 
 class FieldsBuilderDataHandle(DataHandle):
-    """
-    DataHandle backed by one field allocated via FieldsBuilder.
-
-    Composition, not inheritance: kernels take the raw field via `.array`,
-    not the handle itself - see pool/base.py design notes on why
-    subclassing a field type was rejected.
-
-    Author: B.G (07/2026)
-    """
+    """Handle backed by one field allocated through ``FieldsBuilder``."""
 
     _backend: ClassVar[Any]
 
@@ -52,13 +30,7 @@ class FieldsBuilderDataHandle(DataHandle):
         raise ValueError(f"unsupported dtype {dtype!r}")
 
     def __init__(self, dtype: Any, shape: tuple[int, ...]):
-        """
-        Allocate a field of the given dtype/shape via FieldsBuilder.
-
-        shape=() allocates a 0D scalar field, indexed as field[None].
-
-        Author: B.G (07/2026)
-        """
+        """Allocate a field; ``shape=()`` creates a scalar field."""
         self._uid = new_uid()
         self.backend_dtype = self.normalize_dtype(dtype)
         self.dtype = self.short_dtype(self.backend_dtype)
@@ -82,12 +54,7 @@ class FieldsBuilderDataHandle(DataHandle):
 
     @property
     def array(self):
-        """
-        Return the underlying field, for passing straight into kernels or
-        binding as a global.
-
-        Author: B.G (07/2026)
-        """
+        """Underlying Taichi or Quadrants field."""
         return self._field
 
     def acquire(self) -> None:
@@ -98,12 +65,7 @@ class FieldsBuilderDataHandle(DataHandle):
         self.in_use = False
 
     def destroy(self) -> None:
-        """
-        Free the field's GPU memory. Unusable afterwards. Raises PoolError while
-        a bound object still holds this handle directly (see _assert_unbound).
-
-        Author: B.G (07/2026)
-        """
+        """Destroy the underlying field."""
         self._assert_unbound("destroy")
         if self._snodetree is not None:
             self._snodetree.destroy()

@@ -1,53 +1,4 @@
-"""
-KernelBuilder / HelperBuilder / GroupBuilder (and HostBlockBuilder,
-host_block.py): the build phase. See parameter.py's module docstring for the
-overall build -> bind -> compile scheme; this module is the first phase.
-
-The template is given at construction (`KernelBuilder(template)`,
-`HelperBuilder(template)`; a GroupBuilder has none), and the builder derives
-its own contract from it - the slots are not restated by hand. At `freeze()`:
-
-  PARAM slots   the ctx roots the template reads as a two-segment
-                `ctx.X.get(...)`/`ctx.X.set_node(...)` accessor and does not
-                compose (host blocks: `get`/`set`/`read`). param() adds an extra
-                PARAM the template does not imply - the only way a GroupBuilder,
-                which has no template, gets any.
-  DATA slots    a kernel's/host block's own signature after `ctx` (python) or
-                `__global__` parameter list (cupy). A helper's signature after
-                `ctx` is ordinary device-call arguments, NOT DATA; a group has
-                no signature. data(name, dtype=) attaches a dtype contract to a
-                signature-declared DATA argument.
-  children      compose(name, frozen) attaches an already-frozen sub-structure
-                (frozen.py) under `name`, by identity, never positionally - a
-                template reaches `ctx.name.member` once `name` is composed. A
-                composed child IS the helper/group root; there is no separate
-                HELPER slot to declare.
-
-Disambiguation, at freeze(): a root read as `ctx.X.get(...)`/`.set_node(...)`
-and not composed is a PARAM; a root composed is a child (and reading it as
-`.get` is an error - a composed child is not a Parameter); a root used any other
-way (a bare call, a further segment) and not composed is missing - `.missing()`
-reports the set, `freeze()` raises ContractError. Every chain that enters a
-composed child is resolved to its end through the child's own children/slots;
-a dead-end names the full chain and the deepest node reached.
-
-share(canonical, *paths, as_=None) / share_identical(path, as_=None) declare
-build-phase sharing: several relative addresses of this builder's own tree that
-mean one quantity, collapsed by bound.py's walk into a single bindable address
-(the canonical, or a synthetic top-level name when `as_` re-roots). Each spec
-may be a PARAM leaf, a DATA leaf, or a child root (whole subtree). See share()'s
-own docstring; classify_path/compute_share/find_identical_roots (below) are the
-shared implementation every builder level reuses.
-
-`RESERVED_BK_NAME` ("bk", bk.py) may never be a param()/compose() name -
-`ctx.bk` is the reserved backend-intrinsics namespace (`ctx.bk.sqrt`, ...),
-dropped from every contract before it becomes a requirement.
-
-freeze() returns a frozen, immutable Node and freezes the builder in the same
-call - every method afterwards raises FrozenError. A builder is used once.
-
-Author: B.G (09/2026)
-"""
+"""Builders for kernels, helpers, and reusable groups."""
 
 from typing import Any
 
@@ -67,7 +18,6 @@ class _ShareMixin:
     `_synthetic`, `_shared_seen`, and optionally `_slots`. See share() for the
     contract and compute_share (below) for the implementation.
 
-    Author: B.G (09/2026)
     """
 
     def share(self, canonical: str, *paths: str, as_: "str | None" = None) -> "_Builder":
@@ -101,7 +51,6 @@ class _ShareMixin:
             shared roots are not the identical object, a path is already
             shared, or `as_` collides with an existing top-level name.
 
-        Author: B.G (09/2026)
         """
         self._check_mutable()
         new_shared, synthetic, seen_add = compute_share(
@@ -124,7 +73,6 @@ class _ShareMixin:
         `path` must name a child root, not a leaf. A no-op (not an error) if
         nothing else in the tree is that same object.
 
-        Author: B.G (09/2026)
         """
         self._check_mutable()
         kind, node, _slot = classify_path(self._share_top_slots(), self._composed, tuple(path.split(".")), what="share_identical")
@@ -144,7 +92,6 @@ class _ShareMixin:
         template; a kernel shares its own explicit params), so this suffices at
         share() time. Empty for a routine/sequence (no top-level params).
 
-        Author: B.G (09/2026)
         """
         sg = SlotGroup()
         for name in getattr(self, "_explicit_params", {}):
@@ -162,7 +109,6 @@ class _Builder(_ShareMixin):
     Shared build-phase machinery behind KernelBuilder/HelperBuilder. Not
     instantiated directly.
 
-    Author: B.G (08/2026)
     """
 
     def __init__(self, template: Any = None):
@@ -221,7 +167,6 @@ class _Builder(_ShareMixin):
         Strict: raises at freeze() if `name` turns out to be a derived slot
         (already implied by the template) or a composed child.
 
-        Author: B.G (09/2026)
         """
         self._check_mutable()
         self._check_name(name, "PARAM slot")
@@ -235,7 +180,6 @@ class _Builder(_ShareMixin):
         `name` is not a signature argument. Kernel and HostBlock only - a helper
         has no DATA slots of its own, a group no signature.
 
-        Author: B.G (09/2026)
         """
         self._check_mutable()
         self._data_contracts[name] = dtype
@@ -250,7 +194,6 @@ class _Builder(_ShareMixin):
         already declared an explicit PARAM slot, raises. A FrozenKernel raises:
         a kernel is a host entry point, not device-callable.
 
-        Author: B.G (08/2026)
         """
         self._check_mutable()
         self._check_name(name, "composed root")
@@ -278,7 +221,6 @@ class _Builder(_ShareMixin):
         kernel/host block; not a helper, whose signature after ctx is
         device-call arguments, nor a template-less group).
 
-        Author: B.G (09/2026)
         """
         template = self._template
         if template is None:
@@ -302,9 +244,8 @@ class _Builder(_ShareMixin):
         that dead-ends - a segment that is neither a child nor a PARAM leaf of
         the deepest node reached, or trailing segments after a PARAM leaf that
         are not a single legal accessor - raises ContractError naming the full
-        chain and the deepest node. See the module docstring.
+        chain and the deepest node.
 
-        Author: B.G (09/2026)
         """
         cur = root_node
         walked = chain[0]
@@ -339,7 +280,6 @@ class _Builder(_ShareMixin):
         segments ending in a legal accessor, else missing. See the module
         docstring's disambiguation rules.
 
-        Author: B.G (09/2026)
         """
         derived: set[str] = set()
         missing: set[str] = set()
@@ -363,9 +303,8 @@ class _Builder(_ShareMixin):
         """
         The contract roots that are neither composed nor PARAM-able - a root
         used with a bare call or a further segment but never composed. Empty
-        means freeze() will succeed (contract-wise). See the module docstring.
+        means freeze() will succeed (contract-wise).
 
-        Author: B.G (09/2026)
         """
         contract, _data = self._derive_contract()
         _derived, missing = self._classify_roots(contract)
@@ -380,7 +319,6 @@ class _Builder(_ShareMixin):
         missing root or a dead-end chain, SlotGroupError on an explicit-param
         conflict or a data() name absent from the signature.
 
-        Author: B.G (09/2026)
         """
         self._check_mutable()
         contract, data_names = self._derive_contract()
@@ -428,7 +366,6 @@ class HelperBuilder(_Builder):
     data() raises. PARAM slots are derived from the template's
     contract; param() adds any the template does not imply.
 
-    Author: B.G (09/2026)
     """
 
     _HAS_DATA = False
@@ -458,9 +395,8 @@ class KernelBuilder(_Builder):
     parameter list (cupy). param() adds an extra PARAM the template does not
     imply (a share canonical); data() attaches a dtype contract to a
     signature-declared DATA argument. `domain`/`block` are the launch config
-    (Unit 4).
+    .
 
-    Author: B.G (09/2026)
     """
 
     _HAS_DATA = True
@@ -488,7 +424,6 @@ class GroupBuilder(_Builder):
     explicitly via param() (the canonical leaves share_leaf collapses into);
     data() raises (a group is never a call argument's signature).
 
-    Author: B.G (09/2026)
     """
 
     _HAS_DATA = False
@@ -516,7 +451,6 @@ def freeze_helper(template, *, helpers=None, params=()):
     ``params`` remains accepted only while feature call sites are consolidated;
     helper PARAM slots are derived from the template contract.
 
-    Author: B.G (09/2026)
     """
     builder = HelperBuilder(template)
     for name, frozen in (helpers or {}).items():
@@ -530,7 +464,6 @@ def freeze_kernel(template, *, helpers=None, params=(), data=(), domain=None, bl
     ``params`` and ``data`` remain accepted only while feature call sites are
     consolidated; kernel slots are derived from the template contract.
 
-    Author: B.G (09/2026)
     """
     builder = KernelBuilder(template, domain=domain, block=block)
     for name, frozen in (helpers or {}).items():
@@ -566,7 +499,6 @@ def find_param_paths(frozen: Node, leaf_name: str, prefix: tuple = ()) -> list:
     list[str]
         Dotted relative paths to every occurrence of `leaf_name`.
 
-    Author: B.G (08/2026)
     """
     paths = []
     if leaf_name in frozen.slots.names(SlotKind.PARAM):
@@ -593,7 +525,6 @@ def share_leaf(group: "GroupBuilder", canonical: str) -> None:
     canonical : str
         PARAM slot name to search for and share.
 
-    Author: B.G (08/2026)
     """
     paths = []
     for name, child in group._composed.items():
@@ -616,7 +547,6 @@ def classify_path(top_slots: "SlotGroup | None", top_composed: dict, segs: tuple
     a routine/sequence, which have none) and `top_composed` its composed children
     (a kernel/helper/group's composed subtree, or a routine/sequence's blocks).
 
-    Author: B.G (09/2026)
     """
     root = segs[0]
     if len(segs) == 1:
@@ -655,7 +585,6 @@ def find_identical_roots(top_composed: dict, target, prefix: tuple = ()) -> list
     `top_composed` (any depth) whose Node `is` `target`. What share_identical()
     hands to share(). See classify_path for the tree shape.
 
-    Author: B.G (09/2026)
     """
     found = []
     for name, node in top_composed.items():
@@ -681,7 +610,6 @@ def compute_share(top_slots, top_composed, existing_top_names, shared_seen, cano
 
     See _Builder.share() for the caller-facing contract. Raises BuildError.
 
-    Author: B.G (09/2026)
     """
     specs = [canonical, *paths]
     classified = []
