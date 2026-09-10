@@ -42,7 +42,7 @@ def _bound(domain):
 
     bk = Backend.from_name("cupy")
     b = KernelBuilder(_TMPL, domain=domain, block=1).freeze().build()
-    b.bind("N", bk.ParameterCls("N", dtype=bk.dtypes["i32"], mode="const", value=0, pool=None))
+    b.bind("N", bk.ParameterCls("N", dtype="i32", mode="const", value=0, pool=None))
     return b
 
 
@@ -55,7 +55,7 @@ def test_domain_launch_no_grid_block_and_swap_shortens_extent():
     big = pool.get_data("i32", (64,))
     big.from_numpy(cp.zeros(64, dtype=cp.int32))
     b.bind("out", big)
-    run = b.compile("cupy")  # no grid=/block=
+    run = b.compile()  # backend inferred from the bound parameter/handle
 
     run()
     cp.cuda.runtime.deviceSynchronize()
@@ -81,7 +81,7 @@ def test_int_domain_fixes_extent():
     buf = pool.get_data("i32", (64,))
     buf.from_numpy(cp.zeros(64, dtype=cp.int32))
     b.bind("out", buf)
-    run = b.compile("cupy")
+    run = b.compile()
     run()
     cp.cuda.runtime.deviceSynchronize()
     assert int((buf.array != 0).sum()) == 8  # only the fixed extent launched

@@ -144,13 +144,12 @@ class BoundHostBlock(_Bound):
     Author: B.G (08/2026)
     """
 
-    def compile(self, backend: "str | None" = None, **kwargs) -> Any:
+    def compile(self) -> Any:
         """
         Resolve this block's ctx (each PARAM slot's bound Parameter, unwrapped)
         and its DATA arguments (each bound value - a DataHandle - in signature
         order), and return `lambda: template(ctx, *data)`. Checks unmet slots
-        and legal host accessors first. `backend` is accepted and ignored (a
-        host block is name resolution, not device emission).
+        and legal host accessors first.
 
         Author: B.G (09/2026)
         """

@@ -17,7 +17,7 @@ member it wants, binds its PARAM/DATA addresses, `.compile()`s:
     bound.bind_leaf(grid_params)  # NX/NY/DX/N_NEIGHBOURS - see below
     bound.bind("z", z_field)
     bound.bind("rec", rec_field)
-    receivers_kernel = bound.compile("taichi")
+    receivers_kernel = bound.compile(be)
     receivers_kernel()
 
 `mode` ("steepest"|"stochastic") and `h_aware` (False: kernel takes (z, rec)
@@ -80,13 +80,13 @@ kernel's own `SOURCE` PARAM slot - any mode (const, scalar or field all work
 with no variant code, since every template reads `source.get(i)`) - there is
 no Need indirection anywhere in this stack:
 
-    source_p = TaichiParameter("SOURCE", dtype=ti.f32, mode="const", value=1.0, pool=pool)
+    source_p = TaichiParameter("SOURCE", dtype="f32", mode="const", value=1.0, pool=pool)
     accum = make_accumulation(be, grid, method="atomic", n_flat=n_flat)
     bound = accum["accum"].build()
     bound.bind("SOURCE", source_p)
     bound.bind("rec", rec)
     bound.bind("q", q)
-    accum_kernel = bound.compile("taichi")
+    accum_kernel = bound.compile(be)
     accum_kernel()
 
 `method`:
@@ -148,10 +148,8 @@ kernels - see CLAUDE.md). The caller `.freeze()`s (or lets `.compile()`
 freeze implicitly - SequenceBuilder has no separate freeze() call exposed
 here beyond what `.build()`/`.compile()` already do internally), `.build()`s,
 binds every PARAM/DATA address named above and in each build_* docstring,
-then `.compile(backend, grid=..., block=...)` on cupy (grid/block size the
-sequence's own default launch dims; single-thread steps override their own
-via `launch=` at compose() time, already baked in by the factory) or
-`.compile(backend)` on closure backends (no launch dims needed). The
+then `.compile(be)`. Every cupy kernel declares its own `domain`/`block`;
+closure backends range over the template's own loop. The
 compiled CompiledSequence takes no arguments; call it, then read
 `last_trip_counts` if wanted (always exactly one loop entry per compiled
 sequence here, so `last_trip_counts[0]` is the only entry, and is always the
@@ -178,7 +176,7 @@ per-node donor arrays) - `pointer_jump_push` needs neither `grid` nor
 make_depressions: the depression-handling factory, on the builder/frozen/
 bound stack. Two orthogonal build flags:
 
-    ndep_p = TaichiParameter("NDEP", dtype=ti.i32, mode="scalar", value=0, pool=pool)
+    ndep_p = TaichiParameter("NDEP", dtype="i32", mode="scalar", value=0, pool=pool)
     deps = make_depressions(be, grid, ndep_p, method="vanilla", reroute="carve", n_flat=n_flat)
 
 `method` ("vanilla"|"optimized") picks how basins are labelled and, for
@@ -522,6 +520,7 @@ def make_accumulation(
 
         return _cupy_mfd_accum.build_persistent_mfd(
             grid=grid, n_flat=int(n_flat), n_neighbours=int(n_neighbours), fr_stage=fr_stage,
+            blocks_per_sm=blocks_per_sm, threads=threads,
         )
 
     if method not in _ACCUM_METHODS:

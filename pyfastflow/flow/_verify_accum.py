@@ -222,14 +222,13 @@ def run(backend: str):
     rec = pool.get_data(i32, (n,))
     upload(z, z_np)
 
-    launch = {}
 
     recv = make_receivers(_bk, grid_group, topology="D8", mode="steepest")
     recv_bound = recv["receivers"].build()
     recv_bound.bind_leaf(grid_params)
     recv_bound.bind("z", z)
     recv_bound.bind("rec", rec)
-    recv_kernel = recv_bound.compile(backend, **launch)
+    recv_kernel = recv_bound.compile(_bk)
     recv_kernel()
 
     rec_np = download(rec).astype(np.int64)
@@ -246,7 +245,7 @@ def run(backend: str):
         # compile, run once, then release both the compiled object and the bound
         # object's hold on their Parameters (destroy safety, Unit 6) so the
         # source/iteration Parameters can be destroyed afterwards.
-        c = bnd.compile(backend, **launch)
+        c = bnd.compile(_bk)
         c()
         c.close()
         bnd.close()
@@ -500,7 +499,7 @@ def run_mfd_cupy():
     from ..core import Backend
     from ..grid import make_grid_group, make_grid_parameters
     from . import make_accumulation
-    from ._cupy_mfd_accum import init_frontier_mfd, persistent_grid_block
+    from ._cupy_mfd_accum import init_frontier_mfd
 
     be = Backend.from_name("cupy")
     Param, Pool, i32, f32 = be.ParameterCls, be.pool, be.dtypes["i32"], be.dtypes["f32"]
@@ -515,7 +514,7 @@ def run_mfd_cupy():
     pool = Pool()
     grid_group = make_grid_group(be, topology="D8", boundary="normal", outlet="edge")
     grid_params = make_grid_parameters(be, pool, nx, ny, DX, topology="D8", outlet="edge")
-    source_p = Param("SRC", dtype=f32, mode="const", value=1.0, pool=pool)
+    source_p = Param("SRC", dtype="f32", mode="const", value=1.0, pool=pool)
 
     dirs = pool.get_data(np.dtype(np.uint8), (n,))
     mfd_w = pool.get_data(f32, (n * 8,))
@@ -532,13 +531,11 @@ def run_mfd_cupy():
 
     accum = make_accumulation(be, grid_group, method="persistent_mfd", n_flat=n, n_neighbours=8)
 
-    launch_grid, launch_block = ((n + 255) // 256,), (256,)
-
     q_init_bound = accum["q_init"].build()
     q_init_bound.bind("SOURCE", source_p)
     q_init_bound.bind("accum", accum_h)
     q_init_bound.bind_leaf(grid_params, prefix=("grid",))
-    _qc = q_init_bound.compile("cupy", grid=launch_grid, block=launch_block)
+    _qc = q_init_bound.compile(be)
     _qc()
     _qc.close()
     q_init_bound.close()
@@ -559,8 +556,7 @@ def run_mfd_cupy():
     accum_bound.bind("accum", accum_h)
     accum_bound.bind("indegree", indegree)
 
-    p_grid, p_block = persistent_grid_block()
-    _ac = accum_bound.compile("cupy", grid=p_grid, block=p_block)
+    _ac = accum_bound.compile(be)
     _ac()
     _ac.close()
     accum_bound.close()

@@ -6,7 +6,7 @@ objects into its globals before handing it to qd.func - the mechanism in
 _closure_backend.py, shared with Taichi.
 
 The kernel/helper compile path (KernelBuilder/HelperBuilder -> FrozenKernel ->
-BoundKernel.compile("quadrants")) is compile_closure.py, which reaches this
+BoundKernel.compile(Backend.from_name("quadrants"))) is compile_closure.py, which reaches this
 module only for `qd` itself, imported directly there. There, a kernel
 template may type its data arguments qd.Tensor to accept either a field- or
 ndarray-backed value at call time - Taichi has no equivalent. Field-mode

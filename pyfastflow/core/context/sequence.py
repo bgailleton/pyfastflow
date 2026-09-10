@@ -54,7 +54,7 @@ would mint, with the sequence-level compose() name prefixed on top.
 
 Compiling
 ----------
-`BoundSequence.compile(backend, **kwargs)` checks this sequence's own unmet
+`BoundSequence.compile(backend)` checks this sequence's own unmet
 slots first, then compiles each composed name at most once (cached by name,
 since one composed block may be referenced from several places in order): a
 fresh bound object from that block's own `.build()`, filled from this
@@ -64,17 +64,6 @@ everything else takes it. The result, CompiledSequence, is an ordered list
 of zero-argument callables (blocks already resolved to their own compiled
 form) plus loop entries carrying their own body/max_times/until, evaluated
 on the host at call time.
-
-Per-block launch config
---------------------------
-`compose(name, frozen, launch=None)` accepts the same optional launch-kwargs
-override `RoutineBuilder.compose()` does (routine.py) - a dict merged over
-this sequence's own `compile(backend, **kwargs)` call, `{**kwargs, **launch}`,
-for that one composed block only. Composing a whole FrozenRoutine under `name`
-with a `launch` override hands that merged dict to the routine's own
-`compile()` as *its* default - which the routine's own per-step `launch`
-overrides then apply on top of, exactly as they would against any other
-default.
 
 `CompiledSequence.swap(addr, buf)` routes `name.*` to the matching compiled
 block's own `.swap()` (CompiledKernel.swap / CompiledRoutine.swap); raises if
@@ -121,17 +110,11 @@ class SequenceBuilder(_ShareMixin):
     def __init__(self):
         self._uid = new_uid()
         self._composed: dict[str, Any] = {}
-        self._launch: dict[str, dict] = {}
         self._order: list[tuple] = []
         self._shared: dict[tuple, tuple] = {}
         self._synthetic: dict[str, Any] = {}
         self._shared_seen: set[tuple] = set()
         self._frozen = False
-
-    @property
-    def uid(self) -> int:
-        """Process-wide identity assigned at construction. See Parameter.uid (parameter.py)."""
-        return self._uid
 
     def _check_mutable(self) -> None:
         if self._frozen:
@@ -145,7 +128,7 @@ class SequenceBuilder(_ShareMixin):
             raise SequenceBuilderError(f"{name!r} is not registered on this sequence - call add({name!r}, ...) first")
         return self._composed[name]
 
-    def add(self, name: str, frozen: Any, *, launch: "dict | None" = None) -> "SequenceBuilder":
+    def add(self, name: str, frozen: Any) -> "SequenceBuilder":
         """
         Register `frozen` under `name`, without placing it in execution
         order - see step()/loop() for that, and the module docstring for why
@@ -155,13 +138,6 @@ class SequenceBuilder(_ShareMixin):
         ----------
         name : str
         frozen : FrozenKernel, FrozenRoutine or FrozenHostBlock
-        launch : dict, optional
-            compile()-kwargs overriding this sequence's own compile()-level
-            default for this block only. Ignored for a FrozenHostBlock
-            (BoundHostBlock.compile() takes no backend-specific kwargs),
-            accepted here regardless so a caller need not special-case which
-            kind of block it is composing.
-
         Author: B.G (08/2026)
         """
         self._check_mutable()
@@ -179,7 +155,6 @@ class SequenceBuilder(_ShareMixin):
         if name in self._composed:
             raise SequenceBuilderError(f"'{name}' is already registered on this sequence")
         self._composed[name] = frozen
-        self._launch[name] = dict(launch) if launch else {}
         return self
 
     def step(self, name: str) -> "SequenceBuilder":
@@ -248,7 +223,7 @@ class SequenceBuilder(_ShareMixin):
         if not self._order:
             raise SequenceBuilderError("freeze: sequence has no steps - call step()/loop() at least once")
         self._frozen = True
-        return FrozenSequence(self._composed, self._order, self._launch, self._shared, self._synthetic)
+        return FrozenSequence(self._composed, self._order, self._shared, self._synthetic)
 
 
 class FrozenSequence(Node):
@@ -256,8 +231,7 @@ class FrozenSequence(Node):
     The frozen result of a SequenceBuilder's freeze(): a `Node` of kind
     "sequence" whose `children` are the block registry ({name: FrozenKernel|
     FrozenRoutine|FrozenHostBlock}) and whose `.order` is the ordered step/loop
-    schedule, plus each block's own launch-kwargs override (`.launch`). No
-    template/contract/slots of its own. build() is inherited from Node - the
+    schedule. It has no template/contract/slots of its own. build() is inherited from Node - the
     walk recurses a composed FrozenRoutine into its own steps, so a routine
     composed under `saddlesort` stepping `label`/`sort` reaches
     `saddlesort.label.*`. See the module docstring.
@@ -271,7 +245,6 @@ class FrozenSequence(Node):
         self,
         composed: dict,
         order: list,
-        launch: "dict | None" = None,
         shared: "dict | None" = None,
         synthetic: "dict | None" = None,
     ):
@@ -284,13 +257,6 @@ class FrozenSequence(Node):
             synthetic=synthetic,
             order=tuple(order),
         )
-        object.__setattr__(self, "_launch", dict(launch) if launch else {})
-
-    @property
-    def launch(self) -> dict:
-        """{name: launch-kwargs override dict}, read-only copy. See compose()'s `launch=`."""
-        return dict(self._launch)
-
     def __repr__(self) -> str:
         return f"FrozenSequence(uid={self._uid}, blocks={sorted(self.children)})"
 
@@ -305,14 +271,13 @@ class BoundSequence(_Bound):
     Author: B.G (08/2026)
     """
 
-    def compile(self, backend=None, **kwargs) -> "CompiledSequence":
+    def compile(self, backend=None) -> "CompiledSequence":
         """
         Compile every composed block and return the resulting
         CompiledSequence. See the module docstring's "Compiling" section.
 
-        `backend` is a `Backend` (or a name, or omitted to use the one recorded
-        from bound Parameters). `**kwargs` is the temporary per-block cupy
-        grid/block compat (Unit 4), overridden by a block's own `launch=`.
+        `backend` is a `Backend`, or may be omitted to use the one recorded
+        from bound Parameters and data handles.
 
         Author: B.G (09/2026)
         """
@@ -329,8 +294,7 @@ class BoundSequence(_Bound):
             child = frozen.children[name]
             child_bound = child.build()
             self.bind_into(child_bound, (name,))
-            block_kwargs = {**kwargs, **frozen.launch.get(name, {})}
-            compiled = child_bound.compile() if isinstance(child, FrozenHostBlock) else child_bound.compile(be, **block_kwargs)
+            compiled = child_bound.compile() if isinstance(child, FrozenHostBlock) else child_bound.compile(be)
             compiled_blocks[name] = compiled
             block_bounds.append(child_bound)
             return compiled

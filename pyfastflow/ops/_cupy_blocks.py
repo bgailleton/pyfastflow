@@ -13,14 +13,9 @@ new_uid()), matching grid/noise/visu's own belt-and-braces convention
 `.inclusive()` on cupy stays `cp.cumsum` (ops/__init__.py's own module
 docstring: CUB's DeviceScan is already the accelerator cupy dispatches to by
 default) - no RoutineBuilder involved for that half. Compaction's count-read
-and scatter are a two-step FrozenRoutine (routine.py): "read_count" (a
-1-thread kernel writing scan_out[n-1] into the COUNT PARAM) and "scatter",
-each composed with its own `launch=` override
-(routine.py's `RoutineBuilder.compose(name, frozen, launch=...)`) - a
-genuinely different, meaningfully-sized grid/block per step, which is what
-actually exercises the per-step launch mechanism on a backend where launch
-dims mean anything (see ops/__init__.py's module docstring for the fuller
-design-fork note this resolves).
+and scatter are a two-step FrozenRoutine (routine.py): "read_count" declares
+`domain=1`, while "scatter" declares `domain=n`. Each kernel owns its launch
+geometry.
 
 Author: B.G (08/2026)
 """
@@ -337,13 +332,8 @@ def build_count_and_scatter_routine(n: int, *, block: int = 256) -> "FrozenRouti
     A 2-step FrozenRoutine (routine.py): "read_count" (one thread, writes
     scan_out[n-1] into the wired PARAM slot "COUNT") then "scatter" (one
     thread per node, `ids[scan_out[i]-1] = i` wherever `flags[i] != 0`) - the
-    compaction half of scan-based stream compaction. Each step is composed
-    with its own `launch=` override (routine.py's `RoutineBuilder.compose(
-    ..., launch=...)`) sized to that step's own real thread count - "
-    read_count" is one thread regardless of `n`, "scatter" needs
-    ceil(n/block) blocks of `block` threads - see the module docstring for
-    why this, not the inclusive scan itself, is what exercises per-step
-    launch on cupy.
+    compaction half of scan-based stream compaction. Each kernel declares its
+    own domain: one thread for "read_count", and `n` threads for "scatter".
 
     Author: B.G (08/2026)
     """

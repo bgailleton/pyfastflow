@@ -45,7 +45,7 @@ def _taichi():
 
 
 def _param(be, pool, name, mode="scalar", value=0):
-    return be.ParameterCls(name, dtype=be.dtypes["i32"], mode=mode, value=value, pool=pool)
+    return be.ParameterCls(name, dtype="i32", mode=mode, value=value, pool=pool)
 
 
 def test_rebind_decrements_old_param():
@@ -166,10 +166,10 @@ def test_swap_decrements_old_handle():
         "}"
     )
     b = KernelBuilder(tmpl, domain="out").freeze().build()
-    b.bind("N", be.ParameterCls("N", dtype=be.dtypes["i32"], mode="const", value=8, pool=None))
+    b.bind("N", be.ParameterCls("N", dtype="i32", mode="const", value=8, pool=None))
     h1 = pool.get_data(be.dtypes["i32"], (8,))
     b.bind("out", h1)
-    run = b.compile("cupy")  # the compiled kernel now holds h1 (bound_by incremented)
+    run = b.compile()  # the compiled kernel now holds h1 (bound_by incremented)
     assert h1._bound_by >= 1
     h2 = pool.get_data(be.dtypes["i32"], (8,))
     run.swap("out", h2)  # decrements h1, increments h2

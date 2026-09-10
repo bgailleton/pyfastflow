@@ -240,10 +240,7 @@ def _label_only_sequence(backend, deps, grid_params, n_flat, rec, rec_jump, bid,
         _bind_if_present(bound, ("label_basins", "copy_rec_to_recjump", "dst"), rec_jump)
     _bind_grid_everywhere(bound, grid_params)
 
-    if backend == "cupy":
-        compiled = bound.compile(backend)
-    else:
-        compiled = bound.compile(backend)
+    compiled = bound.compile()
     bound.close()
     return compiled
 
@@ -310,8 +307,7 @@ def run(backend: str):
     recv_bound.bind_leaf(grid_params)
     recv_bound.bind("z", z)
     recv_bound.bind("rec", rec)
-    recv_launch = {}
-    recv_kernel = recv_bound.compile(backend)
+    recv_kernel = recv_bound.compile(_bk)
 
     buffers = dict(
         rec=rec, z=z, bid=bid, rec_jump=rec_jump, z_prime=z_prime,
@@ -330,7 +326,7 @@ def run(backend: str):
         bound = bind_depression_solver(
             frozen, grid_params, ndep_p=ndep_p, method=method, reroute=reroute, **buffers,
         )
-        solvers[(method, reroute)] = bound.compile(backend, **recv_launch)
+        solvers[(method, reroute)] = bound.compile(_bk)
         bound.close()
         if reroute == "carve":
             labellers[method] = _label_only_sequence(
@@ -345,7 +341,7 @@ def run(backend: str):
     rows = []
     for terrain_name, z_np in terrains:
         upload(z, z_np)
-        recv_kernel(**recv_launch)
+        recv_kernel()
         rec0 = download(rec).astype(np.int64)
         entry_pits = count_pits(rec0, can_out)
 

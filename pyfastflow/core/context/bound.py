@@ -392,11 +392,6 @@ class _Bound:
         self._closed = False
 
     @property
-    def uid(self) -> int:
-        """Process-wide identity assigned at construction."""
-        return self._uid
-
-    @property
     def frozen(self) -> Node:
         """The Node this object was build()-ed from."""
         return self._frozen
@@ -683,7 +678,7 @@ class _Bound:
 
     def _resolve_backend(self, backend):
         """
-        The Backend to compile on: `backend` if given (a Backend or a name,
+        The Backend to compile on: `backend` if given (a Backend,
         checked against any recorded one), else the backend recorded from a
         bound Parameter/handle. Raises CompileError on a mismatch or when none
         can be determined.
@@ -694,7 +689,11 @@ class _Bound:
         from .compile_shared import CompileError
 
         if backend is not None:
-            be = Backend.from_name(backend)
+            if not isinstance(backend, Backend):
+                raise CompileError(
+                    f"compile() requires a Backend object, got {type(backend).__name__}"
+                )
+            be = backend
             if self._backend is not None and be != self._backend:
                 raise CompileError(
                     f"compile({be.name!r}) but this object is bound to {self._backend.name!r}-"
@@ -719,25 +718,22 @@ class BoundKernel(_Bound):
     Author: B.G (08/2026)
     """
 
-    def compile(self, backend=None, **kwargs) -> Any:
+    def compile(self, backend=None) -> Any:
         """
         Produce a frozen, immutable callable from this object's current
         bindings. A snapshot: this BoundKernel stays live and rebindable, and a
         later compile() produces an independent callable (see compile_shared.py
         for CompiledKernel, swap(), and the checks every backend runs first).
 
-        `backend` is a `Backend` (backends.py); a name string is also accepted
-        (converted through Backend.from_name) during the string -> Backend
-        migration. It may be omitted once a backend has been recorded by
+        `backend` is a `Backend` (backends.py). It may be omitted once a backend has been recorded by
         binding a Parameter/handle - the recorded one is used. Passing a backend
-        that differs from the recorded one raises CompileError. `**kwargs` is
-        the temporary cupy grid/block compat (Unit 4).
+        that differs from the recorded one raises CompileError.
 
         Author: B.G (09/2026)
         """
         self._check_open("compile")
         be = self._resolve_backend(backend)
-        return be.compile_kernel(self, **kwargs)
+        return be.compile_kernel(self)
 
 
 class _BoundNonCallable(_Bound):
@@ -750,7 +746,7 @@ class _BoundNonCallable(_Bound):
     Author: B.G (09/2026)
     """
 
-    def compile(self, backend: "str | None" = None, **kwargs) -> Any:
+    def compile(self, backend=None) -> Any:
         """
         Always raises: this kind has no standalone compiled form on any
         backend. Compose its frozen node into a KernelBuilder and compile the

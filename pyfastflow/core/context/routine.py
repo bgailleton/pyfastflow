@@ -32,19 +32,11 @@ inside the kernel composed under `flux`.
 
 Compiling
 ----------
-`BoundRoutine.compile(backend, **kwargs)` checks this routine's own unmet
+`BoundRoutine.compile(backend)` checks this routine's own unmet
 slots, then per step: builds a fresh `BoundKernel` from that step's
 `FrozenKernel`, copies over whatever is bound at that step's addresses
 (`name.*` -> the step's own local addresses), and compiles it. The result is
 a `CompiledRoutine` wrapping each step's `CompiledKernel`, in order.
-
-Per-step launch config
-------------------------
-`compose(name, frozen_kernel, launch=None)` takes an optional dict of
-compile()-kwargs (cupy's `grid=`/`block=`) applied to that step only,
-overriding the routine-level `compile(backend, **kwargs)` defaults key by
-key - e.g. `ops`' scan kernels, which need a different launch shape than
-the rest of a routine they share with.
 
 `CompiledRoutine.swap(addr, buf)` routes `name.*` to that step's own
 `CompiledKernel.swap()`. Calling a `CompiledRoutine` launches every step in
@@ -87,16 +79,10 @@ class RoutineBuilder(_ShareMixin):
         self._uid = new_uid()
         self._order: list[str] = []
         self._composed: dict[str, FrozenKernel] = {}
-        self._launch: dict[str, dict] = {}
         self._shared: dict[tuple, tuple] = {}
         self._synthetic: dict[str, Any] = {}
         self._shared_seen: set[tuple] = set()
         self._frozen = False
-
-    @property
-    def uid(self) -> int:
-        """Process-wide identity assigned at construction. See Parameter.uid (parameter.py)."""
-        return self._uid
 
     def _check_mutable(self) -> None:
         if self._frozen:
@@ -105,7 +91,7 @@ class RoutineBuilder(_ShareMixin):
                 f"build a new RoutineBuilder instead of reusing this one"
             )
 
-    def step(self, name: str, frozen_kernel: FrozenKernel, *, launch: "dict | None" = None) -> "RoutineBuilder":
+    def step(self, name: str, frozen_kernel: FrozenKernel) -> "RoutineBuilder":
         """
         Append a step named `name`, launching `frozen_kernel` at this
         position in the routine's launch order.
@@ -115,11 +101,6 @@ class RoutineBuilder(_ShareMixin):
         name : str
             Address prefix for this step. Must be unique within the routine.
         frozen_kernel : FrozenKernel
-        launch : dict, optional
-            compile()-kwargs (cupy's `grid=`/`block=`) applied to this step
-            only, overriding the routine-level default. See the module
-            docstring's "Per-step launch config" section.
-
         Author: B.G (08/2026)
         """
         self._check_mutable()
@@ -134,7 +115,6 @@ class RoutineBuilder(_ShareMixin):
         if name in self._composed:
             raise RoutineBuilderError(f"'{name}' is already registered on this routine")
         self._composed[name] = frozen_kernel
-        self._launch[name] = dict(launch) if launch else {}
         self._order.append(name)
         return self
 
@@ -154,15 +134,14 @@ class RoutineBuilder(_ShareMixin):
         if not self._order:
             raise RoutineBuilderError("freeze: routine has no steps - compose() at least one kernel first")
         self._frozen = True
-        return FrozenRoutine(self._order, self._composed, self._launch, self._shared, self._synthetic)
+        return FrozenRoutine(self._order, self._composed, self._shared, self._synthetic)
 
 
 class FrozenRoutine(Node):
     """
     The frozen result of a RoutineBuilder's freeze(): a `Node` of kind
     "routine" whose `children` are its steps, insertion order = launch order,
-    plus each step's own launch-kwargs override (`.launch`). It has no
-    template/contract/slots of its own; `.order` reports its step names in
+    It has no template/contract/slots of its own; `.order` reports its step names in
     launch order. build() is inherited from Node. See the module docstring.
 
     Author: B.G (09/2026)
@@ -174,7 +153,6 @@ class FrozenRoutine(Node):
         self,
         order: list,
         composed: dict,
-        launch: "dict | None" = None,
         shared: "dict | None" = None,
         synthetic: "dict | None" = None,
     ):
@@ -187,13 +165,6 @@ class FrozenRoutine(Node):
             synthetic=synthetic,
             order=tuple(order),
         )
-        object.__setattr__(self, "_launch", dict(launch) if launch else {})
-
-    @property
-    def launch(self) -> dict:
-        """{step name: launch-kwargs override dict}, read-only copy. See compose()'s `launch=`."""
-        return dict(self._launch)
-
     def __repr__(self) -> str:
         return f"FrozenRoutine(uid={self._uid}, steps={list(self.order)})"
 
@@ -208,14 +179,13 @@ class BoundRoutine(_Bound):
     Author: B.G (08/2026)
     """
 
-    def compile(self, backend=None, **kwargs) -> "CompiledRoutine":
+    def compile(self, backend=None) -> "CompiledRoutine":
         """
         Compile every step and return the resulting CompiledRoutine. See
         the module docstring's "Compiling" section.
 
-        `backend` is a `Backend` (or a name, or omitted to use the one recorded
-        from bound Parameters). `**kwargs` is the temporary per-step cupy
-        grid/block compat (Unit 4), overridden by a step's own `launch=`.
+        `backend` is a `Backend`, or may be omitted to use the one recorded
+        from bound Parameters and data handles.
 
         Author: B.G (09/2026)
         """
@@ -229,8 +199,7 @@ class BoundRoutine(_Bound):
             step_frozen = frozen.children[name]
             step_bound = step_frozen.build()
             self.bind_into(step_bound, (name,))
-            step_kwargs = {**kwargs, **frozen.launch.get(name, {})}
-            compiled = step_bound.compile(be, **step_kwargs)
+            compiled = step_bound.compile(be)
             steps.append((name, compiled))
             step_bounds.append(step_bound)
         return CompiledRoutine(steps, step_bounds)

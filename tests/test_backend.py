@@ -63,7 +63,7 @@ def test_compile_infers_recorded_backend_and_rejects_mismatch():
             z[i] = ctx.K.get(0)
 
     b = KernelBuilder(_k_param, domain="z").freeze().build()
-    b.bind("K", be.ParameterCls("K", dtype=be.dtypes["f32"], mode="const", value=3.0, pool=pool))
+    b.bind("K", be.ParameterCls("K", dtype="f32", mode="const", value=3.0, pool=pool))
     zh = pool.get_data(ti.f32, (8,))
     b.bind("z", zh)
     run = b.compile()  # no backend argument: inferred from the bound taichi Parameter
@@ -72,8 +72,10 @@ def test_compile_infers_recorded_backend_and_rejects_mismatch():
     assert float(zh.array.to_numpy()[0]) == 3.0
 
     if _available("cupy"):
+        with pytest.raises(CompileError, match="Backend object"):
+            b.compile("cupy")
         with pytest.raises(CompileError, match="cupy"):
-            b.compile("cupy")  # differs from the recorded taichi backend
+            b.compile(Backend.from_name("cupy"))  # differs from the recorded taichi backend
     run.close()
     b.close()
     pool.clear_all(force=True)
@@ -114,8 +116,8 @@ def test_mixed_backend_param_binding_rejected():
             z[i] = ctx.A.get(0) + ctx.B.get(0)
 
     b = KernelBuilder(_two, domain="z").freeze().build()
-    b.bind("A", tbe.ParameterCls("A", dtype=tbe.dtypes["f32"], mode="const", value=1.0, pool=None))
+    b.bind("A", tbe.ParameterCls("A", dtype="f32", mode="const", value=1.0, pool=None))
     from pyfastflow.core.context.bound import BindError
 
     with pytest.raises(BindError, match="single-backend"):
-        b.bind("B", cbe.ParameterCls("B", dtype=cbe.dtypes["f32"], mode="const", value=2.0, pool=None))
+        b.bind("B", cbe.ParameterCls("B", dtype="f32", mode="const", value=2.0, pool=None))

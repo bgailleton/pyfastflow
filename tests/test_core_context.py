@@ -91,10 +91,6 @@ def _closure(name):
     return name in ("taichi", "quadrants")
 
 
-def _launch(name, n):
-    return {} if _closure(name) else {"grid": ((n + 255) // 256,), "block": (256,)}
-
-
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +114,7 @@ extern "C" __global__ void {t}_k(const float* arr, float* out) {{
 }}
 """
 
-    frozen = KernelBuilder(template).freeze()
+    frozen = KernelBuilder(template, domain="arr").freeze()
 
     arr_np = np.arange(n, dtype=np.float32)
     fld_np = (np.arange(n, dtype=np.float32) * 0.5)
@@ -126,9 +122,9 @@ extern "C" __global__ void {t}_k(const float* arr, float* out) {{
     out = pool.get_data(f32, (n,))
     arr.from_numpy(arr_np)
 
-    kp = Param("K", dtype=f32, mode="const", value=2.0, pool=pool)
-    sp = Param("S", dtype=f32, mode="scalar", value=10.0, pool=pool)
-    fp = Param("F", dtype=f32, mode="field", value=fld_np, pool=pool, n_flat=n)
+    kp = Param("K", dtype="f32", mode="const", value=2.0, pool=pool)
+    sp = Param("S", dtype="f32", mode="scalar", value=10.0, pool=pool)
+    fp = Param("F", dtype="f32", mode="field", value=fld_np, pool=pool, shape=(n,))
 
     bound = frozen.build()
     bound.bind("K", kp)
@@ -136,20 +132,20 @@ extern "C" __global__ void {t}_k(const float* arr, float* out) {{
     bound.bind("F", fp)
     bound.bind("arr", arr)
     bound.bind("out", out)
-    run = bound.compile(backend, **_launch(backend, n))
+    run = bound.compile()
     run()
 
     assert np.allclose(out.to_numpy(), arr_np * 2.0 + 10.0 + fld_np, rtol=1e-5)
 
     # builder not consumed; re-bind the same frozen with a new scalar value
-    sp2 = Param("S", dtype=f32, mode="scalar", value=100.0, pool=pool)
+    sp2 = Param("S", dtype="f32", mode="scalar", value=100.0, pool=pool)
     bound2 = frozen.build()
     bound2.bind("K", kp)
     bound2.bind("S", sp2)
     bound2.bind("F", fp)
     bound2.bind("arr", arr)
     bound2.bind("out", out)
-    run2 = bound2.compile(backend, **_launch(backend, n))
+    run2 = bound2.compile()
     run2()
     assert np.allclose(out.to_numpy(), arr_np * 2.0 + 100.0 + fld_np, rtol=1e-5)
 
@@ -187,19 +183,19 @@ extern "C" __global__ void {t}_k(const float* arr, float* out) {{
 }}
 """
 
-    frozen = KernelBuilder(ktemplate).compose("h", helper).freeze()
+    frozen = KernelBuilder(ktemplate, domain="arr").compose("h", helper).freeze()
 
     arr_np = np.arange(n, dtype=np.float32)
     arr = pool.get_data(f32, (n,))
     out = pool.get_data(f32, (n,))
     arr.from_numpy(arr_np)
 
-    bp = Param("B", dtype=f32, mode="scalar", value=7.0, pool=pool)
+    bp = Param("B", dtype="f32", mode="scalar", value=7.0, pool=pool)
     bound = frozen.build()
     bound.bind(("h", "B"), bp)
     bound.bind("arr", arr)
     bound.bind("out", out)
-    run = bound.compile(backend, **_launch(backend, n))
+    run = bound.compile()
     run()
 
     assert np.allclose(out.to_numpy(), arr_np + 7.0, rtol=1e-5)
@@ -239,8 +235,8 @@ extern "C" __global__ void {t}_mul3(int* buf) {{
 }}
 """
 
-    k_add = KernelBuilder(add1).freeze()
-    k_mul = KernelBuilder(mul3).freeze()
+    k_add = KernelBuilder(add1, domain="buf").freeze()
+    k_mul = KernelBuilder(mul3, domain="buf").freeze()
 
     rb = RoutineBuilder()
     rb.step("add1", k_add)
@@ -253,7 +249,7 @@ extern "C" __global__ void {t}_mul3(int* buf) {{
     bound = frozen.build()
     bound.bind(("add1", "buf"), buf)
     bound.bind(("mul3", "buf"), buf)
-    run = bound.compile(backend, **_launch(backend, n))
+    run = bound.compile()
     run()
 
     assert np.array_equal(buf.to_numpy(), np.full(n, (5 + 1) * 3, dtype=np.int32))
@@ -270,7 +266,6 @@ def test_sequence_host_loop(backend):
         def bump_tmpl(ctx):
             ctx.CNT.set_node(0, ctx.CNT.get(0) + 1)
         bump = bump_tmpl
-        launch = {}
     else:
         t = f"pf{new_uid()}"
         bump = f"""
@@ -279,12 +274,11 @@ extern "C" __global__ void {t}_bump() {{
     $ctx.CNT.set_node(0, cur + 1)$;
 }}
 """
-        launch = {"grid": (1,), "block": (1,)}
 
     def stop_tmpl(ctx):
         return int(ctx.CNT.read()) >= 3
 
-    k_bump = KernelBuilder(bump).freeze()
+    k_bump = KernelBuilder(bump, domain=1, block=1).freeze()
     stop_hb = HostBlockBuilder(stop_tmpl).freeze()
 
     sb = SequenceBuilder()
@@ -293,11 +287,11 @@ extern "C" __global__ void {t}_bump() {{
     sb.loop(body=["bump"], max_times=10, until="stop")
     frozen = sb.freeze()
 
-    cnt = Param("CNT", dtype=i32, mode="scalar", value=0, pool=pool)
+    cnt = Param("CNT", dtype="i32", mode="scalar", value=0, pool=pool)
     bound = frozen.build()
     bound.bind(("bump", "CNT"), cnt)
     bound.bind(("stop", "CNT"), cnt)
-    compiled = bound.compile(backend, **launch)
+    compiled = bound.compile()
     compiled()
 
     assert int(cnt.read()) == 3
@@ -330,25 +324,25 @@ def test_build_contracts(backend):
         ok = f'extern "C" __global__ void {t}_ok(float* arr) {{ arr[0] = $ctx.Z.get(0)$; }}'
 
     with pytest.raises(ContractError):
-        KernelBuilder(bad).freeze()
+        KernelBuilder(bad, domain="arr").freeze()
 
     # a frozen builder cannot be reused
-    kb = KernelBuilder(ok)
+    kb = KernelBuilder(ok, domain="arr")
     kb.freeze()
     with pytest.raises(FrozenError):
         kb.freeze()
 
     # bind(None)
-    bound = KernelBuilder(ok).freeze().build()
+    bound = KernelBuilder(ok, domain="arr").freeze().build()
     with pytest.raises(BindError):
         bound.bind("Z", None)
 
     # compile with an unbound slot
     with pytest.raises(CompileError):
-        bound.compile(backend, **_launch(backend, n))
+        bound.compile(Backend.from_name(backend))
 
     # set() on a const Parameter
-    cp = Param("Z", dtype=f32, mode="const", value=1.0, pool=pool)
+    cp = Param("Z", dtype="f32", mode="const", value=1.0, pool=pool)
     with pytest.raises(Exception):
         cp.set(2.0)
 

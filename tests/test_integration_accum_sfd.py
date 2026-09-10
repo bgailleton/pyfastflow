@@ -134,7 +134,6 @@ def test_accum_sfd(backend, boundary, nodata, custom_outlet):
     n = nx * ny
     nn = 8
     outlet_cfg = "mask" if custom_outlet else "edge"
-    launch = {} if closure else {"grid": ((n + BLOCK - 1) // BLOCK,), "block": (BLOCK,)}
 
     pool = _pool_cls(backend)()
     grid = make_grid_group(bk, topology="D8", boundary=boundary, nodata=nodata, outlet=outlet_cfg)
@@ -166,12 +165,12 @@ def test_accum_sfd(backend, boundary, nodata, custom_outlet):
     rb.bind_leaf(gp)
     rb.bind("z", z)
     rb.bind("rec", rec)
-    recv_solver = rb.compile(backend)
-    recv_solver(**launch)
+    recv_solver = rb.compile(bk)
+    recv_solver()
     rec0 = rec.to_numpy().astype(np.int32)
 
     # carve, optimized
-    ndep_p = Param("NDEP", dtype=i32, mode="scalar", value=0, pool=pool)
+    ndep_p = Param("NDEP", dtype="i32", mode="scalar", value=0, pool=pool)
     carve_bufs = dict(
         rec=rec, z=z,
         bid=pool.get_data(i32, (n,)), rec_jump=pool.get_data(i32, (n,)),
@@ -190,7 +189,7 @@ def test_accum_sfd(backend, boundary, nodata, custom_outlet):
     bound = bind_depression_solver(
         frozen, gp, ndep_p=ndep_p, method="optimized", reroute="carve", **carve_bufs,
     )
-    solver = bound.compile(backend, **launch)
+    solver = bound.compile(bk)
     bound.close()
     solver()
     assert int(ndep_p.read()) == 0, "carve/optimized left unresolved pits"
@@ -203,10 +202,10 @@ def test_accum_sfd(backend, boundary, nodata, custom_outlet):
     src_ones = np.ones(n, dtype=np.float32)
     ref = numpy_topological_accum(rec_np, src_ones)
 
-    source_p = Param("SOURCE", dtype=f32, mode="const", value=1.0, pool=pool)
+    source_p = Param("SOURCE", dtype="f32", mode="const", value=1.0, pool=pool)
 
     # rake_compress
-    iter_p = Param("ITER", dtype=i32, mode="scalar", value=0, pool=pool)
+    iter_p = Param("ITER", dtype="i32", mode="scalar", value=0, pool=pool)
     acc_rc = make_accumulation(bk, grid, method="rake_compress", n_flat=n, n_neighbours=nn)
     b_rc = acc_rc["sequence"].freeze().build()
     q_rc = pool.get_data(f32, (n,))
@@ -222,7 +221,7 @@ def test_accum_sfd(backend, boundary, nodata, custom_outlet):
         "q_alt": q_alt, "src": src,
     })
     b_rc.bind_leaf({"SOURCE": source_p, "ITER": iter_p})
-    rc_solver = b_rc.compile(backend, **launch)
+    rc_solver = b_rc.compile(bk)
     rc_solver()
     q_rake = q_rc.to_numpy().astype(np.float64)
 
@@ -234,7 +233,7 @@ def test_accum_sfd(backend, boundary, nodata, custom_outlet):
     work2 = pool.get_data(i32, (n,))
     q_work = pool.get_data(f32, (n,))
     _bind_pjp(b_pjp, closure, source_p=source_p, q=q_pjp, work=work, work2=work2, q_work=q_work, rec=rec)
-    pjp_solver = b_pjp.compile(backend, **launch)
+    pjp_solver = b_pjp.compile(bk)
     pjp_solver()
     q_jump = q_pjp.to_numpy().astype(np.float64)
 

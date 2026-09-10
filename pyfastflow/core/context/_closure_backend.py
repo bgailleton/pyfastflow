@@ -108,7 +108,7 @@ class ClosureBackendParameter(Parameter):
 
     _backend: ClassVar[Any]
 
-    def __init__(self, name: str, *, dtype, mode: str, value, pool, shape: tuple = (), n_flat: int | None = None):
+    def __init__(self, name: str, *, dtype: str, mode: str, value, pool, shape: tuple = ()):
         """
         Declare one parameter and give it its initial value.
 
@@ -118,9 +118,8 @@ class ClosureBackendParameter(Parameter):
         Parameters
         ----------
         name : str
-        dtype : str or ti.* / qd.* dtype
-            Short dtype tag (``"f32"``, ``"i32"``, ...) or the temporary
-            backend-native spelling accepted during the feature migration.
+        dtype : str
+            Short dtype tag (``"f32"``, ``"i32"``, ...).
         mode : str
             One of MODES ("const", "scalar", "field").
         value : Any
@@ -129,33 +128,28 @@ class ClosureBackendParameter(Parameter):
             Device-buffer pool backing scalar/field storage.
         shape : tuple, optional
             Field storage shape. Field parameters require a non-empty shape.
-        n_flat : int, optional
-            Temporary compatibility spelling for ``shape=(n_flat,)``.
-
         Raises
         ------
         ValueError
-            If `mode` is not in MODES, or field mode is given without
-            `n_flat`.
+            If `mode` is not in MODES, or field mode is given without a
+            shape.
 
         Author: B.G (07/2026)
         """
         if mode not in MODES:
             raise ValueError(f"{name}: mode must be one of {sorted(MODES)}, got {mode!r}")
-        if isinstance(dtype, str):
-            try:
-                dtype = getattr(self._backend, dtype)
-            except AttributeError as exc:
-                raise ValueError(f"{name}: unknown dtype tag {dtype!r}") from exc
+        if not isinstance(dtype, str):
+            raise TypeError(f"{name}: dtype must be a short tag string, got {type(dtype).__name__}")
+        try:
+            backend_dtype = getattr(self._backend, dtype)
+        except AttributeError as exc:
+            raise ValueError(f"{name}: unknown dtype tag {dtype!r}") from exc
         shape = tuple(shape)
-        if n_flat is not None:
-            if shape:
-                raise ValueError(f"{name}: pass shape= or n_flat=, not both")
-            shape = (int(n_flat),)
 
         super().__init__()
         self.name = name
         self.dtype = dtype
+        self.backend_dtype = backend_dtype
         self.mode = mode
         self._pool = pool
         self._const_value: Any = None
@@ -226,11 +220,11 @@ class ClosureBackendParameter(Parameter):
         Author: B.G (07/2026)
         """
         if self.mode == "const":
-            self._const_value = self._numpy_dtype(self.dtype)(value).item()
+            self._const_value = self._numpy_dtype(self.backend_dtype)(value).item()
         elif self.mode == "scalar":
             self._handle.array[None] = value
         else:  # field
-            arr = np.asarray(value, dtype=self._numpy_dtype(self.dtype)).reshape(-1)
+            arr = np.asarray(value, dtype=self._numpy_dtype(self.backend_dtype)).reshape(-1)
             self._handle.array.from_numpy(arr)
 
     def set_node(self, node, value) -> None:
@@ -273,7 +267,7 @@ class ClosureBackendParameter(Parameter):
                 f"{self.name}: read() is for scalar/const only; a field is not meant to be "
                 f"read back to the host as a whole"
             )
-        return self._numpy_dtype(self.dtype)(self._handle.array.to_numpy()).item()
+        return self._numpy_dtype(self.backend_dtype)(self._handle.array.to_numpy()).item()
 
     def destroy(self) -> None:
         """

@@ -195,11 +195,6 @@ class _Builder(_ShareMixin):
     # arguments, a group has no signature).
     _HAS_DATA = False
 
-    @property
-    def uid(self) -> int:
-        """Process-wide identity assigned at construction. See Parameter.uid (parameter.py)."""
-        return self._uid
-
     def _check_mutable(self) -> None:
         if self._frozen:
             raise FrozenError(

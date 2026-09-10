@@ -98,7 +98,7 @@ def _register_ptr(state: _EmitState, param: Parameter, write: bool, local_ptrs: 
     uid = param.uid
     entry = state.registry.get(uid)
     if entry is None:
-        entry = {"ctype": _ctype(param.dtype), "write": False, "array": param.handle().array}
+        entry = {"ctype": _ctype(param.backend_dtype), "write": False, "array": param.handle().array}
         state.registry[uid] = entry
     if write:
         entry["write"] = True
@@ -262,7 +262,7 @@ def _check_cupy_data_signature(template: str) -> list[str]:
     return [p.strip().rsplit(None, 1)[-1].lstrip("*") for p in parts]
 
 
-def compile_kernel(bound: BoundKernel, *, grid: Any = None, block: Any = None) -> CompiledKernel:
+def compile_kernel(bound: BoundKernel) -> CompiledKernel:
     """
     Compile `bound` to a cupy `cp.RawModule`. Checks unmet slots and legal
     PARAM accessors first (compile_shared.py), then emits the kernel's own
@@ -273,11 +273,6 @@ def compile_kernel(bound: BoundKernel, *, grid: Any = None, block: Any = None) -
     Parameters
     ----------
     bound : BoundKernel
-    grid, block : optional
-        Launch-dimension defaults for the returned CompiledKernel (see
-        CompiledKernel.__call__) - cupy has no auto-ranging equivalent to
-        Taichi/Quadrants, so a caller must supply them here or at call time.
-
     Returns
     -------
     CompiledKernel
@@ -318,25 +313,25 @@ def compile_kernel(bound: BoundKernel, *, grid: Any = None, block: Any = None) -
 
     # Launch domain (Unit 4): domain names one of this kernel's DATA args (the
     # launch extent is that buffer's length at launch time) or is a fixed int;
-    # block is threads/block (default DEFAULT_BLOCK - moves to Backend.
-    # default_block in Unit 5). A domain of None falls back to the compile-time
-    # grid/block compat path.
+    # block is threads/block (default DEFAULT_BLOCK).
     domain = frozen.domain
     domain_addr = None
     extent = None
-    kernel_block = block
+    kernel_block = frozen.block or DEFAULT_BLOCK
     if isinstance(domain, str):
         if domain not in data_names:
             raise CompileError(
                 f"domain={domain!r} is not one of this kernel's DATA arguments {data_names}"
             )
         domain_addr = (domain,)
-        kernel_block = frozen.block or DEFAULT_BLOCK
     elif isinstance(domain, int):
         extent = domain
-        kernel_block = frozen.block or DEFAULT_BLOCK
+    else:
+        raise CompileError(
+            "cupy kernels require KernelBuilder(..., domain=<a DATA arg or int>)"
+        )
     return CompiledKernel(
         bound, launch, data_order,
-        needs_launch_dims=True, grid=grid, block=kernel_block,
+        block=kernel_block,
         domain_addr=domain_addr, extent=extent,
     )

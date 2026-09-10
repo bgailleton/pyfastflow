@@ -181,7 +181,7 @@ def run(backend: str):
         frozen, grid_params, z=z, filled=filled, parent=parent, frontier=frontier,
         counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
     )
-    solver = bound.compile(backend, **({} if _bk.family == "closure" else {"grid": ((n + BLOCK - 1) // BLOCK,), "block": (BLOCK,)}))
+    solver = bound.compile(_bk)
     bound.close()
 
     terrains = (

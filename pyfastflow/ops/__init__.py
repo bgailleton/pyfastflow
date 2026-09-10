@@ -74,8 +74,7 @@ Scan's cupy compaction
 `.inclusive()` on cupy stays `cp.cumsum` (CUB's own DeviceScan is already
 the accelerator cupy dispatches to by default on this build). Compaction's
 count-read and scatter are a 2-step FrozenRoutine (routine.py): "read_count"
-(1 thread) then "scatter" (ceil(n/block) blocks), each composed with its own
-`launch=` override sized to its own real thread count - see
+declares a one-thread domain and "scatter" declares an `n`-thread domain; see
 _cupy_blocks.build_count_and_scatter_routine's own docstring.
 
 One consequence: scatter always launches on cupy, even when `count == 0`

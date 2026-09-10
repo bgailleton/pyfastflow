@@ -193,12 +193,11 @@ class Backend:
             dict(_NP_DTYPES), _NP_DTYPES, None, None,
         )
 
-    def compile_kernel(self, bound, **kw):
+    def compile_kernel(self, bound):
         """
         Compile `bound` on this backend - dispatches to compile_closure (with
-        this backend's module) or compile_cupy. Closure backends take no launch
-        kwargs (they range over the template's loop); cupy takes them (the
-        temporary grid/block compat, Unit 4).
+        this backend's module) or compile_cupy. Launch dimensions belong to the
+        frozen kernel's `domain`/`block` declaration.
 
         Author: B.G (09/2026)
         """
@@ -208,7 +207,7 @@ class Backend:
             return compile_closure.compile_kernel(bound, self.module)
         from . import compile_cupy
 
-        return compile_cupy.compile_kernel(bound, **kw)
+        return compile_cupy.compile_kernel(bound)
 
     def pool(self):
         """A fresh Pool for this backend."""

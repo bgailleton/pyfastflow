@@ -75,7 +75,7 @@ def _edge_can_out(boundary: str, nx: int, ny: int) -> np.ndarray:
 def test_accum_mfd(boundary, nodata, custom_outlet):
     from pyfastflow.core.pool.cupy_pool import CupyPool
     from pyfastflow.flow import bind_fill_reconstruct_solver, make_accumulation, make_fill_reconstruct, make_fill_reconstruct_solver
-    from pyfastflow.flow._cupy_mfd_accum import init_frontier_mfd, persistent_grid_block
+    from pyfastflow.flow._cupy_mfd_accum import init_frontier_mfd
     from pyfastflow.graphflood import _cupy_mfd_topology, _cupy_reconstruct_epsilon
     from pyfastflow.grid import make_grid_group, make_grid_parameters
 
@@ -86,7 +86,6 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
     nx = ny = SIDE
     n = nx * ny
     outlet_cfg = "mask" if custom_outlet else "edge"
-    launch = {"grid": ((n + BLOCK - 1) // BLOCK,), "block": (BLOCK,)}
 
     pool = CupyPool()
     grid = make_grid_group(bk, topology="D8", boundary=boundary, nodata=nodata, outlet=outlet_cfg)
@@ -119,8 +118,8 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
     queued_gen = pool.get_data(i32, (n,))
     counters.from_numpy(np.zeros(max_passes + 2, dtype=np.int32))
     queued_gen.from_numpy(np.full(n, -1, dtype=np.int32))
-    pass_p = Param("PASS", dtype=i32, mode="scalar", value=0, pool=pool)
-    active_p = Param("ACTIVE", dtype=i32, mode="scalar", value=0, pool=pool)
+    pass_p = Param("PASS", dtype="i32", mode="scalar", value=0, pool=pool)
+    active_p = Param("ACTIVE", dtype="i32", mode="scalar", value=0, pool=pool)
 
     recon = make_fill_reconstruct(bk, grid, nx=nx, ny=ny)
     frozen, _ = make_fill_reconstruct_solver(
@@ -131,7 +130,7 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
         frozen, gp, z=z, filled=filled, parent=parent, frontier=frontier,
         counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
     )
-    solver = bound.compile("cupy", **launch)
+    solver = bound.compile(bk)
     bound.close()
     solver()
     solver.close()
@@ -147,7 +146,7 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
     hi.bind("filled", filled)
     hi.bind("dist", dist)
     hi.bind("anc", anc)
-    hops_init = hi.compile("cupy", **launch)
+    hops_init = hi.compile(bk)
 
     hj_frozen = _cupy_reconstruct_epsilon.build_hops_jump(n_flat=n)
     hj_fwd = hj_frozen.build()
@@ -155,13 +154,13 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
     hj_fwd.bind("anc_in", anc)
     hj_fwd.bind("dist_out", dist2)
     hj_fwd.bind("anc_out", anc2)
-    hops_fwd = hj_fwd.compile("cupy", **launch)
+    hops_fwd = hj_fwd.compile(bk)
     hj_bwd = hj_frozen.build()
     hj_bwd.bind("dist_in", dist2)
     hj_bwd.bind("anc_in", anc2)
     hj_bwd.bind("dist_out", dist)
     hj_bwd.bind("anc_out", anc)
-    hops_bwd = hj_bwd.compile("cupy", **launch)
+    hops_bwd = hj_bwd.compile(bk)
 
     hops_rounds = math.ceil(math.log2(max(2, n))) + 1
     if hops_rounds % 2:
@@ -186,17 +185,17 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
     dw.bind("dirs", dirs)
     dw.bind("mfd_w", mfd_w)
     dw.bind_leaf(gp)
-    dirs_weights = dw.compile("cupy", **launch)
+    dirs_weights = dw.compile(bk)
 
     ir = topo["indegree_reset"].build()
     ir.bind("indegree", indegree)
-    indegree_reset = ir.compile("cupy", **launch)
+    indegree_reset = ir.compile(bk)
 
     ic = topo["indegree_count"].build()
     ic.bind("dirs", dirs)
     ic.bind("indegree", indegree)
     ic.bind_leaf(gp)
-    indegree_count = ic.compile("cupy", **launch)
+    indegree_count = ic.compile(bk)
 
     indegree_reset()
     dirs_weights()
@@ -209,14 +208,14 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
     count = pool.get_data(i32, (2,))
     barrier = pool.get_data(u32, (1,))
 
-    source_p = Param("SRC", dtype=f32, mode="const", value=1.0, pool=pool)
+    source_p = Param("SRC", dtype="f32", mode="const", value=1.0, pool=pool)
     accum = make_accumulation(bk, grid, method="persistent_mfd", n_flat=n, n_neighbours=NN)
 
     qib = accum["q_init"].build()
     qib.bind("SOURCE", source_p)
     qib.bind("accum", accum_h)
     qib.bind_leaf(gp, prefix=("grid",))
-    q_init = qib.compile("cupy", **launch)
+    q_init = qib.compile(bk)
     q_init()
 
     n0 = init_frontier_mfd(indegree.array, frontier0.array)
@@ -234,8 +233,7 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
     ab.bind("mfd_w", mfd_w)
     ab.bind("accum", accum_h)
     ab.bind("indegree", indegree)
-    pgrid, pblock = persistent_grid_block()
-    persistent = ab.compile("cupy", grid=pgrid, block=pblock)
+    persistent = ab.compile(bk)
     persistent()
 
     got = accum_h.to_numpy().astype(np.float64)

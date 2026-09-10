@@ -231,8 +231,6 @@ class CompiledKernel:
         launch: Callable,
         data_order: list[Address],
         *,
-        needs_launch_dims: bool = False,
-        grid: Any = None,
         block: Any = None,
         domain_addr: "Address | None" = None,
         extent: "int | None" = None,
@@ -241,15 +239,12 @@ class CompiledKernel:
         self._launch = launch
         self._data_order = list(data_order)
         self._data: dict[Address, Any] = {addr: bound.value_at(addr) for addr in self._data_order}
-        self._needs_launch_dims = needs_launch_dims
-        self._grid = grid
         self._block = block
         # Unit 4 launch domain (cupy): the extent is a fixed int, or the length
         # of the DATA buffer at `domain_addr` read live at every launch (so
         # swap() to a shorter buffer shrinks the launch), and grid = ceil(n /
-        # block). When both are None the kernel is on the compat path and reads
-        # grid/block from compile()/the call (removed once every caller is on
-        # domain=).
+        # block). Both are None for closure backends, whose template loop owns
+        # its iteration space.
         self._domain_addr = domain_addr
         self._extent = extent
         # destroy safety (Unit 6): this compiled kernel independently holds its
@@ -321,40 +316,28 @@ class CompiledKernel:
         for buf in self._data.values():
             _refcount(buf, -1)
 
-    def __call__(self, *, grid: Any = None, block: Any = None):
+    def __call__(self):
         """
         Launch with whatever `swap()` currently holds for every DATA address,
         in `data_order`. Takes no arguments in normal use: a closure backend
         ranges over the template's own loop, and cupy computes its grid from the
-        kernel's launch domain (Unit 4). `grid`/`block` are the temporary compat
-        path for a cupy kernel built without a `domain=` (removed once every
-        caller is migrated); ignored otherwise.
+        kernel's launch domain (Unit 4).
 
         Author: B.G (09/2026)
         """
         # DATA is represented by a DataHandle throughout the bind graph. Only
         # the backend call boundary unwraps it to the native buffer.
         args = [getattr(self._data[addr], "array", self._data[addr]) for addr in self._data_order]
-        if not self._needs_launch_dims:
+        if self._domain_addr is None and self._extent is None:
             return self._launch(*args)
-        if self._domain_addr is not None or self._extent is not None:
-            if self._extent is not None:
-                n = self._extent
-            else:
-                buf = self._data[self._domain_addr]
-                arr = getattr(buf, "array", buf)
-                n = int(arr.shape[0])
-            b = self._block
-            g = (n + b - 1) // b
-            return self._launch(*args, grid=(g,), block=(b,))
-        g = grid if grid is not None else self._grid
-        b = block if block is not None else self._block
-        if g is None or b is None:
-            raise CompileError(
-                "this compiled kernel needs explicit launch dimensions - build the kernel with "
-                "KernelBuilder(..., domain=<a DATA arg or int>), or pass grid=/block= (compat)"
-            )
-        return self._launch(*args, grid=g, block=b)
+        if self._extent is not None:
+            n = self._extent
+        else:
+            buf = self._data[self._domain_addr]
+            n = int(buf.array.shape[0])
+        b = self._block
+        g = (n + b - 1) // b
+        return self._launch(*args, grid=(g,), block=(b,))
 
     def __repr__(self) -> str:
         return f"CompiledKernel(data={[format_address(a) for a in self._data_order]})"

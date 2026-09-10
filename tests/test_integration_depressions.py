@@ -136,7 +136,6 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
     nx = ny = SIDE
     n = nx * ny
     outlet_cfg = "mask" if custom_outlet else "edge"
-    launch = {} if closure else {"grid": ((n + BLOCK - 1) // BLOCK,), "block": (BLOCK,)}
 
     pool = _pool_cls(backend)()
 
@@ -170,13 +169,13 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
     rb.bind_leaf(gp)
     rb.bind("z", z)
     rb.bind("rec", rec)
-    recv_kernel = rb.compile(backend)
-    recv_kernel(**launch)
+    recv_kernel = rb.compile(bk)
+    recv_kernel()
     recv_kernel.close()
     rb.close()
     rec0 = rec.to_numpy().astype(np.int32)
 
-    ndep_p = Param("NDEP", dtype=i32, mode="scalar", value=0, pool=pool)
+    ndep_p = Param("NDEP", dtype="i32", mode="scalar", value=0, pool=pool)
 
     # ---- reconstruct -------------------------------------------------------
     filled = pool.get_data(f32, (n,))
@@ -187,8 +186,8 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
     counters = pool.get_data(i32, (max_passes + 2,))
     counters.from_numpy(np.zeros(max_passes + 2, dtype=np.int32))
     queued_gen.from_numpy(np.full(n, -1, dtype=np.int32))
-    pass_p = Param("PASS", dtype=i32, mode="scalar", value=0, pool=pool)
-    active_p = Param("ACTIVE", dtype=i32, mode="scalar", value=0, pool=pool)
+    pass_p = Param("PASS", dtype="i32", mode="scalar", value=0, pool=pool)
+    active_p = Param("ACTIVE", dtype="i32", mode="scalar", value=0, pool=pool)
 
     fr = make_fill_reconstruct(bk, grid, nx=nx, ny=ny)
     fr_frozen, _ = make_fill_reconstruct_solver(
@@ -199,7 +198,7 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
         fr_frozen, gp, z=z, filled=filled, parent=parent, frontier=frontier,
         counters=counters, queued_gen=queued_gen, pass_p=pass_p, active_p=active_p,
     )
-    fr_solver = fr_bound.compile(backend, **launch)
+    fr_solver = fr_bound.compile(bk)
     fr_bound.close()
     fr_solver()
     fr_solver.close()
@@ -215,8 +214,8 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
     dc.bind("rec", parent_scratch)
     dc.bind("ndep", ndep_p.handle())
     ndep_p.set(0)
-    dc_kernel = dc.compile(backend)
-    dc_kernel(**launch)
+    dc_kernel = dc.compile(bk)
+    dc_kernel()
     dc_kernel.close()
     dc.close()
     assert int(ndep_p.read()) == 0, "reconstruct: device depression_counter != 0"
@@ -242,7 +241,7 @@ def test_depressions_resolve(backend, boundary, nodata, custom_outlet):
         deps_bound = bind_depression_solver(
             deps_frozen, gp, ndep_p=ndep_p, method=method, reroute="carve", **carve_bufs,
         )
-        solver = deps_bound.compile(backend, **launch)
+        solver = deps_bound.compile(bk)
         deps_bound.close()
         solver()
         solver.close()

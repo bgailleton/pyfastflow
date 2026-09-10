@@ -31,9 +31,7 @@ contiguous range (one `atomicAdd` per block, not per cell), fences again,
 then every block increments the global `barrier` counter and spins until it
 reads `(level+1) * gridDim.x` - the point every block has published
 everything for this level - before moving on. The loop exits once
-`count[p]`, reloaded through a volatile pointer each iteration (not just
-once, and not just via the atomics' own side effects - nothing else in this
-kernel forces that reload), is zero.
+`count[p]`, reloaded through a volatile pointer each iteration, is zero.
 
 `accum` is seeded through a `SOURCE` PARAM slot (any mode - a caller binds a
 Parameter there after `.build()`) by a separate `q_init` kernel, not
@@ -78,7 +76,7 @@ from ..core import KernelBuilder, new_uid
 def persistent_grid_block(*, blocks_per_sm: int = 2, threads: int = 256) -> tuple:
     """
     (grid, block) launch dims for the persistent kernel: `blocks_per_sm *
-    <this device's SM count>` blocks, never more than can be co-resident,
+    <this device's SM count>` blocks,
     of `threads` threads each - queried from the current cupy device, not
     sized off n_flat the way every other launch in this package is (the
     frontier itself, not the whole node range, bounds how much work a
@@ -137,6 +135,8 @@ def build_persistent_mfd(
     n_flat: int,
     n_neighbours: int,
     fr_stage: int = 2048,
+    blocks_per_sm: int = 2,
+    threads: int = 256,
 ):
     """
     Two FrozenKernels (new builder/frozen/bound stack): "q_init" (composes
@@ -152,9 +152,10 @@ def build_persistent_mfd(
     `persistent_grid_block(...)`'s dims; there is no per-round host loop to
     sequence, unlike rake_compress/pointer_jump_push. A caller `.build()`s
     each, binds "q_init"'s `SOURCE` PARAM slot and both kernels' composed
-    `grid`, then `.compile("cupy", grid=..., block=...)`s each with its own
-    launch dims (n_flat-sized for "q_init",
-    `persistent_grid_block(blocks_per_sm=..., threads=...)` for "accum").
+    `grid`, then calls `.compile()` on each. The q-init kernel declares an
+    n_flat-sized domain; the accumulation kernel stores
+    `persistent_grid_block(blocks_per_sm=..., threads=...)` as its fixed
+    resident domain, so callers never pass launch dimensions.
 
     `fr_stage` sizes the per-block shared staging buffer (`s_buf`) baked
     into "accum"'s generated source as a compile-time array length - a
@@ -165,7 +166,7 @@ def build_persistent_mfd(
     ----------
     grid : FrozenGroup
     n_flat, n_neighbours : int
-    fr_stage : int, optional
+    fr_stage, blocks_per_sm, threads : int, optional
         Default 2048.
 
     Returns
@@ -177,6 +178,10 @@ def build_persistent_mfd(
     """
     NN = int(n_neighbours)
     t = f"pm{new_uid()}"
+    persistent_grid, persistent_block = persistent_grid_block(
+        blocks_per_sm=blocks_per_sm, threads=threads,
+    )
+    resident_threads = persistent_grid[0] * persistent_block[0]
 
     q_init = (
         KernelBuilder(
@@ -272,7 +277,7 @@ extern "C" __global__ void {t}_persistent_mfd(
         p = 1 - p;
     }}
 }}
-""", domain=n_flat)
+""", domain=resident_threads, block=threads)
         .compose("grid", grid)
         .freeze()
     )

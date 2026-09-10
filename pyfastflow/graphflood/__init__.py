@@ -212,12 +212,12 @@ def _require(label: str, **buffers) -> None:
         raise ValueError(f"make_graphflood: {label} requires {missing}")
 
 
-def _compile_bound(bound, be: Backend, **launch):
+def _compile_bound(bound, be: Backend):
     """Compile one bound structure and release its top-level binding hold.
 
     Author: B.G (09/2026)
     """
-    compiled = bound.compile(be, **launch)
+    compiled = bound.compile(be)
     bound.close()
     return compiled
 
@@ -616,7 +616,6 @@ def _compile_graphflood(
         _require("outlet_behavior='fixed_s'", boundary_slope_p=boundary_slope_p)
 
     closure = be.family == "closure"
-    launch = {}
     core_blocks = _core_blocks_for(be)
     if closure:
         backend_mod = be.module
@@ -686,7 +685,7 @@ def _compile_graphflood(
         if outlet_behavior == "fixed_h":
             bound.bind(("apply_divergence", "BOUNDARY_H"), boundary_h_p)
         bound.bind_leaf(grid_params, prefix=("apply_divergence",))
-        routine = _compile_bound(bound, be, **launch)
+        routine = _compile_bound(bound, be)
         return GraphfloodUnstable(routine)
 
     if kind == "vanilla_mfd":
@@ -698,7 +697,7 @@ def _compile_graphflood(
             dirs=dirs, mfd_w=mfd_w, indegree=indegree, frontier0=frontier0, frontier1=frontier1,
             count=count, barrier=barrier, dist=dist, anc=anc, dist2=dist2, anc2=anc2,
         )
-        from ..flow._cupy_mfd_accum import build_persistent_mfd, init_frontier_mfd, persistent_grid_block
+        from ..flow._cupy_mfd_accum import build_persistent_mfd, init_frontier_mfd
         from . import _cupy_mfd_topology, _cupy_reconstruct_epsilon
 
         make_surface_fk = core_blocks.build_make_surface(n_flat=n_flat)
@@ -706,23 +705,23 @@ def _compile_graphflood(
         ms_bound.bind("z", z)
         ms_bound.bind("h", h)
         ms_bound.bind("surface", surface)
-        make_surface_kernel = _compile_bound(ms_bound, be, **launch)
+        make_surface_kernel = _compile_bound(ms_bound, be)
 
         h_from_filled_fk = core_blocks.build_h_from_filled(n_flat=n_flat)
         hf_bound = h_from_filled_fk.build()
         hf_bound.bind("z", z)
         hf_bound.bind("filled", filled)
         hf_bound.bind("h", h)
-        h_from_filled_kernel = _compile_bound(hf_bound, be, **launch)
+        h_from_filled_kernel = _compile_bound(hf_bound, be)
 
         resolved_max_passes = max_passes if max_passes is not None else 4 * max(int(nx), int(ny))
         reset_fks = core_blocks.build_reset_reconstruct_scratch(n_flat=n_flat, counters_size=resolved_max_passes + 2)
         rc_bound = reset_fks["counters"].build()
         rc_bound.bind("counters", counters)
-        reset_counters_kernel = _compile_bound(rc_bound, be, **launch)
+        reset_counters_kernel = _compile_bound(rc_bound, be)
         rq_bound = reset_fks["queued_gen"].build()
         rq_bound.bind("queued_gen", queued_gen)
-        reset_queued_gen_kernel = _compile_bound(rq_bound, be, **launch)
+        reset_queued_gen_kernel = _compile_bound(rq_bound, be)
 
         recon = make_fill_reconstruct(be, grid, nx=nx, ny=ny)
         recon_frozen, _ = make_fill_reconstruct_solver(
@@ -734,7 +733,7 @@ def _compile_graphflood(
             frontier=frontier, counters=counters, queued_gen=queued_gen,
             pass_p=pass_p, active_p=active_p,
         )
-        minima_solver = _compile_bound(recon_bound, be, **launch)
+        minima_solver = _compile_bound(recon_bound, be)
 
         # "reconstruct_epsilon": accumulate a per-cell `dist` perturbation
         # along the `parent` chain (hops-to-outlet, ULP-scaled), then feed it
@@ -749,7 +748,7 @@ def _compile_graphflood(
         hi_bound.bind("filled", filled)
         hi_bound.bind("dist", dist)
         hi_bound.bind("anc", anc)
-        hops_init_kernel = _compile_bound(hi_bound, be, **launch)
+        hops_init_kernel = _compile_bound(hi_bound, be)
 
         hops_jump_fk = _cupy_reconstruct_epsilon.build_hops_jump(n_flat=n_flat)
         hj_fwd_bound = hops_jump_fk.build()
@@ -757,14 +756,14 @@ def _compile_graphflood(
         hj_fwd_bound.bind("anc_in", anc)
         hj_fwd_bound.bind("dist_out", dist2)
         hj_fwd_bound.bind("anc_out", anc2)
-        hops_jump_fwd_kernel = _compile_bound(hj_fwd_bound, be, **launch)
+        hops_jump_fwd_kernel = _compile_bound(hj_fwd_bound, be)
 
         hj_bwd_bound = hops_jump_fk.build()
         hj_bwd_bound.bind("dist_in", dist2)
         hj_bwd_bound.bind("anc_in", anc2)
         hj_bwd_bound.bind("dist_out", dist)
         hj_bwd_bound.bind("anc_out", anc)
-        hops_jump_bwd_kernel = _compile_bound(hj_bwd_bound, be, **launch)
+        hops_jump_bwd_kernel = _compile_bound(hj_bwd_bound, be)
 
         # rounded up to even so alternating fwd/bwd always ends back in the
         # primary dist/anc buffers - see build_hops_jump's own docstring.
@@ -781,17 +780,17 @@ def _compile_graphflood(
         dw_bound.bind("dirs", dirs)
         dw_bound.bind("mfd_w", mfd_w)
         dw_bound.bind_leaf(grid_params)
-        dirs_weights_kernel = _compile_bound(dw_bound, be, **launch)
+        dirs_weights_kernel = _compile_bound(dw_bound, be)
 
         ir_bound = topo["indegree_reset"].build()
         ir_bound.bind("indegree", indegree)
-        indegree_reset_kernel = _compile_bound(ir_bound, be, **launch)
+        indegree_reset_kernel = _compile_bound(ir_bound, be)
 
         ic_bound = topo["indegree_count"].build()
         ic_bound.bind("dirs", dirs)
         ic_bound.bind("indegree", indegree)
         ic_bound.bind_leaf(grid_params)
-        indegree_count_kernel = _compile_bound(ic_bound, be, **launch)
+        indegree_count_kernel = _compile_bound(ic_bound, be)
 
         nn = _TOPOLOGY_NN[topology]
         persistent = build_persistent_mfd(grid=grid, n_flat=n_flat, n_neighbours=nn)
@@ -799,7 +798,7 @@ def _compile_graphflood(
         qi_bound.bind("SOURCE", source_p)
         qi_bound.bind("accum", Q_in)
         qi_bound.bind_leaf(grid_params, prefix=("grid",))
-        persistent_q_init_kernel = _compile_bound(qi_bound, be, **launch)
+        persistent_q_init_kernel = _compile_bound(qi_bound, be)
 
         pa_bound = persistent["accum"].build()
         pa_bound.bind("frontier0", frontier0)
@@ -811,8 +810,7 @@ def _compile_graphflood(
         pa_bound.bind("accum", Q_in)
         pa_bound.bind("indegree", indegree)
         pa_bound.bind_leaf(grid_params)
-        pgrid, pblock = persistent_grid_block()
-        persistent_accum_kernel = _compile_bound(pa_bound, be, grid=pgrid, block=pblock)
+        persistent_accum_kernel = _compile_bound(pa_bound, be)
 
         compute_qo_fk = core_blocks.build_compute_qo(
             grid=grid, n_flat=n_flat, topology=topology,
@@ -838,7 +836,7 @@ def _compile_graphflood(
         if outlet_behavior == "fixed_h":
             core_bound.bind(("apply_divergence", "BOUNDARY_H"), boundary_h_p)
         core_bound.bind_leaf(grid_params, prefix=("apply_divergence",))
-        core_kernel = _compile_bound(core_bound, be, **launch)
+        core_kernel = _compile_bound(core_bound, be)
 
         return GraphfloodVanillaMFD(
             make_surface=make_surface_kernel, reset_counters=reset_counters_kernel,
@@ -863,7 +861,6 @@ def _compile_graphflood(
         )
 
     closure = be.family == "closure"
-    launch = {}
     core_blocks = _core_blocks_for(be)
     if closure:
         backend_mod = be.module
@@ -899,7 +896,7 @@ def _compile_graphflood(
         recv_bound.bind("z", z)
         recv_bound.bind("h", h)
         recv_bound.bind("rec", rec)
-        receivers_kernel = _compile_bound(recv_bound, be, **launch)
+        receivers_kernel = _compile_bound(recv_bound, be)
 
         deps = make_depressions(be, grid, ndep_p, method=depression_method, reroute="carve", n_flat=n_flat)
         deps_frozen, _ = make_depression_solver(
@@ -913,7 +910,7 @@ def _compile_graphflood(
             rerouted=rerouted, tag=tag, tag_alt=tag_alt, rec_scratch=rec_scratch,
             basin_route=basin_route, b_rcv=b_rcv,
         )
-        minima_solver = _compile_bound(deps_bound, be, **launch)
+        minima_solver = _compile_bound(deps_bound, be)
         rec_for_accum = rec
     else:
         _require(
@@ -931,13 +928,13 @@ def _compile_graphflood(
         ms_bound.bind("z", z)
         ms_bound.bind("h", h)
         ms_bound.bind("surface", surface)
-        make_surface_kernel = _compile_bound(ms_bound, be, **launch)
+        make_surface_kernel = _compile_bound(ms_bound, be)
 
         hf_bound = h_from_filled_fk.build()
         hf_bound.bind("z", z)
         hf_bound.bind("filled", filled)
         hf_bound.bind("h", h)
-        h_from_filled_kernel = _compile_bound(hf_bound, be, **launch)
+        h_from_filled_kernel = _compile_bound(hf_bound, be)
 
         resolved_max_passes = max_passes if max_passes is not None else 4 * max(int(nx), int(ny))
         if closure:
@@ -948,10 +945,10 @@ def _compile_graphflood(
             )
         rc_bound = reset_fks["counters"].build()
         rc_bound.bind("counters", counters)
-        reset_counters_kernel = _compile_bound(rc_bound, be, **launch)
+        reset_counters_kernel = _compile_bound(rc_bound, be)
         rq_bound = reset_fks["queued_gen"].build()
         rq_bound.bind("queued_gen", queued_gen)
-        reset_queued_gen_kernel = _compile_bound(rq_bound, be, **launch)
+        reset_queued_gen_kernel = _compile_bound(rq_bound, be)
 
         recon = make_fill_reconstruct(be, grid, nx=nx, ny=ny)
         recon_frozen, _ = make_fill_reconstruct_solver(
@@ -963,7 +960,7 @@ def _compile_graphflood(
             frontier=frontier, counters=counters, queued_gen=queued_gen,
             pass_p=pass_p, active_p=active_p,
         )
-        minima_solver = _compile_bound(recon_bound, be, **launch)
+        minima_solver = _compile_bound(recon_bound, be)
         rec_for_accum = parent
 
     # ------------------------------------------------------------------
@@ -974,12 +971,12 @@ def _compile_graphflood(
         qi_bound = accum["q_init"].build()
         qi_bound.bind("SOURCE", source_p)
         qi_bound.bind("q", Q_in)
-        q_init_kernel = _compile_bound(qi_bound, be, **launch)
+        q_init_kernel = _compile_bound(qi_bound, be)
     a_bound = accum["accum"].build()
     a_bound.bind("SOURCE", source_p)
     a_bound.bind("rec", rec_for_accum)
     a_bound.bind("q", Q_in)
-    accum_kernel = _compile_bound(a_bound, be, **launch)
+    accum_kernel = _compile_bound(a_bound, be)
 
     # ------------------------------------------------------------------
     # 3. core: compute_qo then apply_divergence
@@ -1019,7 +1016,7 @@ def _compile_graphflood(
         core_bound.bind(("apply_divergence", "BOUNDARY_H"), boundary_h_p)
     core_bound.bind_leaf(grid_params, prefix=("compute_qo",))
     core_bound.bind_leaf(grid_params, prefix=("apply_divergence",))
-    core_kernel = _compile_bound(core_bound, be, **launch)
+    core_kernel = _compile_bound(core_bound, be)
 
     return GraphfloodVanillaSFD(
         fill_method=fill_method,

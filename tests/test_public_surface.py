@@ -72,7 +72,7 @@ def test_host_block_takes_data_argument():
     assert hb.slots.names(SlotKind.DATA) == {"counts"}
 
     b = hb.build()
-    n_p = be.ParameterCls("N", dtype=be.dtypes["i32"], mode="scalar", value=0, pool=pool)
+    n_p = be.ParameterCls("N", dtype="i32", mode="scalar", value=0, pool=pool)
     counts = pool.get_data(ti.i32, (5,))
     counts.from_numpy(__import__("numpy").array([1, 2, 3, 4, 5], dtype="int32"))
     b.bind("N", n_p)

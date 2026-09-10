@@ -62,8 +62,8 @@ ti.kernel/qd.kernel/CUDA source:
     kernel = KernelBuilder(update_height).compose("phys", phys_group).freeze()
     bound = kernel.build()
     bound.bind(("phys", "dx"), dx_p)
-    compiled = bound.compile("taichi")
-    compiled(h_new=h_new_field, h_old=h_old_field)   # bulk data passed at call time
+    compiled = bound.compile(be)
+    compiled()
 
 See core/context/builder.py, frozen.py and bound.py for the three phases in
 full.
@@ -165,7 +165,8 @@ class Parameter(ABC):
     "scalar" in a single device cell, "field" in a device array - and every
     backend offers all three (see MODES).
 
-    Two surfaces. From the host: get(), set(value), set_node(node, value).
+    Two surfaces. From the host: `.value` for const, `.handle()` for stored
+    values, plus `set(value)` and `read()`.
     From device code: device_view(), which returns a backend object whose
     .get(node) / .set_node(node, val) let a kernel read and write the
     parameter identically whatever its mode.

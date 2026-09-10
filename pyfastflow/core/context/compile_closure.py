@@ -300,4 +300,4 @@ def compile_kernel(bound: BoundKernel, backend: Any) -> CompiledKernel:
     compiled = backend.kernel(raw)
 
     data_order = [(name,) for name in data_names]
-    return CompiledKernel(bound, compiled, data_order, needs_launch_dims=False)
+    return CompiledKernel(bound, compiled, data_order)

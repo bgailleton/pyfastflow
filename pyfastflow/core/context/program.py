@@ -12,6 +12,7 @@ import numpy as np
 
 from .backends import require_backend
 from .frozen import Node
+from .host_block import FrozenHostBlock
 from .slot import ProgramBuilderError, ProgramError
 
 _NP_DTYPES = {"i32": np.int32, "i64": np.int64, "f32": np.float32, "u8": np.uint8, "u32": np.uint32}
@@ -288,7 +289,7 @@ class _Program:
         for name, spec in self._recipe.params.items():
             shape = _resolve_shape(spec.shape, self._dim_vals) if spec.mode == "field" else ()
             value = spec.value(self._dim_vals) if callable(spec.value) else spec.value
-            p = self._be.ParameterCls(name, dtype=self._be.dtypes[spec.dtype], mode=spec.mode, value=value, pool=self._pool, shape=shape, n_flat=int(np.prod(shape)) if shape else None)
+            p = self._be.ParameterCls(name, dtype=spec.dtype, mode=spec.mode, value=value, pool=self._pool, shape=shape)
             self._params[name] = p; self._owned_params.append(p)
         for name, spec in self._recipe.data.items():
             if spec.lifetime == "persistent": self._data[name] = self._pool.get_data(self._be.dtypes[spec.dtype], self._device_shape(spec))
@@ -402,7 +403,9 @@ class _Program:
             if bound.unmet(): raise ProgramError(f"sequence {name!r} has unmet bindings:\n{bound.inspect()}")
             for temp_name, addrs in temp_addrs.items():
                 state.placeholders.append(temp_placeholders[temp_name]); state.temp_plan.append((temp_name, addrs))
-            state.after = bound.inspect(); state.compiled = bound.compile(self._be); state.bound = bound
+            state.after = bound.inspect()
+            state.compiled = bound.compile() if isinstance(node, FrozenHostBlock) else bound.compile(self._be)
+            state.bound = bound
         except Exception:
             bound.close()
             for h in state.placeholders: self._pool.release_data(h)

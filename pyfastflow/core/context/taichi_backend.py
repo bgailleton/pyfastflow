@@ -7,7 +7,7 @@ _closure_backend.py holds that machinery, shared with Quadrants. Everything
 below just names Taichi as the backend to use.
 
 The kernel/helper compile path (KernelBuilder/HelperBuilder -> FrozenKernel ->
-BoundKernel.compile("taichi")) is compile_closure.py, which reaches this
+BoundKernel.compile(Backend.from_name("taichi"))) is compile_closure.py, which reaches this
 module only for `ti` itself, imported directly there.
 
 Author: B.G (07/2026)
