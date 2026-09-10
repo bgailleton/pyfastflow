@@ -1,63 +1,241 @@
 # PyFastFlow
 
-> ⚠️ **Experimental.** This describes the in-progress v1 core. The API is
-> settling and will change.
+> **Experimental.** PyFastFlow is under active development. The core model is
+> usable, but public names and high-level Programs may still change before 1.0.
 
-**GPU routines for Earth-surface processes — portable across backends.**
+**Composable GPU routines for geomorphology and shallow-water flow.**
 
-Two things in one:
+PyFastFlow has two layers:
 
-- **A portable GPU-routine engine.** Compose parameters, helpers and
-  multi-kernel *routines* once, and run them on **Taichi**, **Quadrants**,
-  or **CuPy** — same composition model, backend-native kernels.
-- **A geomorphology toolbox built on it.** Flow routing, flooding, and
-  landscape evolution, engineered for grids of hundreds of millions of nodes.
+- a backend-aware computation core for assembling, binding, compiling, and
+  owning GPU kernels and multi-kernel algorithms;
+- geomorphology building blocks for grids, routing, local-minima resolution,
+  drainage accumulation, procedural terrain, visualisation, and GraphFlood.
 
-[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+The same assembly model targets **Taichi**, **Quadrants**, and **CuPy**. Taichi
+and Quadrants use Python closure kernels; CuPy emits specialised CUDA C++ and
+runs it with `RawKernel`. Algorithms can share the same high-level contract
+while retaining an implementation suited to each backend.
+
 [![License](https://img.shields.io/badge/license-CeCILL%20v2.1-red.svg)](./LICENSE)
 
-## Why
+## Why PyFastFlow?
 
-Writing flexible GPU kernels for physics simulation can be time-consuming. Performance on GPU is highly affected by memory layout. Hence simple things such as a constant _vs_ a 2D varying parameter, or stencil operations (periodic boundaries, no-data, outlets, ...), each push you toward a different hand-tuned kernel — multiplied by every backend you want to run on. PyFastFlow lets you write a routine once and *bind* how each parameter and stencil is realised, then specialises it per backend and layout.
+Flow routing is awkward GPU work. Receiver trees, drainage accumulation,
+depression handling, and shallow-water solvers contain non-local dependencies
+that do not map to a single elementwise kernel.
 
-## Example
+PyFastFlow provides the machinery needed to express them as complete GPU
+algorithms:
+
+- `Parameter` represents a compile-time constant, mutable scalar, or spatial
+  field;
+- helpers and groups package reusable device logic such as D4/D8 neighbours,
+  boundaries, outlets, and noise sampling;
+- kernels, routines, and sequences compose work ranging from one launch to a
+  host-controlled iterative solver;
+- `ProgramBuilder` packages configuration, arrays, parameters, algorithm
+  dispatch, temporary storage, and cleanup behind a small user-facing API.
+
+Composition happens once. The resulting kernels are specialised for the
+selected backend, topology, parameter layout, and algorithm.
+
+## Quick start: a complete flow Program
+
+The experimental CuPy Programs provide the shortest route from a DEM to SFD
+drainage accumulation:
 
 ```python
-import taichi as ti; ti.init(arch=ti.gpu)
-from pyfastflow.core.context.taichi_backend import (
-    TaichiKernelBuilder, TaichiParameter,
-)
-from pyfastflow.core.pool.taichi_pool import TaichiPool
+import numpy as np
 
-pool = TaichiPool()
-D = TaichiParameter("D", ti.f32, mode="scalar", value=1e-2, pool=pool)
+from pyfastflow.core import Backend
+from pyfastflow.experimental.programs.flow import SFDFlowProgram
 
-def diffuse(z_out: ti.template(), z_in: ti.template()):
-    for i, j in z_in:
-        z_out[i, j] = z_in[i, j] + D.get(0) * (
-            z_in[i-1, j] + z_in[i+1, j] + z_in[i, j-1] + z_in[i, j+1] - 4.0 * z_in[i, j])
+ny = nx = 1024
+dem = np.random.default_rng(42).random((ny, nx), dtype=np.float32)
+backend = Backend.from_name("cupy")
 
-step = TaichiKernelBuilder().bind("D", D).ingest(diffuse).compile()
+with SFDFlowProgram(
+    backend,
+    nx=nx,
+    ny=ny,
+    dx=30.0,
+    local_minima="cordonnier_carve",
+    accumulation="pointer_jump_push",
+) as flow:
+    flow.z.from_numpy(dem)
+    flow.route()
+    flow.resolve_minima()
+    flow.accumulate()
+    drainage = flow.drainage.to_numpy()
 ```
 
-The parameter / helper / routine API is identical on every backend; only the
-kernel body changes — a Python `def` on Taichi and Quadrants, CUDA source on
-CuPy. The same landscape-evolution model, built once per backend, lives in
-[`examples/core/lem/`](./examples/core/lem/).
+The high-level choices currently exposed by `SFDFlowProgram` are:
 
-## Install
+| Stage | Choices |
+| --- | --- |
+| Local minima | `cordonnier_carve`, `cordonnier_jump`, `reconstruct_epsilon` |
+| SFD accumulation | `pointer_jump_push` (or `pj`), `rake_compress` |
+
+`reconstruct_epsilon` constructs the acyclic receiver forest itself, so it is
+used without the preceding `flow.route()` call.
+
+For Perlin terrain and zero-copy composition between two Programs, run:
 
 ```bash
-pip install -e .            # from source
+python examples/flow_acc_sfd_lm_program.py
 ```
 
-Requires Python ≥ 3.9, and the backend(s) you target (Taichi, Quadrants, CuPy).
+Algorithm selection is available directly from the command line:
 
-## Status
+```bash
+python examples/flow_acc_sfd_lm_program.py \
+    --local-minima cordonnier_jump \
+    --accumulation rake_compress \
+    --no-plot
+```
 
-Core interface under active refactor toward v1.0 (+ paper). Flow/flood routines
-are being ported onto the new core; landscape evolution is WIP.
+See [`examples/flow_acc_sfd_lm_program.py`](./examples/flow_acc_sfd_lm_program.py)
+for the full example, including explicit cleanup without a context manager.
 
-## License & authors
+## Programs and memory ownership
 
-CeCILL v2.1 — Boris Gailleton (Géosciences Rennes) · Guillaume Cordonnier (INRIA).
+A Program owns its parameters, persistent buffers, compiled operations, and an
+internal memory pool unless a pool is supplied explicitly. A context manager is
+the simplest way to release those resources, but it is not required:
+
+```python
+flow = SFDFlowProgram(backend, nx=nx, ny=ny)
+try:
+    flow.z.from_numpy(dem)
+    flow.route()
+    flow.resolve_minima()
+    flow.accumulate()
+finally:
+    flow.close()
+```
+
+`close()` releases the Program's ownership. CuPy may retain freed CUDA blocks
+in its process-wide memory cache for reuse. If memory must be returned to CUDA
+immediately after all relevant Programs have closed, the application can call
+`cupy.get_default_memory_pool().free_all_blocks()`.
+
+## Current building blocks
+
+- **Grid:** D4/D8 topology, normal and periodic boundaries, no-data masks, and
+  edge or masked outlets.
+- **Flow routing:** steepest and stochastic receivers.
+- **Drainage accumulation:** atomic SFD, rake-and-compress, pointer-jump/push,
+  and CuPy persistent-kernel MFD accumulation.
+- **Local minima:** Cordonnier basin labelling with carve or jump rerouting,
+  plus fill-and-reconstruct solvers.
+- **Hydraulics:** GraphFlood SFD, unstable flow, and CuPy MFD variants, with
+  configurable friction laws and outlet behaviour.
+- **Terrain and utilities:** white/Perlin noise, hillshading, elementwise
+  operations, scan, reduction, and reusable math/bit-packing helpers.
+
+Not every algorithm exists on every backend. Backend-specific capabilities are
+validated when their factory or Program is built. The ready-made
+`PerlinNoiseProgram` and `SFDFlowProgram` are currently CuPy-only; the lower-level
+feature factories cover Taichi, Quadrants, and CuPy where implementations exist.
+
+## Working at the composition layer
+
+The high-level Programs are built from the same public core available to model
+authors:
+
+```python
+from pyfastflow.core import (
+    Backend,
+    GroupBuilder,
+    KernelBuilder,
+    ProgramBuilder,
+    RoutineBuilder,
+    SequenceBuilder,
+)
+
+backend = Backend.from_name("cupy")
+```
+
+The normal lifecycle is:
+
+1. create reusable parameter/helper structure;
+2. compose and freeze kernels, routines, or sequences;
+3. bind their named slots to concrete parameters and arrays;
+4. compile for a `Backend` and execute;
+5. close the compiled objects and release their storage.
+
+Model authors who want configuration, dispatch, and ownership handled as one
+unit can define a reusable class with `ProgramBuilder`. Complete backend-level
+examples live under [`examples/core`](./examples/core), and a fully authored
+Program is shown in
+[`examples/core/program/sfd_drainage.py`](./examples/core/program/sfd_drainage.py).
+
+## Backends
+
+Create backends through `Backend.from_name(...)`; feature factories accept the
+resulting `Backend` object rather than a backend-name string.
+
+```python
+# CuPy (no separate runtime initialisation)
+backend = Backend.from_name("cupy")
+
+# Taichi
+import taichi as ti
+ti.init(arch=ti.gpu)
+backend = Backend.from_name("taichi")
+
+# Quadrants
+import quadrants as qd
+qd.init(arch=qd.gpu)
+backend = Backend.from_name("quadrants")
+```
+
+## Installation
+
+Install the source tree in editable mode:
+
+```bash
+git clone https://github.com/bgailleton/pyfastflow.git
+cd pyfastflow
+python -m pip install -e .
+```
+
+Install the GPU backend appropriate for your system in the same environment.
+Taichi is currently declared by the package; CuPy must match the installed CUDA
+toolkit, and Quadrants must be installed separately when that backend is used.
+The current source is developed and tested primarily on modern Python versions
+(Python 3.10 or newer is recommended).
+
+For development:
+
+```bash
+python -m pip install -e ".[dev]"
+pytest -q
+```
+
+## Project status
+
+The v1-style core and feature factories are the active implementation. Code in
+`pyfastflow.legacy` is retained for reference and older command-line tools; it
+is not the API demonstrated above. Ready-made Programs currently live under
+`pyfastflow.experimental` while their user-facing contracts settle.
+
+Useful starting points:
+
+- [`examples/flow_acc_sfd_lm_program.py`](./examples/flow_acc_sfd_lm_program.py):
+  high-level Perlin → routing → local minima → accumulation;
+- [`examples/flow_acc_sfd_lm.py`](./examples/flow_acc_sfd_lm.py): the same type
+  of pipeline assembled directly from feature factories;
+- [`examples/flow_acc_sfd_lm_raw_cupy.py`](./examples/flow_acc_sfd_lm_raw_cupy.py)
+  and
+  [`examples/flow_acc_sfd_lm_raw_quadrants.py`](./examples/flow_acc_sfd_lm_raw_quadrants.py):
+  hard-coded baselines for measuring the cost of the machinery;
+- [`examples/core/graphflood`](./examples/core/graphflood): GraphFlood examples;
+- [`examples/core/lem`](./examples/core/lem): landscape-evolution examples.
+
+## License and authors
+
+PyFastFlow is distributed under the CeCILL v2.1 license. See [`LICENSE`](./LICENSE).
+
+Boris Gailleton (Géosciences Rennes) · Guillaume Cordonnier (Inria)
