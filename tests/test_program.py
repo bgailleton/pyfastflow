@@ -126,3 +126,4 @@ def test_program_restores_temp_placeholder_after_run():
     assert state.compiled.data_at("dst") is state.placeholders[0]
     assert prog._pool.stats()["in_use"] == 2  # persistent source + reserved placeholder
     prog.close()
+    assert prog._pool.stats() == {"total": 0, "in_use": 0, "available": 0}

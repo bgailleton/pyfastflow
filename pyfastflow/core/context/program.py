@@ -451,7 +451,7 @@ class _Program:
         self._closed = True
         for state in self._states.values():
             if state.compiled is not None and hasattr(state.compiled, "close"): state.compiled.close()
-            elif state.bound is not None: state.bound.close()
+            if state.bound is not None: state.bound.close()
             for h in state.placeholders:
                 try: self._pool.release_data(h)
                 except Exception: pass
