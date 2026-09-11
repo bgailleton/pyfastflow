@@ -74,9 +74,15 @@ def _edge_can_out(boundary: str, nx: int, ny: int) -> np.ndarray:
 @pytest.mark.parametrize("boundary,nodata,custom_outlet", _CONFIGS, ids=_IDS)
 def test_accum_mfd(boundary, nodata, custom_outlet):
     from pyfastflow.core.pool.cupy_pool import CupyPool
-    from pyfastflow.flow import bind_fill_reconstruct_solver, make_accumulation, make_fill_reconstruct, make_fill_reconstruct_solver
+    from pyfastflow.flow import (
+        bind_fill_reconstruct_solver,
+        make_accumulation,
+        make_fill_reconstruct,
+        make_fill_reconstruct_solver,
+        make_mfd_topology,
+    )
     from pyfastflow.flow._cupy_mfd_accum import init_frontier_mfd
-    from pyfastflow.graphflood import _cupy_mfd_topology, _cupy_reconstruct_epsilon
+    from pyfastflow.graphflood import _cupy_reconstruct_epsilon
     from pyfastflow.grid import make_grid_group, make_grid_parameters
 
     bk = Backend.from_name("cupy")
@@ -176,8 +182,9 @@ def test_accum_mfd(boundary, nodata, custom_outlet):
     mfd_w = pool.get_data(f32, (n * NN,))
     indegree = pool.get_data(i32, (n,))
 
-    topo = _cupy_mfd_topology.build_mfd_topology(
-        grid=grid, n_flat=n, topology="D8", diagonal_partition_correction=True,
+    topo = make_mfd_topology(
+        bk, grid, method="surface", n_flat=n, topology="D8",
+        diagonal_partition_correction=True,
     )
     dw = topo["dirs_weights"].build()
     dw.bind("filled", filled)

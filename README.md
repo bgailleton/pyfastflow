@@ -74,7 +74,7 @@ The high-level choices currently exposed by `SFDFlowProgram` are:
 
 | Stage | Choices |
 | --- | --- |
-| Local minima | `cordonnier_carve`, `cordonnier_jump`, `reconstruct_epsilon` |
+| Local minima | `none`, `cordonnier_carve`, `cordonnier_jump`, `reconstruct_epsilon` |
 | SFD accumulation | `pointer_jump_push` (or `pj`), `rake_compress` |
 
 `reconstruct_epsilon` constructs the acyclic receiver forest itself, so it is
@@ -97,6 +97,49 @@ python examples/flow_acc_sfd_lm_program.py \
 
 See [`examples/flow_acc_sfd_lm_program.py`](./examples/flow_acc_sfd_lm_program.py)
 for the full example, including explicit cleanup without a context manager.
+
+The CuPy `MFDFlowProgram` packages persistent Kahn accumulation with raw,
+reconstructed-surface, or rank-gated Cordonnier topology. A complete zero-copy
+Perlin → MFD → multishade composition is runnable with:
+
+```bash
+python examples/flow_acc_mfd_lm_program.py
+```
+
+Use `--local-minima none` to retain raw-surface sinks, or
+`--local-minima reconstruct_epsilon` to use filling and flat resolution. The
+example selects `hillshade` or four-direction `multishade` through the
+standalone `HillshadeProgram`.
+
+MFD Programs use max-normalized `uint8` routing scores by default. Pass
+`quantized_weight=False` when constructing either `MFDFlowProgram` or
+`GraphFloodProgram` to retain precomputed `float32` weights. Effective weights
+are normalized by their integer sum during accumulation, so the quantized path
+still partitions the complete discharge at every node.
+
+The experimental CuPy `GraphFloodProgram` combines the same rank-gated
+Cordonnier topology with persistent MFD accumulation and a Manning depth
+update:
+
+```python
+from pyfastflow.experimental.programs.graphflood import GraphFloodProgram
+
+with GraphFloodProgram(backend, nx=nx, ny=ny, dx=dx) as flood:
+    flood.z.from_numpy(dem.astype("float32"))
+    flood.reset_h()
+    flood.precipitation.set(50e-3 / 3600)  # m s-1
+    flood.friction_coefficient.set(0.033)
+    flood.friction_exponent.set(2 / 3)
+    flood.dt.set(1e-2)
+    flood.run_n_step(100)
+    depth = flood.h.to_numpy()
+```
+
+Each step rebuilds the hydraulic surface and its Cordonnier-carved,
+rank-gated MFD graph before accumulating rainfall and updating water depth.
+The only friction-law option is currently `friction_law="manning"`; it is
+already a construction-time Program choice so more laws can be added without
+changing the execution API.
 
 ## Programs and memory ownership
 
@@ -127,6 +170,8 @@ immediately after all relevant Programs have closed, the application can call
 - **Flow routing:** steepest and stochastic receivers.
 - **Drainage accumulation:** atomic SFD, rake-and-compress, pointer-jump/push,
   and CuPy persistent-kernel MFD accumulation.
+- **MFD topology:** filled-surface routing, or CuPy rank-gated routing directly
+  over a Cordonnier-carved receiver graph without topographic filling.
 - **Local minima:** Cordonnier basin labelling with carve or jump rerouting,
   plus fill-and-reconstruct solvers.
 - **Hydraulics:** GraphFlood SFD, unstable flow, and CuPy MFD variants, with
@@ -136,8 +181,17 @@ immediately after all relevant Programs have closed, the application can call
 
 Not every algorithm exists on every backend. Backend-specific capabilities are
 validated when their factory or Program is built. The ready-made
-`PerlinNoiseProgram` and `SFDFlowProgram` are currently CuPy-only; the lower-level
+`PerlinNoiseProgram`, `HillshadeProgram`, `SFDFlowProgram`, and `MFDFlowProgram`
+are currently CuPy-only; the lower-level
 feature factories cover Taichi, Quadrants, and CuPy where implementations exist.
+
+The rank-gated MFD path is assembled with
+`make_mfd_topology(..., method="cordonnier_rank")`. Snapshot the initial
+receivers, apply optimized Cordonnier carving, compute `receiver_rank`, then
+build directions and indegrees before running
+`make_accumulation(..., method="persistent_mfd")`. Rerouted cells retain one
+forced carved link; all other MFD links must strictly decrease receiver rank,
+which gives the persistent Kahn accumulator an acyclic graph.
 
 ## Working at the composition layer
 

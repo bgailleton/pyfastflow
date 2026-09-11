@@ -19,6 +19,7 @@ from ..flow import (
     make_depressions,
     make_fill_reconstruct,
     make_fill_reconstruct_solver,
+    make_mfd_topology,
     make_receivers,
 )
 
@@ -357,7 +358,7 @@ def _compile_graphflood(
             count=count, barrier=barrier, dist=dist, anc=anc, dist2=dist2, anc2=anc2,
         )
         from ..flow._cupy_mfd_accum import build_persistent_mfd, init_frontier_mfd
-        from . import _cupy_mfd_topology, _cupy_reconstruct_epsilon
+        from . import _cupy_reconstruct_epsilon
 
         make_surface_fk = core_blocks.build_make_surface(n_flat=n_flat)
         ms_bound = make_surface_fk.build()
@@ -425,8 +426,9 @@ def _compile_graphflood(
         if hops_rounds % 2 != 0:
             hops_rounds += 1
 
-        topo = _cupy_mfd_topology.build_mfd_topology(
-            grid=grid, n_flat=n_flat, topology=topology, diagonal_partition_correction=diagonal_partition_correction,
+        topo = make_mfd_topology(
+            be, grid, method="surface", n_flat=n_flat, topology=topology,
+            diagonal_partition_correction=diagonal_partition_correction,
         )
         dw_bound = topo["dirs_weights"].build()
         dw_bound.bind("filled", filled)

@@ -76,15 +76,19 @@ class _DispatchSpec:
     name: str; on: str; cases: dict
 
 @dataclass(frozen=True)
+class _PipelineSpec:
+    name: str; steps: tuple
+
+@dataclass(frozen=True)
 class _Recipe:
-    name: str; dims: tuple; params: dict; data: dict; bundles: dict; sequences: dict; config: dict; dispatch: dict
+    name: str; dims: tuple; params: dict; data: dict; bundles: dict; sequences: dict; config: dict; dispatch: dict; pipelines: dict
 
 
 class ProgramBuilder:
     """Author a Program recipe with declarative bundles and bind maps."""
     def __init__(self, name):
         self._name = name; self._dims = []; self._params = {}; self._data = {}
-        self._bundles = {}; self._sequences = {}; self._config = {}; self._dispatch = {}
+        self._bundles = {}; self._sequences = {}; self._config = {}; self._dispatch = {}; self._pipelines = {}
 
     def dim(self, name):
         if name in self._dims: raise ProgramBuilderError(f"dim {name!r} already declared")
@@ -104,7 +108,7 @@ class ProgramBuilder:
         self._params[name] = _ParamSpec(name, mode, dtype, value, tuple(shape), shape_source); return self
 
     def data(self, name, dtype, shape, *, lifetime="persistent", role=None, flat=True, shape_source=False):
-        if dtype not in _NP_DTYPES: raise ProgramBuilderError(f"{name!r}: unsupported dtype {dtype!r}")
+        if not callable(dtype) and dtype not in _NP_DTYPES: raise ProgramBuilderError(f"{name!r}: unsupported dtype {dtype!r}")
         if lifetime not in ("persistent", "temp"): raise ProgramBuilderError(f"{name!r}: lifetime must be persistent or temp")
         if shape_source and lifetime == "temp": raise ProgramBuilderError(f"{name!r}: temp data cannot be a shape source")
         self._data[name] = _DataSpec(name, dtype, tuple(shape), lifetime, role, flat, shape_source); return self
@@ -120,9 +124,13 @@ class ProgramBuilder:
     def dispatch(self, name, *, on, cases):
         self._dispatch[name] = _DispatchSpec(name, on, dict(cases)); return self
 
+    def pipeline(self, name, steps):
+        """Expose an ordered composition of sequences/dispatches as one call."""
+        self._pipelines[name] = _PipelineSpec(name, tuple(steps)); return self
+
     def freeze(self):
         dims = tuple(self._dims); dimset = set(dims); seen = {}
-        for kind, names in (("dim", dims), ("param", self._params), ("data", self._data), ("bundle", self._bundles), ("sequence", self._sequences), ("dispatch", self._dispatch)):
+        for kind, names in (("dim", dims), ("param", self._params), ("data", self._data), ("bundle", self._bundles), ("sequence", self._sequences), ("dispatch", self._dispatch), ("pipeline", self._pipelines)):
             for name in names:
                 if not name.isidentifier(): raise ProgramBuilderError(f"{kind} name {name!r} is not an identifier")
                 if name in seen: raise ProgramBuilderError(f"name {name!r} declared twice ({seen[name]}, {kind})")
@@ -140,7 +148,12 @@ class ProgramBuilder:
             if set(spec.dims) - dimset or set(spec.config) - set(self._config): raise ProgramBuilderError(f"bundle {spec.name!r}: unknown dim/config selection")
         for spec in self._dispatch.values():
             if spec.on not in self._config or set(spec.cases.values()) - set(self._sequences): raise ProgramBuilderError(f"dispatch {spec.name!r}: invalid selector or case")
-        recipe = _Recipe(self._name, dims, dict(self._params), dict(self._data), dict(self._bundles), dict(self._sequences), dict(self._config), dict(self._dispatch))
+        callable_names = set(self._sequences) | set(self._dispatch)
+        for spec in self._pipelines.values():
+            if not spec.steps: raise ProgramBuilderError(f"pipeline {spec.name!r}: steps are empty")
+            unknown = set(spec.steps) - callable_names
+            if unknown: raise ProgramBuilderError(f"pipeline {spec.name!r}: unknown steps {sorted(unknown)}")
+        recipe = _Recipe(self._name, dims, dict(self._params), dict(self._data), dict(self._bundles), dict(self._sequences), dict(self._config), dict(self._dispatch), dict(self._pipelines))
         return type(self._name, (_Program,), {"_recipe": recipe})
 
 
@@ -218,7 +231,7 @@ class _Program:
         if pool is not None and not isinstance(pool, self._be.PoolCls): raise ProgramError(f"pool does not match {self._be.name!r}")
         self._pool = self._be.pool() if pool is None else pool
         self._config = self._resolve_config(config); self._dim_vals = {n: int(v) for n, v in self._config.items() if n in self._recipe.dims}
-        self._params = {}; self._data = {}; self._bundles = {}; self._bundle_params = {}; self._owned_params = []; self._allocated = False
+        self._params = {}; self._data = {}; self._data_dtypes = {}; self._bundles = {}; self._bundle_params = {}; self._owned_params = []; self._allocated = False
         self._pending_arrays = {}; self._pending_scalars = {}; self._states = {n: _SeqState() for n in self._recipe.sequences}
         self._install(); self._maybe_allocate()
 
@@ -246,6 +259,10 @@ class _Program:
             def _dispatcher(n=1, _name=n):
                 return self.run(_name, n)
             object.__setattr__(self, n, _dispatcher)
+        for n in self._recipe.pipelines:
+            def _pipeline(n=1, _name=n):
+                return self.run(_name, n)
+            object.__setattr__(self, n, _pipeline)
     def __getattr__(self, name):
         if name in self._dim_vals: return self._dim_vals[name]
         if name in self._config: return self._config[name]
@@ -253,7 +270,14 @@ class _Program:
     def get(self, name):
         if hasattr(self, name): return getattr(self, name)
         raise ProgramError(f"no public program member {name!r}")
-    def _dtype(self, name): return (self._recipe.params.get(name) or self._recipe.data[name]).dtype
+    def _dtype(self, name):
+        if name in self._recipe.params: return self._recipe.params[name].dtype
+        if name not in self._data_dtypes:
+            spec = self._recipe.data[name]
+            dtype = spec.dtype({**self._config, **self._dim_vals}) if callable(spec.dtype) else spec.dtype
+            if dtype not in _NP_DTYPES: raise ProgramError(f"{name!r}: dtype selector returned unsupported dtype {dtype!r}")
+            self._data_dtypes[name] = dtype
+        return self._data_dtypes[name]
     def _spec(self, name): return self._recipe.params.get(name) or self._recipe.data.get(name)
     def _host_shape(self, name):
         self._check_open()
@@ -287,7 +311,7 @@ class _Program:
             p = self._be.ParameterCls(name, dtype=spec.dtype, mode=spec.mode, value=value, pool=self._pool, shape=shape)
             self._params[name] = p; self._owned_params.append(p)
         for name, spec in self._recipe.data.items():
-            if spec.lifetime == "persistent": self._data[name] = self._pool.get_data(self._be.dtypes[spec.dtype], self._device_shape(spec))
+            if spec.lifetime == "persistent": self._data[name] = self._pool.get_data(self._be.dtypes[self._dtype(name)], self._device_shape(spec))
         self._allocated = True
         for name, arr in tuple(self._pending_arrays.items()): self._write_array(name, arr)
         self._pending_arrays.clear()
@@ -325,7 +349,7 @@ class _Program:
         if not self._allocated: raise ProgramError("adopt requires resolved shapes")
         if any(s.compiled is not None for s in self._states.values()): raise ProgramError("adopt before compile; compiled objects retain bindings")
         h = self._be.wrap(array, owned=False); spec = self._recipe.data[name]
-        if h.dtype != spec.dtype or tuple(h.shape) != self._device_shape(spec): raise ProgramError(f"{name!r}: adopted buffer has incompatible dtype or shape")
+        if h.dtype != self._dtype(name) or tuple(h.shape) != self._device_shape(spec): raise ProgramError(f"{name!r}: adopted buffer has incompatible dtype or shape")
         self._pool.release_data(self._data[name]); self._data[name] = h
     def _value(self, name):
         if isinstance(name, str) and name.endswith(".handle"):
@@ -385,7 +409,7 @@ class _Program:
                 if data is not None and data.lifetime == "temp":
                     placeholder = temp_placeholders.get(value_name)
                     if placeholder is None:
-                        placeholder = self._pool.get_data(self._be.dtypes[data.dtype], self._device_shape(data))
+                        placeholder = self._pool.get_data(self._be.dtypes[self._dtype(value_name)], self._device_shape(data))
                         temp_placeholders[value_name] = placeholder
                     bound.bind(addr, placeholder)
                     temp_addrs.setdefault(value_name, []).append(addr)
@@ -406,7 +430,7 @@ class _Program:
         self._ensure_compiled(name); state = self._states[name]; acquired = []
         try:
             for (temp, addrs), placeholder in zip(state.temp_plan, state.placeholders):
-                data = self._recipe.data[temp]; h = self._pool.get_data(self._be.dtypes[data.dtype], self._device_shape(data)); acquired.append(h)
+                data = self._recipe.data[temp]; h = self._pool.get_data(self._be.dtypes[self._dtype(temp)], self._device_shape(data)); acquired.append(h)
                 for addr in addrs: state.compiled.swap(addr, h)
             for _ in range(max(0, int(n))): state.compiled()
         finally:
@@ -418,13 +442,19 @@ class _Program:
         if name in self._recipe.sequences: return self._run_sequence(name, n)
         if name in self._recipe.dispatch:
             d = self._recipe.dispatch[name]; return self._run_sequence(d.cases[self._config[d.on]], n)
+        if name in self._recipe.pipelines:
+            result = None
+            for _ in range(max(0, int(n))):
+                for step in self._recipe.pipelines[name].steps:
+                    result = self.run(step)
+            return result
         raise ProgramError(f"unknown sequence {name!r}")
     def compile(self):
         self._check_open()
         if not self._allocated: raise ProgramError("shapes are unresolved")
         for name in self._states: self._ensure_compiled(name)
     def inspect(self): return "\n\n".join(f"[{n}]\n{s.after or s.before or '(not built)'}" for n, s in self._states.items())
-    def describe(self): return f"{self._recipe.name}: config={list(self._recipe.config)}, params={list(self._recipe.params)}, data={list(self._recipe.data)}, bundles={list(self._recipe.bundles)}, sequences={list(self._recipe.sequences)}"
+    def describe(self): return f"{self._recipe.name}: config={list(self._recipe.config)}, params={list(self._recipe.params)}, data={list(self._recipe.data)}, bundles={list(self._recipe.bundles)}, sequences={list(self._recipe.sequences)}, pipelines={list(self._recipe.pipelines)}"
     def state(self):
         self._check_open()
         if not self._allocated: raise ProgramError("shapes are unresolved")

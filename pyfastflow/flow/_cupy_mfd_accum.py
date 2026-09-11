@@ -67,6 +67,7 @@ def build_persistent_mfd(
     fr_stage: int = 2048,
     blocks_per_sm: int = 2,
     threads: int = 256,
+    quantized_weight: bool = False,
 ):
     """
     Two FrozenKernels (new builder/frozen/bound stack): "q_init" (composes
@@ -98,6 +99,9 @@ def build_persistent_mfd(
     n_flat, n_neighbours : int
     fr_stage, blocks_per_sm, threads : int, optional
         Default 2048.
+    quantized_weight : bool, optional
+        Consume max-normalized unsigned-byte scores rather than float32
+        weights. Their integer sum is normalized during scattering.
 
     Returns
     -------
@@ -111,6 +115,18 @@ def build_persistent_mfd(
         blocks_per_sm=blocks_per_sm, threads=threads,
     )
     resident_threads = persistent_grid[0] * persistent_block[0]
+    weight_type = "unsigned char" if quantized_weight else "float"
+    weight_sum = (
+        f"""int weight_sum = 0;
+            #pragma unroll
+            for (int k = 0; k < {NN}; k++)
+                if (mask & (1u << k)) weight_sum += (int)mfd_w[base + k];"""
+        if quantized_weight else ""
+    )
+    weight_value = (
+        "(float)mfd_w[base + k] / (float)weight_sum"
+        if quantized_weight else "mfd_w[base + k]"
+    )
 
     q_init = (
         KernelBuilder(
@@ -131,7 +147,7 @@ extern "C" __global__ void {t}_q_init(float* accum) {{
 extern "C" __global__ void {t}_persistent_mfd(
     int* __restrict__ frontier0, int* __restrict__ frontier1,
     int* __restrict__ count, unsigned int* __restrict__ barrier,
-    const unsigned char* __restrict__ dirs, const float* __restrict__ mfd_w,
+    const unsigned char* __restrict__ dirs, const {weight_type}* __restrict__ mfd_w,
     float* __restrict__ accum, int* __restrict__ indegree)
 {{
     __shared__ int s_buf[{fr_stage}];
@@ -158,11 +174,12 @@ extern "C" __global__ void {t}_persistent_mfd(
             float au = accum[u];
             unsigned int mask = (unsigned int)dirs[u];
             int base = u * {NN};
+            {weight_sum}
             #pragma unroll
             for (int k = 0; k < {NN}; k++) {{
                 if (!(mask & (1u << k))) continue;
                 int r = $ctx.grid.neighbour_raw(u, k)$;
-                atomicAdd(&accum[r], au * mfd_w[base + k]);
+                atomicAdd(&accum[r], au * ({weight_value}));
             }}
             __threadfence();
             #pragma unroll

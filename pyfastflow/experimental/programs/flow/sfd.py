@@ -46,6 +46,16 @@ def _cupy_only(be: Backend) -> None:
         raise ValueError(f"experimental SFDFlowProgram is cupy-only, got {be.name!r}")
 
 
+def _noop_factory(be, _bundles, _config):
+    """Return an explicit no-op so ``none`` remains a normal dispatch case."""
+    _cupy_only(be)
+
+    def noop(ctx):
+        pass
+
+    return HostBlockBuilder(noop).freeze()
+
+
 def _grid_leaf_plan(frozen, values):
     """Make an exact Program bind map from unique leaf names plus grid leaves."""
     bound = frozen.build()
@@ -167,7 +177,7 @@ def build_sfd_flow_program() -> type:
     b.config("nx")
     b.config(
         "local_minima",
-        choices=("reconstruct_epsilon", "cordonnier_carve", "cordonnier_jump"),
+        choices=("none", "reconstruct_epsilon", "cordonnier_carve", "cordonnier_jump"),
         default="cordonnier_carve",
     )
     b.config(
@@ -229,7 +239,9 @@ def build_sfd_flow_program() -> type:
     b.add("resolve_carve", cordonnier_factory("carve"), bind=lambda f, be: depression_binding_plan(f, method="optimized", reroute="carve"))
     b.add("resolve_jump", cordonnier_factory("jump"), bind=lambda f, be: depression_binding_plan(f, method="optimized", reroute="jump"))
     b.add("resolve_reconstruct_epsilon", _reconstruct_epsilon_factory, bind=_reconstruct_epsilon_plan)
+    b.add("resolve_none", _noop_factory, bind={})
     b.dispatch("resolve_minima", on="local_minima", cases={
+        "none": "resolve_none",
         "reconstruct_epsilon": "resolve_reconstruct_epsilon",
         "cordonnier_carve": "resolve_carve",
         "cordonnier_jump": "resolve_jump",

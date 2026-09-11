@@ -13,6 +13,9 @@ from ..noise import make_hash_u32
 
 _MODES = frozenset({"steepest", "stochastic"})
 _ACCUM_METHODS = frozenset({"atomic", "rake_compress", "pointer_jump_push"})
+_MFD_TOPOLOGY_METHODS = frozenset(
+    {"surface", "cordonnier_rank", "cordonnier_fill"}
+)
 
 
 def _blocks_for(be: Backend, section: str):
@@ -91,6 +94,110 @@ def make_receivers(
     )
 
 
+def make_mfd_topology(
+    be: Backend,
+    grid,
+    *,
+    method: str = "surface",
+    n_flat: int,
+    topology: str = "D8",
+    diagonal_partition_correction: bool = False,
+    quantized_weight: bool = False,
+) -> dict:
+    """Return CuPy kernels that construct a persistent-MFD topology.
+
+    ``surface`` routes on a depression-filled elevation plus a flat-distance
+    field. ``cordonnier_rank`` instead consumes an SFD receiver graph after
+    Cordonnier carving: carved nodes keep their single receiver, while all
+    other raw-downslope MFD links are gated by decreasing receiver rank.
+    ``cordonnier_fill`` converts the carved receiver paths to their maximum
+    elevation and uses receiver distance only as an epsilon ordering on flats;
+    MFD is otherwise independent of the carved receiver graph.
+
+    For ``cordonnier_rank``, run ``snapshot_receivers`` before modifying the
+    receiver array, then run ``receiver_rank`` and ``dirs_weights`` after the
+    carve. In either mode, run ``indegree_reset`` and ``indegree_count``
+    before :func:`make_accumulation` with ``method="persistent_mfd"``.
+    Set ``quantized_weight=True`` to emit max-normalized ``uint8`` scores;
+    the accumulation factory must receive the same option and the caller must
+    bind an unsigned-byte weight buffer instead of a float buffer.
+    """
+    be = require_backend(be)
+    if be.family != "cupy":
+        raise ValueError(
+            f"make_mfd_topology is cupy-only (got backend={be.name!r})"
+        )
+    if method not in _MFD_TOPOLOGY_METHODS:
+        raise ValueError(
+            f"make_mfd_topology: method must be one of "
+            f"{sorted(_MFD_TOPOLOGY_METHODS)}, got {method!r}"
+        )
+    if topology not in ("D4", "D8"):
+        raise ValueError(
+            f"make_mfd_topology: topology must be 'D4' or 'D8', got {topology!r}"
+        )
+    if int(n_flat) < 1:
+        raise ValueError("make_mfd_topology: n_flat must be positive")
+
+    from . import _cupy_mfd_topology
+
+    if method == "surface":
+        build = _cupy_mfd_topology.build_surface_mfd_topology
+    elif method == "cordonnier_rank":
+        build = _cupy_mfd_topology.build_ranked_mfd_topology
+    else:
+        build = _cupy_mfd_topology.build_filled_rank_mfd_topology
+    out = build(
+        grid=grid,
+        n_flat=int(n_flat),
+        topology=topology,
+        diagonal_partition_correction=diagonal_partition_correction,
+        quantized_weight=bool(quantized_weight),
+    )
+    if method == "cordonnier_fill":
+        out["receiver_fill"] = _cupy_mfd_topology.build_receiver_fill(
+            n_flat=int(n_flat)
+        )
+    return out
+
+
+def bind_mfd_receiver_rank(
+    frozen, *, rec, ancestor, ancestor_alt, rank, rank_alt
+):
+    """Bind the ping-pong buffers of a ``receiver_rank`` sequence.
+
+    The completed rank and ancestor arrays are ``rank`` and ``ancestor``;
+    the ``*_alt`` arrays are scratch space of the same shape and dtype.
+    """
+    bound = frozen.build()
+    bound.bind_leaf(
+        {"rec": rec, "ancestor": ancestor, "rank": rank},
+        prefix=("init",),
+        strict=True,
+    )
+    bound.bind_leaf(
+        {
+            "ancestor_in": ancestor,
+            "rank_in": rank,
+            "ancestor_out": ancestor_alt,
+            "rank_out": rank_alt,
+        },
+        prefix=("forward",),
+        strict=True,
+    )
+    bound.bind_leaf(
+        {
+            "ancestor_in": ancestor_alt,
+            "rank_in": rank_alt,
+            "ancestor_out": ancestor,
+            "rank_out": rank,
+        },
+        prefix=("backward",),
+        strict=True,
+    )
+    return bound
+
+
 def make_accumulation(
     be: Backend,
     grid,
@@ -103,6 +210,7 @@ def make_accumulation(
     fr_stage: int = 2048,
     blocks_per_sm: int = 2,
     threads: int = 256,
+    quantized_weight: bool = False,
 ) -> dict:
     """Return structures for one drainage-accumulation method.
 
@@ -125,6 +233,9 @@ def make_accumulation(
         Number of neighbours for rake-compress or MFD accumulation.
     fr_stage, blocks_per_sm, threads : int
         CuPy persistent-MFD launch settings.
+    quantized_weight : bool
+        For persistent MFD, consume max-normalized ``uint8`` scores and
+        renormalize their sum per node. Must match the topology builder.
 
     Returns
     -------
@@ -164,6 +275,7 @@ def make_accumulation(
         return _cupy_mfd_accum.build_persistent_mfd(
             grid=grid, n_flat=int(n_flat), n_neighbours=int(n_neighbours), fr_stage=fr_stage,
             blocks_per_sm=blocks_per_sm, threads=threads,
+            quantized_weight=bool(quantized_weight),
         )
 
     if method not in _ACCUM_METHODS:

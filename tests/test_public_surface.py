@@ -40,6 +40,40 @@ def test_core_context_all_is_exact():
         assert getattr(ctx, name) is not None
 
 
+def test_cupy_mfd_topology_public_recipes():
+    from pyfastflow.core import Backend
+    from pyfastflow.flow import make_mfd_topology
+    from pyfastflow.grid import make_grid_group
+
+    be = Backend.from_name("cupy")
+    grid = make_grid_group(be, topology="D8")
+    surface = make_mfd_topology(be, grid, method="surface", n_flat=16)
+    assert set(surface) == {"dirs_weights", "indegree_reset", "indegree_count"}
+
+    ranked = make_mfd_topology(be, grid, method="cordonnier_rank", n_flat=16)
+    assert set(ranked) == {
+        "snapshot_receivers", "receiver_rank", "dirs_weights",
+        "indegree_reset", "indegree_count",
+    }
+    bound = ranked["receiver_rank"].build()
+    addresses = bound.addresses()
+    assert ("init", "rec") in addresses
+    assert ("forward", "ancestor_in") in addresses
+    assert ("backward", "rank_out") in addresses
+    bound.close()
+    bound = ranked["dirs_weights"].build()
+    addresses = bound.addresses()
+    for name in ("z", "rec_initial", "rec", "rank", "dirs", "mfd_w"):
+        assert (name,) in addresses
+    bound.close()
+
+    with pytest.raises(ValueError, match="method must be one of"):
+        make_mfd_topology(be, grid, method="unknown", n_flat=16)
+    with pytest.raises(ValueError, match="cupy-only"):
+        other = Backend.from_name("taichi")
+        make_mfd_topology(other, make_grid_group(other), n_flat=16)
+
+
 def _taichi_available():
     try:
         import taichi  # noqa: F401

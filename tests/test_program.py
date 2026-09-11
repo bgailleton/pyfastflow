@@ -50,6 +50,41 @@ def test_program_host_orchestration_state_and_close():
         prog.counter.read()
 
 
+def test_program_pipeline_repeats_the_complete_chain():
+    ti.init(arch=ti.cpu)
+    P = (
+        ProgramBuilder("PipelineProgram")
+        .param("counter", "scalar", "i32", value=0)
+        .add("tick", lambda be, bundles, config: HostBlockBuilder(_increment).freeze(),
+             bind={"counter": "counter"})
+        .pipeline("run_n_step", ("tick", "tick"))
+        .freeze()
+    )
+    prog = P(Backend.from_name("taichi"))
+    try:
+        prog.run_n_step(3)
+        assert prog.counter.read() == 6
+    finally:
+        prog.close()
+
+
+@pytest.mark.parametrize("compact, expected", [(True, np.uint8), (False, np.float32)])
+def test_program_data_dtype_can_follow_configuration(compact, expected):
+    ti.init(arch=ti.cpu)
+    P = (
+        ProgramBuilder("ConfiguredDtypeProgram")
+        .config("compact", choices=(False, True), default=True)
+        .data("values", lambda config: "u8" if config["compact"] else "f32",
+              (4,), role="output")
+        .freeze()
+    )
+    prog = P(Backend.from_name("taichi"), compact=compact)
+    try:
+        assert prog.values.dtype == np.dtype(expected)
+    finally:
+        prog.close()
+
+
 def _grid_structure(be, *, nx, ny):
     return make_grid_group(be, topology="D8", boundary="normal", outlet="edge")
 
