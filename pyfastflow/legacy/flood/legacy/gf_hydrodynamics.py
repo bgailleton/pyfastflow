@@ -1400,18 +1400,6 @@ def pgraph_v0(particles:ti.template(), z:ti.template(), h:ti.template(), dh:ti.t
             h[i]=0
 
 
-
-# TODO for CLAUDE:
-
-# A bunch of helpers for my next hydrodynamics. be concise and straightfowrad. Respect the conventions of the rest of this file for neighbouring and all
-# for k in range(4) iterates through row major neihgbours in that order: top, left, right, bottom. the neighbour functions automatically manage boundary condition that is why we use it
-# In the following framework, the helper functions and kernels will use different type of data:
-# Q is the total volumatric flux per cell
-# wx and wy are the weights of transfer, the laters are representing the right wx, nd bottom wy link of each node. positive from node to right (for x and simlar for wy toward bottom)
-# for a node i the sum of weights going toward lower surface are equal to 1 (so the for directions)
-# The surface of splitting is z+h
-# help me write the different funcions
-
 @ti.func
 def update_wxy(index, wx, wy, z, h):
     '''

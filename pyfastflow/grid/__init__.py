@@ -64,7 +64,10 @@ def make_grid_group(
     -------
     FrozenGroup
         Helpers with ``NX``, ``NY``, ``DX``, and ``N_NEIGHBOURS`` parameter
-        slots, plus mask slots requested by the options.
+        slots, plus mask slots requested by the options. CuPy D4 groups also
+        carry ``face(i, k)``: the index of face k (0 N, 1 W, 2 E, 3 S) of
+        cell i in a staggered x-face (ny, nx + 1) or y-face (ny + 1, nx)
+        array, the last face of a periodic axis wrapping onto the first.
     """
     be = require_backend(be)
     _check_config(topology, boundary, outlet)

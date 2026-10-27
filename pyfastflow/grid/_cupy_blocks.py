@@ -318,3 +318,26 @@ __device__ void {t}_neighbour_and_distance(int i, int k, int* j_out, float* d_ou
     group.compose("is_on_edge", is_on_edge)
     group.compose("which_edge", which_edge)
     group.compose("neighbour_and_distance", neighbour_and_distance)
+
+    if not d8:
+        # Staggered D4 faces: x faces (k 1 W, 2 E) index a (ny, nx + 1)
+        # array, y faces (k 0 N, 3 S) a (ny + 1, nx) one; on a periodic axis
+        # the last face wraps onto the first (the extra slot is unused).
+        ew = "c == $ctx.NX.get(0)$ - 1 ? r * ($ctx.NX.get(0)$ + 1) : " \
+            if boundary == "periodic_EW" else ""
+        ns = "r == $ctx.NY.get(0)$ - 1 ? c : " \
+            if boundary == "periodic_NS" else ""
+        face = _helper(
+            f"""
+__device__ int {t}_face(int i, int k) {{
+    int r = $ctx.row(i)$;
+    int c = $ctx.col(i)$;
+    if (k == 1) return r * ($ctx.NX.get(0)$ + 1) + c;
+    if (k == 2) return {ew}r * ($ctx.NX.get(0)$ + 1) + c + 1;
+    if (k == 0) return r * $ctx.NX.get(0)$ + c;
+    return {ns}(r + 1) * $ctx.NX.get(0)$ + c;
+}}
+""",
+            helpers={"row": row, "col": col},
+        )
+        group.compose("face", face)
