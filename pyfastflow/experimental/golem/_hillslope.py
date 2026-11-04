@@ -49,7 +49,7 @@ def hillslope_factory(be, bundles, config):
                     int j = $ctx.grid.neighbour(i, k)$;
                     if (j == -1) continue;
                     float dj = fmaxf($ctx.DIFFUSIVITY.get(j)$, 0.0f);
-                    float length = $ctx.grid.dist_from_k(k)$;
+                    float length = $ctx.grid.dist(i, k)$;
                     float a = dt * 0.5f * (di + dj) / (length * length);
                     numerator += a * src[j];
                     denominator += a;

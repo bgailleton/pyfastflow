@@ -8,7 +8,8 @@ def build_grid_transfer_program():
     b = ProgramBuilder("GridTransferProgram")
     b.dim("ny").dim("nx")
     b.config("ny").config("nx")
-    b.config("boundary", choices=("normal", "periodic_EW", "periodic_NS"),
+    b.config("boundary", choices=("normal", "periodic_EW", "periodic_NS",
+                                  "periodic_EW_NS"),
              default="normal")
     b.config("jitter", default=0.25)
     b.config("seed", default=0)
@@ -34,8 +35,8 @@ extern "C" __global__ void grid_restrict_2x(
 
     def prolong(_be, _bundles, config):
         nx, ny = config["nx"], config["ny"]
-        periodic_x = config["boundary"] == "periodic_EW"
-        periodic_y = config["boundary"] == "periodic_NS"
+        periodic_x = config["boundary"] in ("periodic_EW", "periodic_EW_NS")
+        periodic_y = config["boundary"] in ("periodic_NS", "periodic_EW_NS")
         jitter = float(config["jitter"])
         seed = int(config["seed"])
         if not 0.0 <= jitter <= 0.5:

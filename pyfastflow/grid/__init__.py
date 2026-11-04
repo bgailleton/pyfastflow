@@ -10,7 +10,7 @@ import numpy as np
 from ..core import Backend, FrozenGroup, GroupBuilder, require_backend, share_leaf
 
 _TOPOLOGIES = {"D4": 4, "D8": 8}
-_BOUNDARIES = frozenset({"normal", "periodic_EW", "periodic_NS"})
+_BOUNDARIES = frozenset({"normal", "periodic_EW", "periodic_NS", "periodic_EW_NS"})
 _OUTLETS = frozenset({"edge", "mask"})
 
 
@@ -53,8 +53,9 @@ def make_grid_group(
         Target backend.
     topology : {"D4", "D8"}, default="D8"
         Four- or eight-neighbour grid connectivity.
-    boundary : {"normal", "periodic_EW", "periodic_NS"}, default="normal"
-        Domain-edge behaviour.
+    boundary : {"normal", "periodic_EW", "periodic_NS", "periodic_EW_NS"}, default="normal"
+        Domain-edge behaviour; ``"periodic_EW_NS"`` joins both pairs of
+        opposite edges.
     nodata : bool, default=False
         Include a per-cell no-data mask.
     outlet : {"edge", "mask"}, default="edge"
@@ -64,7 +65,19 @@ def make_grid_group(
     -------
     FrozenGroup
         Helpers with ``NX``, ``NY``, ``DX``, and ``N_NEIGHBOURS`` parameter
-        slots, plus mask slots requested by the options. CuPy D4 groups also
+        slots, plus mask slots requested by the options.
+
+        Cell-indexed helpers, for kernels that make no raster assumption:
+        ``n()`` cell count; ``neighbour(i, k)`` neighbour of cell i in slot k
+        for ``k < N_NEIGHBOURS``, or -1; ``reverse(k)`` the slot of i seen
+        from neighbour(i, k); ``dx(i)`` cell spacing; ``area(i)`` cell area;
+        ``dist(i, k)`` centre distance along slot k; ``width(i, k)`` width of
+        the link, for partitioning flow between slots; ``flow_width(i, k)``
+        width of the flow leaving i along slot k, for a depth closure; both
+        equal ``dist(i, k)`` here; ``dist_between_nodes(i, j)``; ``can_out(i)``, ``is_active(i)``, ``nodata(i)``.
+
+        Raster helpers: ``NX``, ``NY``, ``DX``, ``delta(k)``, ``which_edge
+        (i)``. CuPy D4 groups also
         carry ``face(i, k)``: the index of face k (0 N, 1 W, 2 E, 3 S) of
         cell i in a staggered x-face (ny, nx + 1) or y-face (ny + 1, nx)
         array, the last face of a periodic axis wrapping onto the first.
@@ -88,6 +101,7 @@ def make_grid_group(
     share_leaf(group, "NX")
     share_leaf(group, "NY")
     share_leaf(group, "DX")
+    share_leaf(group, "N_NEIGHBOURS")
     if nodata:
         share_leaf(group, "NODATA_MASK")
     if outlet == "mask":
@@ -126,7 +140,8 @@ def make_grid_parameters(
     nx, ny : int
         Raster dimensions.
     dx : float
-        Cell spacing, or the initial value of a spatial spacing field.
+        Cell spacing, or the initial value of a spatial spacing field read
+        per cell by ``dx(i)``, ``area(i)``, ``dist(i, k)`` and ``width(i, k)``.
     topology : {"D4", "D8"}, default="D8"
         Connectivity; must match :func:`make_grid_group`.
     nodata : bool, default=False

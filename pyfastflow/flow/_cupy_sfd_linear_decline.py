@@ -99,7 +99,7 @@ extern "C" __global__ void {tag}_downstream(
         int r = rec[i];
         if (r >= 0 && r < {n} && r != i && $ctx.grid.is_active(r)$) {{
             float dt = fmaxf($ctx.DT.get(i)$, 0.0f);
-            float s = $ctx.grid.DX.get(0)$ * $ctx.grid.DX.get(0)$;
+            float s = $ctx.grid.area(i)$;
             float alpha = s - dt * sum_qp[i];
             float beta = sum_q0[i];
             float d = fmaxf($ctx.grid.dist_between_nodes(i, r)$, 1.0e-12f);
@@ -198,7 +198,7 @@ extern "C" __global__ void {tag}_upstream(
             q[i] = sum_q0[i];
         }} else {{
             float dt = fmaxf($ctx.DT.get(i)$, 0.0f);
-            float s = $ctx.grid.DX.get(0)$ * $ctx.grid.DX.get(0)$;
+            float s = $ctx.grid.area(i)$;
             float rise = dt > 0.0f
                 ? dt * sum_q0[i] / (s - dt * sum_qp[i]) : 0.0f;
             z[i] = old + rise;

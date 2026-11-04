@@ -302,22 +302,43 @@ def _can_out_edge_tmpl(ctx, i):
 
 
 # ---------------------------------------------------------------------------
-# public: dist_from_k / dist_between_nodes
+# public: n / dx / area / reverse / dist / width / flow_width / dist_between_nodes
 # ---------------------------------------------------------------------------
 
 
-def _dist_from_k_d4_tmpl(ctx, k):
-    return ctx.DX.get(0)
+def _n_tmpl(ctx):
+    return ctx.NX.get(0) * ctx.NY.get(0)
+
+
+def _dx_tmpl(ctx, i):
+    return ctx.DX.get(i)
+
+
+def _area_tmpl(ctx, i):
+    d = ctx.DX.get(i)
+    return d * d
+
+
+def _reverse_tmpl(ctx, k):
+    return ctx.N_NEIGHBOURS.get(0) - 1 - k
+
+
+def _dist_d4_tmpl(ctx, i, k):
+    return ctx.DX.get(i)
 
 
 _SQRT2 = 1.4142135623730951
 
 
-def _dist_from_k_d8_tmpl(ctx, k):
-    d = ctx.DX.get(0)
+def _dist_d8_tmpl(ctx, i, k):
+    d = ctx.DX.get(i)
     if k == 0 or k == 2 or k == 5 or k == 7:
-        d = ctx.DX.get(0) * _SQRT2
+        d = d * _SQRT2
     return d
+
+
+def _width_tmpl(ctx, i, k):
+    return ctx._DIST(i, k)
 
 
 def _row_dist_normal_tmpl(ctx, raw):
@@ -344,9 +365,9 @@ def _dist_between_d4_tmpl(ctx, i, j):
         dr = ctx._ROWDIST(ctx._ROW(j) - ctx._ROW(i))
         dc = ctx._COLDIST(ctx._COL(j) - ctx._COL(i))
         if dr == 0 and dc == 1:
-            out = ctx.DX.get(0)
+            out = ctx.DX.get(i)
         elif dr == 1 and dc == 0:
-            out = ctx.DX.get(0)
+            out = ctx.DX.get(i)
     return out
 
 
@@ -356,11 +377,11 @@ def _dist_between_d8_tmpl(ctx, i, j):
         dr = ctx._ROWDIST(ctx._ROW(j) - ctx._ROW(i))
         dc = ctx._COLDIST(ctx._COL(j) - ctx._COL(i))
         if dr == 0 and dc == 1:
-            out = ctx.DX.get(0)
+            out = ctx.DX.get(i)
         elif dr == 1 and dc == 0:
-            out = ctx.DX.get(0)
+            out = ctx.DX.get(i)
         elif dr == 1 and dc == 1:
-            out = ctx.DX.get(0) * _SQRT2
+            out = ctx.DX.get(i) * _SQRT2
     return out
 
 
@@ -373,12 +394,14 @@ def _neighbour_and_distance_tmpl(ctx, i, k):
     j = ctx._NEIGHBOUR(i, k)
     d = -1.0
     if j != -1:
-        d = ctx._DISTFROMK(k)
+        d = ctx._DIST(i, k)
     return j, d
 
 
 def build_group(group, *, topology, boundary, nodata, outlet):
     """Compose the selected closure-backend grid helpers onto ``group``."""
+    periodic_x = boundary in ("periodic_EW", "periodic_EW_NS")
+    periodic_y = boundary in ("periodic_NS", "periodic_EW_NS")
     d8 = topology == "D8"
 
     row = _helper(_row_tmpl, params=["NX"])
@@ -388,22 +411,22 @@ def build_group(group, *, topology, boundary, nodata, outlet):
     delta = _helper(_delta_d8_tmpl if d8 else _delta_d4_tmpl)
 
     row_wrap = _helper(
-        _row_wrap_periodic_tmpl if boundary == "periodic_NS" else _row_wrap_identity_tmpl,
-        params=["NY"] if boundary == "periodic_NS" else [],
+        _row_wrap_periodic_tmpl if periodic_y else _row_wrap_identity_tmpl,
+        params=["NY"] if periodic_y else [],
     )
     col_wrap = _helper(
-        _col_wrap_periodic_tmpl if boundary == "periodic_EW" else _col_wrap_identity_tmpl,
-        params=["NX"] if boundary == "periodic_EW" else [],
+        _col_wrap_periodic_tmpl if periodic_x else _col_wrap_identity_tmpl,
+        params=["NX"] if periodic_x else [],
     )
     wrap = _helper(_wrap_tmpl, helpers={"_ROWWRAP": row_wrap, "_COLWRAP": col_wrap})
 
     row_edge_ok = _helper(
-        _row_edge_ok_periodic_tmpl if boundary == "periodic_NS" else _row_edge_ok_bounded_tmpl,
-        params=[] if boundary == "periodic_NS" else ["NY"],
+        _row_edge_ok_periodic_tmpl if periodic_y else _row_edge_ok_bounded_tmpl,
+        params=[] if periodic_y else ["NY"],
     )
     col_edge_ok = _helper(
-        _col_edge_ok_periodic_tmpl if boundary == "periodic_EW" else _col_edge_ok_bounded_tmpl,
-        params=[] if boundary == "periodic_EW" else ["NX"],
+        _col_edge_ok_periodic_tmpl if periodic_x else _col_edge_ok_bounded_tmpl,
+        params=[] if periodic_x else ["NX"],
     )
 
     source_ok = (
@@ -438,12 +461,12 @@ def build_group(group, *, topology, boundary, nodata, outlet):
     nodata_fn = _helper(_nodata_tmpl, helpers={"_ISACTIVE": is_active})
 
     row_is_edge = _helper(
-        _row_is_edge_periodic_tmpl if boundary == "periodic_NS" else _row_is_edge_active_tmpl,
-        params=[] if boundary == "periodic_NS" else ["NY"],
+        _row_is_edge_periodic_tmpl if periodic_y else _row_is_edge_active_tmpl,
+        params=[] if periodic_y else ["NY"],
     )
     col_is_edge = _helper(
-        _col_is_edge_periodic_tmpl if boundary == "periodic_EW" else _col_is_edge_active_tmpl,
-        params=[] if boundary == "periodic_EW" else ["NX"],
+        _col_is_edge_periodic_tmpl if periodic_x else _col_is_edge_active_tmpl,
+        params=[] if periodic_x else ["NX"],
     )
     is_on_edge = _helper(
         _is_on_edge_tmpl,
@@ -451,12 +474,12 @@ def build_group(group, *, topology, boundary, nodata, outlet):
     )
 
     row_edge_code = _helper(
-        _row_edge_code_periodic_tmpl if boundary == "periodic_NS" else _row_edge_code_active_tmpl,
-        params=[] if boundary == "periodic_NS" else ["NY"],
+        _row_edge_code_periodic_tmpl if periodic_y else _row_edge_code_active_tmpl,
+        params=[] if periodic_y else ["NY"],
     )
     col_edge_code = _helper(
-        _col_edge_code_periodic_tmpl if boundary == "periodic_EW" else _col_edge_code_active_tmpl,
-        params=[] if boundary == "periodic_EW" else ["NX"],
+        _col_edge_code_periodic_tmpl if periodic_x else _col_edge_code_active_tmpl,
+        params=[] if periodic_x else ["NX"],
     )
     which_edge = _helper(
         _which_edge_tmpl,
@@ -468,15 +491,21 @@ def build_group(group, *, topology, boundary, nodata, outlet):
     else:
         can_out = _helper(_can_out_edge_tmpl, helpers={"_ISONEDGE": is_on_edge})
 
-    dist_from_k = _helper(_dist_from_k_d8_tmpl if d8 else _dist_from_k_d4_tmpl, params=["DX"])
+    n_cells = _helper(_n_tmpl, params=["NX", "NY"])
+    dx = _helper(_dx_tmpl, params=["DX"])
+    area = _helper(_area_tmpl, params=["DX"])
+    reverse = _helper(_reverse_tmpl, params=["N_NEIGHBOURS"])
+    dist = _helper(_dist_d8_tmpl if d8 else _dist_d4_tmpl, params=["DX"])
+    width = _helper(_width_tmpl, helpers={"_DIST": dist})
+    flow_width = _helper(_width_tmpl, helpers={"_DIST": dist})
 
     row_dist = _helper(
-        _row_dist_periodic_tmpl if boundary == "periodic_NS" else _row_dist_normal_tmpl,
-        params=["NY"] if boundary == "periodic_NS" else [],
+        _row_dist_periodic_tmpl if periodic_y else _row_dist_normal_tmpl,
+        params=["NY"] if periodic_y else [],
     )
     col_dist = _helper(
-        _col_dist_periodic_tmpl if boundary == "periodic_EW" else _col_dist_normal_tmpl,
-        params=["NX"] if boundary == "periodic_EW" else [],
+        _col_dist_periodic_tmpl if periodic_x else _col_dist_normal_tmpl,
+        params=["NX"] if periodic_x else [],
     )
     dist_between = _helper(
         _dist_between_d8_tmpl if d8 else _dist_between_d4_tmpl,
@@ -486,7 +515,7 @@ def build_group(group, *, topology, boundary, nodata, outlet):
 
     neighbour_and_distance = _helper(
         _neighbour_and_distance_tmpl,
-        helpers={"_NEIGHBOUR": neighbour, "_DISTFROMK": dist_from_k},
+        helpers={"_NEIGHBOUR": neighbour, "_DIST": dist},
     )
 
     group.compose("neighbour", neighbour)
@@ -494,7 +523,13 @@ def build_group(group, *, topology, boundary, nodata, outlet):
     group.compose("nodata", nodata_fn)
     group.compose("is_active", is_active)
     group.compose("can_out", can_out)
-    group.compose("dist_from_k", dist_from_k)
+    group.compose("n", n_cells)
+    group.compose("dx", dx)
+    group.compose("area", area)
+    group.compose("dist", dist)
+    group.compose("width", width)
+    group.compose("flow_width", flow_width)
+    group.compose("reverse", reverse)
     group.compose("dist_between_nodes", dist_between)
     group.compose("is_on_edge", is_on_edge)
     group.compose("which_edge", which_edge)

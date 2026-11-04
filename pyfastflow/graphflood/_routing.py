@@ -8,6 +8,14 @@ from pyfastflow.core import KernelBuilder, RoutineBuilder
 from pyfastflow.flow import make_accumulation, make_mfd_topology
 from pyfastflow.flow._program_cupy import _cupy_only, _grid_leaf_plan
 
+def n_slots(config):
+    """Neighbour slots per cell of a config's grid or tree."""
+    tree = config.get("tree")
+    if tree is not None:
+        return tree.n_neighbours
+    return 8 if config["topology"] == "D8" else 4
+
+
 def _build_hydraulic_topology(be, grid, n, topology, quantized_weight):
     """Rank-gated MFD weights plus unmodified hydraulic slope diagnostics."""
     weight_type = "unsigned char" if quantized_weight else "float"
@@ -34,7 +42,7 @@ def _build_hydraulic_topology(be, grid, n, topology, quantized_weight):
             double sum_score = 0.0;
             {max_decl}
             double best_slope = 0.0;
-            float best_width = $ctx.grid.DX.get(0)$;
+            float best_width = $ctx.grid.dx(i)$;
             for (int k = 0; k < 8; ++k) scores[k] = 0.0;
 
             if (!$ctx.grid.can_out(i)$ && !$ctx.grid.nodata(i)$) {{
@@ -43,11 +51,11 @@ def _build_hydraulic_topology(be, grid, n, topology, quantized_weight):
                 for (int k = 0; k < nk; ++k) {{
                     int j = $ctx.grid.neighbour(i, k)$;
                     if (j == -1) continue;
-                    double width = (double)$ctx.grid.dist_from_k(k)$;
-                    double slope = (surface[i] - surface[j]) / width;
+                    double slope = (surface[i] - surface[j])
+                                 / (double)$ctx.grid.dist(i, k)$;
                     if (slope > best_slope) {{
                         best_slope = slope;
-                        best_width = width;
+                        best_width = $ctx.grid.flow_width(i, k)$;
                     }}
                 }}
 
@@ -65,8 +73,9 @@ def _build_hydraulic_topology(be, grid, n, topology, quantized_weight):
                     for (int k = 0; k < nk; ++k) {{
                         int j = $ctx.grid.neighbour(i, k)$;
                         if (j == -1 || rank[j] >= rank[i]) continue;
-                        double width = (double)$ctx.grid.dist_from_k(k)$;
-                        double slope = (surface[i] - surface[j]) / width;
+                        double width = (double)$ctx.grid.width(i, k)$;
+                        double slope = (surface[i] - surface[j])
+                                     / (double)$ctx.grid.dist(i, k)$;
                         double score = slope > 0.0 ? slope * width : 0.0;
                         scores[k] = score;
                         if (score > 0.0) {{
@@ -119,7 +128,7 @@ def _build_filled_hydraulic_topology(
             float sum_score = 0.0f;
             {max_decl}
             float best_slope = 0.0f;
-            float best_width = $ctx.grid.DX.get(0)$;
+            float best_width = $ctx.grid.dx(i)$;
             for (int k = 0; k < 8; ++k) scores[k] = 0.0f;
 
             if (!$ctx.grid.can_out(i)$ && !$ctx.grid.nodata(i)$) {{
@@ -135,16 +144,15 @@ def _build_filled_hydraulic_topology(
                         drop = ulp * (float)(rank[i] - rank[j]);
                     }}
                     if (drop <= 0.0f) continue;
-                    float width = $ctx.grid.dist_from_k(k)$;
-                    float slope = drop / width;
-                    float score = slope * width;
+                    float slope = drop / $ctx.grid.dist(i, k)$;
+                    float score = slope * $ctx.grid.width(i, k)$;
                     scores[k] = score;
                     mask |= (unsigned char)(1u << k);
                     sum_score += score;
                     {max_update}
                     if (slope > best_slope) {{
                         best_slope = slope;
-                        best_width = width;
+                        best_width = $ctx.grid.flow_width(i, k)$;
                     }}
                 }}
             }}
@@ -183,12 +191,11 @@ def _build_filled_hydraulic_topology(
                 if (!(mask & (1u << k))) continue;
                 int j = $ctx.grid.neighbour(i, k)$;
                 if (j == -1 || conditioned[j]) continue;
-                double width = (double)$ctx.grid.dist_from_k(k)$;
                 double slope = (physical_surface[i] - physical_surface[j])
-                             / width;
+                             / (double)$ctx.grid.dist(i, k)$;
                 if (slope > best_slope) {{
                     best_slope = slope;
-                    best_width = (float)width;
+                    best_width = $ctx.grid.flow_width(i, k)$;
                 }}
             }}
             if (best_slope > 0.0) {{
@@ -250,12 +257,11 @@ def _carve_topology_factory(be, bundles, config):
             for (int k = 0; k < nk; ++k) {{
                 if (!(mask & (1u << k))) continue;
                 int r = $ctx.grid.neighbour_raw(i, k)$;
-                double width = (double)$ctx.grid.dist_from_k(k)$;
                 double slope = (physical_surface[i] - physical_surface[r])
-                             / width;
+                             / (double)$ctx.grid.dist(i, k)$;
                 if (slope > best) {{
                     best = slope;
-                    width_best = (float)width;
+                    width_best = $ctx.grid.flow_width(i, k)$;
                 }}
             }}
             steepest_slope[i] = best > 0.0
@@ -289,13 +295,13 @@ def _reconstructed_topology_factory(be, bundles, config):
             int i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i >= {n}) return;
             double best_slope = 0.0;
-            float best_width = $ctx.grid.DX.get(0)$;
+            float best_width = $ctx.grid.dx(i)$;
             unsigned char mask = dirs[i];
             int nk = $ctx.grid.N_NEIGHBOURS.get(0)$;
             for (int k = 0; k < nk; ++k) {{
                 if (!(mask & (1u << k))) continue;
                 int j = $ctx.grid.neighbour(i, k)$;
-                double width = (double)$ctx.grid.dist_from_k(k)$;
+                double width = (double)$ctx.grid.width(i, k)$;
                 double conditioned_drop = ((double)filled[i]
                                            - (double)filled[j])
                                           + ((double)dist[i]
@@ -390,14 +396,14 @@ def _accumulation_factory(be, bundles, config):
         f'''extern "C" __global__ void graphflood_q_init(float* Qi) {{
             int i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i >= {n}) return;
-            float dx = $ctx.grid.DX.get(0)$;
+            float dx = $ctx.grid.dx(i)$;
             Qi[i] = $ctx.grid.nodata(i)$ ? 0.0f
                 : $ctx.PRECIPITATION.get(i)$ * dx * dx;
         }}''', domain=n,
     ).compose("grid", bundles["grid"]).freeze()
     accum = make_accumulation(
         be, bundles["grid"], method="persistent_mfd", n_flat=n,
-        n_neighbours=8 if config["topology"] == "D8" else 4,
+        n_neighbours=n_slots(config),
         quantized_weight=config.get("quantized_weight", False),
     )["accum"]
     return RoutineBuilder().step("q_init", q_init).step("accum", accum).freeze()

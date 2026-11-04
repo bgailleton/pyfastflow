@@ -105,6 +105,7 @@ PARAM_BIND = {
     "NEWTON_ITERATIONS": "newton_iterations", "RAIN": "rain", "SOURCE": "source",
     "CFL": "cfl", "DT": "dt", "DT_MAX": "dt_max",
     "RECORD_INTERVAL": "record_interval", "RHO": "rho",
+    "LOCAL_DT_RATIO": "local_dt_ratio",
 }
 
 
@@ -378,6 +379,37 @@ def _dt_text(config, real, growth):
     if (i == 0) clock[{C_DT}] = (double)dt;'''
 
 
+def _local_dt_text(config, real, kind, src):
+    """Per-cell time step when the program declares ``time_stepping``
+    "local": dt_i = min(cfl dx / c_i, LOCAL_DT_RATIO dt), at least dt (the
+    global step), c_i the largest max(|u|, |v|) + sqrt(g h) over the cell and
+    its neighbours at the step start; the first (or euler) stage stores it in
+    ``dt_local``, the second stage reads it. Returns the extra kernel
+    arguments and the text setting dt (both empty otherwise)."""
+    if config.get("time_stepping", "global") != "local":
+        return "", ""
+    c = literal(real)
+    if kind == "second":
+        return f", const {real}* dt_local", "\n        dt = dt_local[i];"
+    sh, su, sv = src
+    return f", {real}* dt_local", f'''
+        {{
+            {real} g = ({real})$ctx.GRAVITY.get(0)$;
+            {real} cl = {c(0)};
+            for (int k = -1; k < 4; ++k) {{
+                int j = k < 0 ? i : $ctx.grid.neighbour(i, k)$;
+                if (j < 0) continue;
+                {real} cw = sqrt(g * fmax({sh}[j], {c(0)}));
+                cl = fmax(cl, fmax(fabs({su}[j]), fabs({sv}[j])) + cw);
+            }}
+            {real} cap = dt * ({real})$ctx.LOCAL_DT_RATIO.get(0)$;
+            {real} dl = cl > {c(0)}
+                ? fmin(({real})$ctx.CFL.get(0)$ * dx / cl, cap) : cap;
+            dt = fmax(dt, dl);
+            dt_local[i] = dt;
+        }}'''
+
+
 def _stage_kernel(bundles, config, helpers, kind, gated):
     nx, ny, n, px, py = _geometry(config)
     real = _real(config)
@@ -484,6 +516,7 @@ def _stage_kernel(bundles, config, helpers, kind, gated):
     gate = f"if (control[{K_REDO}] == 0u) return;" if gated else ""
     dt_text = (f"\n    {real} dt = ({real})clock[{C_DT}];"
                if gated or kind == "second" else _dt_text(config, real, kind == "first"))
+    local_args, local_text = _local_dt_text(config, real, kind, src)
     reduce_inf = f'''
     if (__any_sync(0xffffffffu, vol_inf != 0.0)) {{
         vol_inf = fusw_warp_sum(vol_inf);
@@ -498,7 +531,7 @@ extern "C" __global__ void fusw_stage(
         const unsigned char* boundary_faces,
         const {real}* fx1, const {real}* fx2, const {real}* fx3,
         const {real}* fy1, const {real}* fy2, const {real}* fy3{face_bed_args}{infiltration_args},
-        double* clock, unsigned int* control, double* budget_step) {{
+        double* clock, unsigned int* control, double* budget_step{local_args}) {{
     {gate}
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     double vol_inf = 0.0, vol_thr = 0.0;{dt_text}
@@ -509,7 +542,7 @@ extern "C" __global__ void fusw_stage(
         int x = i % {nx};
         int y = i / {nx};
         {real} dx = ({real})$ctx.grid.DX.get(0)$;
-        {real} area = dx * dx;
+        {real} area = dx * dx;{local_text}
         {real} tx = dt / dx;
         {real} he = ({real})$ctx.HE_CA.get(0)$;
         {real} ve = ({real})$ctx.VE_CA.get(0)$;
@@ -866,7 +899,8 @@ def bind_plan(frozen, _be):
         + ("z", "boundary_type", "infiltrated", "infiltrated_stage", "clock",
            "boundary_faces", "control", "budget", "budget_step", "rain_table", "inflow_table",
            "source_table", "probe_index", "records", "line_cells", "line_offsets",
-           "line_q", "line_slope", "line_last", "inflow_q", "inflow_depth")
+           "line_q", "line_slope", "line_last", "inflow_q", "inflow_depth",
+           "dt_local")
         + CELL_OUT + FACE_OUT + FROUDE_CELL + FROUDE_FACE + ACC_IN + ACC_CELL + ACC_FACE)}
     values.update(PARAM_BIND)
     return _grid_leaf_plan(frozen, values)

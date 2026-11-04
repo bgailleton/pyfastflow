@@ -28,6 +28,7 @@ _LAZY_SUBMODULES = [
     "core",
     "experimental",
     "grid",
+    "quadtree",
     "noise",
     "flow",
     "flood",

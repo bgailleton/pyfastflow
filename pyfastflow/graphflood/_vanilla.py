@@ -34,7 +34,7 @@ def _update_factory(be, bundles, config):
             float qout = $ctx.friction(h[i], steepest_slope[i], i)$
                 * h[i] * flow_width[i];
             Qo[i] = qout;
-            float dx = $ctx.grid.DX.get(0)$;
+            float dx = $ctx.grid.dx(i)$;
             float next = h[i] + (Qi[i] - qout) / (dx * dx) * $ctx.DT.get(0)$;
             h[i] = next > 0.0f ? next : 0.0f;
         }}''', domain=n,
@@ -72,14 +72,14 @@ def _transient_factory(be, bundles, config):
             double scores[8];
             double sum_score = 0.0;
             double best_slope = 0.0;
-            float best_width = $ctx.grid.DX.get(0)$;
+            float best_width = $ctx.grid.dx(i)$;
             for (int k = 0; k < 8; ++k) scores[k] = 0.0;
 
             if (!$ctx.grid.nodata(i)$ && !$ctx.grid.can_out(i)$) {{
                 for (int k = 0; k < {nk}; ++k) {{
                     int r = $ctx.grid.neighbour(i, k)$;
                     if (r == -1) continue;
-                    double width = (double)$ctx.grid.dist_from_k(k)$;
+                    double width = (double)$ctx.grid.width(i, k)$;
                     double slope = (hydraulic_surface[i]
                                   - hydraulic_surface[r]) / width;
                     if (slope <= 0.0) continue;
@@ -126,7 +126,7 @@ def _transient_factory(be, bundles, config):
                 const float* h, float* Qo) {{
             int i = blockIdx.x * blockDim.x + threadIdx.x;
             if (i >= {n}) return;
-            float dx = $ctx.grid.DX.get(0)$;
+            float dx = $ctx.grid.dx(i)$;
             float area = dx * dx;
             float dt = fmaxf($ctx.DT.get(0)$, 1.0e-12f);
             float available = area * fmaxf(h[i], 0.0f) / dt
@@ -147,13 +147,13 @@ def _transient_factory(be, bundles, config):
                 Qo[i] = 0.0f;
                 return;
             }}
-            float dx = $ctx.grid.DX.get(0)$;
+            float dx = $ctx.grid.dx(i)$;
             float area = dx * dx;
             float qin = fmaxf($ctx.PRECIPITATION.get(i)$, 0.0f) * area;
             for (int k = 0; k < {nk}; ++k) {{
                 int donor = $ctx.grid.neighbour(i, k)$;
                 if (donor == -1) continue;
-                int reverse = {nk - 1} - k;
+                int reverse = $ctx.grid.reverse(k)$;
                 if (!(dirs[donor] & (1u << reverse))) continue;
                 qin += Qo[donor] * weights[donor * {nk} + reverse];
             }}

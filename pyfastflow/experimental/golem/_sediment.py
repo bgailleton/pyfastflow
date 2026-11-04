@@ -53,7 +53,7 @@ def sediment_factory(be, bundles, config):
             rock_erosion[i] = erode_rock;
             sediment_entrainment[i] = erode_sediment;
             source[i] = (erode_rock + erode_sediment)
-                      * $ctx.grid.DX.get(0)$ * $ctx.grid.DX.get(0)$;
+                      * $ctx.grid.dx(i)$ * $ctx.grid.dx(i)$;
             float transport_length = $ctx.TRANSPORT_LENGTH.get(i)$;
             survival[i] = transport_length > 0.0f
                 ? expf(-length / transport_length) : 0.0f;
@@ -129,7 +129,7 @@ def sediment_factory(be, bundles, config):
             float retained = fminf(fmaxf(survival[i], 0.0f), 1.0f);
             float deposited = incoming * (1.0f - retained);
             float dt = fmaxf($ctx.DT.get(i)$, 0.0f);
-            float area = $ctx.grid.DX.get(0)$ * $ctx.grid.DX.get(0)$;
+            float area = $ctx.grid.area(i)$;
             deposition[i] = deposited / area;
             sediment_thickness[i] += dt * deposition[i];
             z[i] += dt * deposition[i];

@@ -63,7 +63,7 @@ extern "C" __global__ void {tag}_phase(
     if (dt == 0.0f) return;
     float dz = z[i] - old_z[i];
     float h = fmaxf(sediment_thickness[i], 0.0f);
-    float area = $ctx.grid.DX.get(0)$ * $ctx.grid.DX.get(0)$;
+    float area = $ctx.grid.area(i)$;
     if (dz < 0.0f) {{
         float removed = -dz;
         float sed_removed = fminf(h, removed);

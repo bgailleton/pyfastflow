@@ -57,7 +57,7 @@ def _route_factory(be, bundles, config):
                 int j = $ctx.grid.neighbour(i, k)$;
                 if (j == -1) continue;
                 double slope = (surface[i] - surface[j])
-                             / (double)$ctx.grid.dist_from_k(k)$;
+                             / (double)$ctx.grid.dist(i, k)$;
                 if (slope > best_slope) {{
                     best_slope = slope;
                     receiver = j;

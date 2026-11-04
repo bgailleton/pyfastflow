@@ -296,7 +296,7 @@ def build_persistent_subset_mfd(
             int na = $ctx.ACTIVE_COUNT.get(0)$;
             if (p >= na) return;
             int i = active_ids[p];
-            float dx = $ctx.grid.DX.get(0)$;
+            float dx = $ctx.grid.dx(i)$;
             accum[i] = $ctx.grid.nodata(i)$ ? 0.0f
                      : $ctx.SOURCE.get(i)$ * dx * dx;
             remaining[i] = 0;
@@ -319,7 +319,7 @@ def build_persistent_subset_mfd(
             for (int k = 0; k < {NN}; ++k) {{
                 int donor = $ctx.grid.neighbour(i, k)$;
                 if (donor == -1) continue;
-                int reverse = {NN - 1} - k;
+                int reverse = $ctx.grid.reverse(k)$;
                 if (!(dirs[donor] & (1u << reverse))) continue;
                 if (active[donor]) {{ ++degree; continue; }}
                 int base = donor * {NN};

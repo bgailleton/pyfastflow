@@ -135,9 +135,11 @@ def _ratio(sx, sy, fx, fy):
         return np.where(norm > 0.0, np.hypot(sx - fx, sy - fy) / norm, np.nan)
 
 
-def build_fusw_program() -> type:
-    """Build the FuswProgram class (see the module docstring)."""
-    b = ProgramBuilder("FuswProgram")
+def fusw_builder(name="FuswProgram"):
+    """ProgramBuilder holding the FuswProgram recipe (see the module
+    docstring); ``finish_fusw_program`` attaches the host methods to the
+    frozen class."""
+    b = ProgramBuilder(name)
     b.dim("ny").dim("nx")
     b.config("ny").config("nx").config("dx", default=1.0)
     b.config("boundary", choices=("normal", "periodic_EW", "periodic_NS"), default="normal")
@@ -256,8 +258,11 @@ def build_fusw_program() -> type:
                          ("_acc_cell", diag.acceleration_cell_kernel),
                          ("_acc_face", diag.acceleration_face_kernel)):
         b.add(name, diagnostic_factory(kernel), bind=bind_plan)
+    return b
 
-    program = b.freeze()
+
+def finish_fusw_program(program):
+    """Attach the FuswProgram host methods to the frozen ``program``."""
 
     def initialize(self):
         """Zero h, u, v, the infiltrated depth, time, budget and recording;
@@ -587,6 +592,12 @@ def build_fusw_program() -> type:
     return program
 
 
+def build_fusw_program() -> type:
+    """Build the FuswProgram class (see the module docstring)."""
+    return finish_fusw_program(fusw_builder().freeze())
+
+
 FuswProgram = build_fusw_program()
 
-__all__ = ["FuswProgram", "build_fusw_program", "BOUNDARY_CODES"]
+__all__ = ["FuswProgram", "build_fusw_program", "fusw_builder",
+           "finish_fusw_program", "BOUNDARY_CODES"]

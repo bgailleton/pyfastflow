@@ -71,7 +71,7 @@ def _measure_text(n, particles):
     inflow_init = "double inflow = (double)rain;" if particles else ""
     neighbour_extra = '''
                 if (other - head > DROP_MIN)
-                    inflow += (double)pushed[j * nk + (nk - 1 - k)];
+                    inflow += (double)pushed[j * nk + $ctx.grid.reverse(k)$];
                 if ($ctx.grid.can_out(j)$)
                     v[10] += (double)pushed[i * nk + k];''' if particles else ""
     stale = "v[9] = fabs(q - inflow);" if particles else ""
@@ -101,7 +101,7 @@ extern "C" __global__ void graphflood_convergence(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < {n} && !$ctx.grid.nodata(i)$) {{
         int nk = $ctx.grid.N_NEIGHBOURS.get(0)$;
-        float dx = $ctx.grid.DX.get(0)$;
+        float dx = $ctx.grid.dx(i)$;
         float rain = $ctx.PRECIPITATION.get(i)$ * dx * dx;
         bool out = $ctx.grid.can_out(i)$;{rain_balance}
         if (!out) {{
@@ -117,7 +117,7 @@ extern "C" __global__ void graphflood_convergence(
                 int j = $ctx.grid.neighbour(i, k)$;
                 if (j < 0 || $ctx.grid.nodata(j)$) continue;
                 double other = (double)z[j] + (double)h[j];
-                float dist = $ctx.grid.dist_from_k(k)$;
+                float dist = $ctx.grid.dist(i, k)$;
                 if (other < low_head) {{
                     low_head = other;
                     low_k = k;
@@ -127,7 +127,7 @@ extern "C" __global__ void graphflood_convergence(
                 if (drop > 0.0 && (float)(drop / dist) > best_slope) {{
                     best_slope = (float)(drop / dist);
                     rk = k;
-                    width = dist;
+                    width = $ctx.grid.flow_width(i, k)$;
                     length = dist;
                     receiver_head = other;
                 }}{neighbour_extra}
@@ -135,7 +135,7 @@ extern "C" __global__ void graphflood_convergence(
             if (rk == 255) {{
                 rk = low_k;
                 receiver_head = low_head;
-                width = low_length;
+                if (low_k != 255) width = $ctx.grid.flow_width(i, low_k)$;
                 length = low_length;
             }}
 

@@ -20,8 +20,8 @@ def build_distance_slope_helpers(grid, *, topology: str, diagonal_partition_corr
     if correct:
         dist_from_k_corrected = HelperBuilder(
             f"""
-__device__ float {t}_dist_from_k_corrected(int k) {{
-    float d = $ctx.grid.dist_from_k(k)$;
+__device__ float {t}_dist_from_k_corrected(int i, int k) {{
+    float d = $ctx.grid.dist(i, k)$;
     if (k == 0 || k == 2 || k == 5 || k == 7) {{
         d = d / 1.4142135623730951f;
     }}
@@ -42,7 +42,7 @@ __device__ float {t}_dist_between_nodes_corrected(int i, int j) {{
         ).compose("grid", grid).freeze()
     else:
         dist_from_k_corrected = HelperBuilder(
-            f"__device__ float {t}_dist_from_k_corrected(int k) {{ return $ctx.grid.dist_from_k(k)$; }}"
+            f"__device__ float {t}_dist_from_k_corrected(int i, int k) {{ return $ctx.grid.dist(i, k)$; }}"
         ).compose("grid", grid).freeze()
         dist_between_nodes_corrected = HelperBuilder(
             f"__device__ float {t}_dist_between_nodes_corrected(int i, int j) {{ return $ctx.grid.dist_between_nodes(i, j)$; }}"
@@ -50,8 +50,8 @@ __device__ float {t}_dist_between_nodes_corrected(int i, int j) {{
 
     slope_from_values_k = HelperBuilder(
         f"""
-__device__ float {t}_slope_from_values_k(float zi, float hi, float zj, float hj, int k) {{
-    return ((zi - zj) + (hi - hj)) / $ctx.dist_from_k_corrected(k)$;
+__device__ float {t}_slope_from_values_k(int i, float zi, float hi, float zj, float hj, int k) {{
+    return ((zi - zj) + (hi - hj)) / $ctx.dist_from_k_corrected(i, k)$;
 }}
 """
     ).compose("dist_from_k_corrected", dist_from_k_corrected).freeze()
@@ -144,10 +144,10 @@ def build_receivers(
     t = f"fr{new_uid()}"
     if h_aware:
         args = "const float* z, const float* h, int* rec"
-        slope_call = "$ctx.slope(z[i], h[i], z[j], h[j], k)$"
+        slope_call = "$ctx.slope(i, z[i], h[i], z[j], h[j], k)$"
     else:
         args = "const float* z, int* rec"
-        slope_call = "$ctx.slope(z[i], 0.0f, z[j], 0.0f, k)$"
+        slope_call = "$ctx.slope(i, z[i], 0.0f, z[j], 0.0f, k)$"
 
     if mode == "slope_weighted_fixed":
         selection = f"""
@@ -193,7 +193,7 @@ def build_receivers(
     body = f"""
 extern "C" __global__ void {t}_receivers({args}) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = $ctx.grid.NX.get(0)$ * $ctx.grid.NY.get(0)$;
+    int n = $ctx.grid.n()$;
     if (i >= n) return;
 
     if ($ctx.grid.can_out(i)$) {{

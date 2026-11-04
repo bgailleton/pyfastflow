@@ -13,12 +13,12 @@ _SQRT2 = math.sqrt(2.0)
 # ---------------------------------------------------------------------------
 
 
-def _dist_from_k_tmpl(ctx, k):
-    return ctx.grid.dist_from_k(k)
+def _dist_from_k_tmpl(ctx, i, k):
+    return ctx.grid.dist(i, k)
 
 
-def _dist_from_k_corrected_tmpl(ctx, k):
-    d = ctx.grid.dist_from_k(k)
+def _dist_from_k_corrected_tmpl(ctx, i, k):
+    d = ctx.grid.dist(i, k)
     if k == 0 or k == 2 or k == 5 or k == 7:
         d = d / _SQRT2
     return d
@@ -35,10 +35,10 @@ def _dist_between_nodes_corrected_tmpl(ctx, i, j):
     return d
 
 
-def _slope_from_values_k_tmpl(ctx, zi, hi, zj, hj, k):
+def _slope_from_values_k_tmpl(ctx, i, zi, hi, zj, hj, k):
     # (zi-zj)+(hi-hj) rather than (zi+hi)-(zj+hj) - avoids float cancellation
     # when z dominates h in magnitude.
-    return ((zi - zj) + (hi - hj)) / ctx.dist_from_k_corrected(k)
+    return ((zi - zj) + (hi - hj)) / ctx.dist_from_k_corrected(i, k)
 
 
 def _slope_between_nodes_tmpl(ctx, vi, vj, i, j):
@@ -181,7 +181,7 @@ def build_receivers(
                     valid = j != -1
                     tsr = -1.0
                     if valid:
-                        tsr = ctx.slope(z[i], 0.0, z[j], 0.0, k)
+                        tsr = ctx.slope(i, z[i], 0.0, z[j], 0.0, k)
                     better = valid and tsr > sr
                     sr = tsr if better else sr
                     r = j if better else r
@@ -201,7 +201,7 @@ def build_receivers(
                     valid = j != -1
                     tsr = -1.0
                     if valid:
-                        tsr = ctx.slope(z[i], h[i], z[j], h[j], k)
+                        tsr = ctx.slope(i, z[i], h[i], z[j], h[j], k)
                     better = valid and tsr > sr
                     sr = tsr if better else sr
                     r = j if better else r
@@ -221,7 +221,7 @@ def build_receivers(
                     valid = j != -1
                     tsr = -1.0
                     if valid:
-                        tsr = ctx.slope(z[i], 0.0, z[j], 0.0, k)
+                        tsr = ctx.slope(i, z[i], 0.0, z[j], 0.0, k)
                         if tsr > 0.0:
                             tsr = ctx.rand_unit(i, k) * ctx.bk.sqrt(tsr)
                     better = valid and tsr > sr
@@ -243,7 +243,7 @@ def build_receivers(
                     valid = j != -1
                     tsr = -1.0
                     if valid:
-                        tsr = ctx.slope(z[i], h[i], z[j], h[j], k)
+                        tsr = ctx.slope(i, z[i], h[i], z[j], h[j], k)
                         if tsr > 0.0:
                             tsr = ctx.rand_unit(i, k) * ctx.bk.sqrt(tsr)
                     better = valid and tsr > sr
@@ -262,7 +262,7 @@ def build_receivers(
                 for k in range(ctx.grid.N_NEIGHBOURS.get(0)):
                     j = ctx.grid.neighbour(i, k)
                     if j != -1:
-                        slope = ctx.slope(z[i], 0.0, z[j], 0.0, k)
+                        slope = ctx.slope(i, z[i], 0.0, z[j], 0.0, k)
                         if slope > 0.0:
                             total += slope
                 if total <= 0.0:
@@ -274,7 +274,7 @@ def build_receivers(
                     j = ctx.grid.neighbour(i, k)
                     if j == -1:
                         continue
-                    weight = ctx.slope(z[i], 0.0, z[j], 0.0, k)
+                    weight = ctx.slope(i, z[i], 0.0, z[j], 0.0, k)
                     if weight <= 0.0:
                         continue
                     selected = j
@@ -294,7 +294,7 @@ def build_receivers(
                 for k in range(ctx.grid.N_NEIGHBOURS.get(0)):
                     j = ctx.grid.neighbour(i, k)
                     if j != -1:
-                        slope = ctx.slope(z[i], h[i], z[j], h[j], k)
+                        slope = ctx.slope(i, z[i], h[i], z[j], h[j], k)
                         if slope > 0.0:
                             total += slope
                 if total <= 0.0:
@@ -306,7 +306,7 @@ def build_receivers(
                     j = ctx.grid.neighbour(i, k)
                     if j == -1:
                         continue
-                    weight = ctx.slope(z[i], h[i], z[j], h[j], k)
+                    weight = ctx.slope(i, z[i], h[i], z[j], h[j], k)
                     if weight <= 0.0:
                         continue
                     selected = j

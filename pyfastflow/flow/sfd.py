@@ -21,12 +21,23 @@ Typical use::
 from reconstruction's acyclic parent links. It also exposes ``filled`` and
 ``epsilon_distance``; SFD itself does not need to re-derive receivers from
 those two fields.
+
+To route on a quadtree, pass it with its dimensions; every array then has
+``tree.capacity`` entries on one row, and the tree stays open after ``close``::
+
+    flow = SFDFlowProgram(be, tree=tree, topology=tree.topology, **tree.dims)
+    flow.source.from_numpy(cell_area)  # shape (1, capacity); area per leaf, zero on spare entries
+
+``dx``, ``boundary``, ``outlet``, ``nodata`` and ``dynamic_grid`` then belong to
+the tree and must keep their defaults. ``reconstruct_epsilon`` and
+``compute_slope_correction`` need the raster and are unavailable on a tree.
 """
 
 import math
 
 from pyfastflow.core import Backend, HostBlockBuilder, KernelBuilder, SequenceBuilder
 from pyfastflow.core.context.program import Dim, ProgramBuilder
+from pyfastflow.core.context.slot import ProgramError
 from pyfastflow.flow import (
     BOUNDARIES,
     LOCAL_MINIMA,
@@ -85,6 +96,7 @@ def build_sfd_flow_program() -> type:
     b.config("outlet", choices=("edge", "mask"), default="edge")
     b.config("nodata", choices=(False, True), default=False)
     b.config("dynamic_grid", choices=(False, True), default=False)
+    b.config("tree", default=None)
     b.config("receiver_mode", choices=RECEIVER_MODES, default="steepest")
     b.param("receiver_seed", "auto", "i32", value=0)
     b.param("source", "auto", "f32", value=1.0,
@@ -103,13 +115,24 @@ def build_sfd_flow_program() -> type:
     b.data("filled", "f32", (Dim("ny"), Dim("nx")), role="output")
     b.data("epsilon_distance", "f32", (Dim("ny"), Dim("nx")), role="output")
 
-    def grid_structure(be, *, topology, boundary, outlet, nodata, **_):
+    def grid_structure(be, *, nx, ny, dx, topology, boundary, outlet, nodata,
+                       dynamic_grid, tree):
         _cupy_only(be)
+        if tree is not None:
+            if (nx, ny) != (tree.capacity, 1):
+                raise ProgramError(f"tree: dims must be tree.dims {tree.dims}, got nx={nx}, ny={ny}")
+            if topology != tree.topology:
+                raise ProgramError(f"tree: topology {topology!r} differs from the tree's {tree.topology!r}")
+            if (dx, boundary, outlet, nodata, dynamic_grid) != (1.0, "normal", "edge", False, False):
+                raise ProgramError("tree: dx, boundary, outlet, nodata and dynamic_grid belong to the tree")
+            return tree.group
         return make_grid_group(be, topology=topology, boundary=boundary,
                                outlet=outlet, nodata=nodata)
     def grid_params(be, pool, *, nx, ny, dx, topology, boundary, outlet, nodata,
-                    dynamic_grid):
+                    dynamic_grid, tree):
         del boundary
+        if tree is not None:
+            return tree.parameters
         return make_grid_parameters(be, pool, nx, ny, dx, topology=topology,
                                     outlet=outlet, nodata=nodata,
                                     nx_mode="scalar" if dynamic_grid else "const",
@@ -117,7 +140,7 @@ def build_sfd_flow_program() -> type:
                                     dx_mode="scalar" if dynamic_grid else "const")
     b.bundle("grid", grid_structure, grid_params, dims=("nx", "ny"),
              config=("dx", "topology", "boundary", "outlet", "nodata",
-                     "dynamic_grid"))
+                     "dynamic_grid", "tree"))
 
     # Cordonnier and reconstruction storage. These stay owned until close().
     for name in ("bid", "rec_jump", "basin_saddlenode", "basin_route", "b_rcv", "parent", "epsilon_ancestor", "epsilon_ancestor_work"):
@@ -137,8 +160,12 @@ def build_sfd_flow_program() -> type:
         b.data(name, "i32", (flat,), lifetime="temp")
     for name in ("pj_q_work", "rake_q_alt"):
         b.data(name, "f32", (flat,), lifetime="temp")
+    def donor_shape(values):
+        tree = values["tree"]
+        slots = 8 if tree is None else tree.n_neighbours
+        return (slots * values["ny"] * values["nx"],)
     for name in ("donors", "donors_alt"):
-        b.data(name, "i32", (8 * flat,), lifetime="temp")
+        b.data(name, "i32", donor_shape, lifetime="temp")
 
     def route_factory(mode):
         def factory(be, bundles, config):
@@ -162,7 +189,7 @@ extern "C" __global__ void sfd_slope_correction(
     const float* z, const int* rec, float* correction,
     const float* min_slope, const float* max_correction) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= $ctx.grid.NX.get(0)$ * $ctx.grid.NY.get(0)$) return;
+    if (i >= $ctx.grid.n()$) return;
     correction[i] = 1.0f;
     int r = rec[i];
     if (r == i || !$ctx.grid.is_active(i)$) return;
@@ -182,7 +209,7 @@ extern "C" __global__ void sfd_slope_correction(
         $ctx.grid.delta(k, &dr, &dc)$;
         float norm = sqrtf((float)(dr * dr + dc * dc));
         float ux = abs(dc) / norm, uy = abs(dr) / norm;
-        float s = dz / $ctx.grid.dist_from_k(k)$;
+        float s = dz / $ctx.grid.dist(i, k)$;
         axx += ux * ux; axy += ux * uy; ayy += uy * uy;
         bx += ux * s; by += uy * s;
         strongest = fmaxf(strongest, s);
@@ -226,7 +253,7 @@ extern "C" __global__ void sfd_clear_inactive(
 extern "C" __global__ void sfd_restore_outlets(
     float* z, const float* boundary_z) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= $ctx.grid.NX.get(0)$ * $ctx.grid.NY.get(0)$) return;
+    if (i >= $ctx.grid.n()$) return;
     if ($ctx.grid.can_out(i)$) z[i] = boundary_z[i];
 }}''', domain=n).compose("grid", bundles["grid"]).freeze()
     b.add("restore_outlets", restore_outlets_factory,
@@ -258,7 +285,8 @@ extern "C" __global__ void sfd_restore_outlets(
     def pj_factory(be, bundles, config):
         return make_accumulation(be, bundles["grid"], method="pointer_jump_push", n_flat=config["nx"] * config["ny"])["sequence"].freeze()
     def rake_factory(be, bundles, config):
-        nk = 8 if config["topology"] == "D8" else 4
+        tree = config["tree"]
+        nk = tree.n_neighbours if tree is not None else (8 if config["topology"] == "D8" else 4)
         return make_accumulation(be, bundles["grid"], method="rake_compress",
                                  n_flat=config["nx"] * config["ny"], n_neighbours=nk)["sequence"].freeze()
     b.add("accumulate_pointer_jump", pj_factory, bind=_pointer_jump_plan)

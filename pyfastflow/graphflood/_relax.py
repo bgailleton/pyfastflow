@@ -13,6 +13,7 @@ from pyfastflow.flow._cupy_mfd_accum import persistent_grid_block
 from pyfastflow.flow._program_cupy import _cupy_only, _grid_leaf_plan
 
 from ._friction import build_friction_velocity
+from ._routing import n_slots
 
 
 def _local_analytical_update_factory(be, bundles, config):
@@ -114,7 +115,7 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
     """Receiver-first persistent Kahn solve of the frozen hydraulic DAG."""
     _cupy_only(be)
     n = config["nx"] * config["ny"]
-    nk = 8 if config["topology"] == "D8" else 4
+    nk = n_slots(config)
     persistent_grid, persistent_block = persistent_grid_block(
         blocks_per_sm=1, threads=256,
     )
@@ -155,7 +156,7 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
                     if (!(mask & (1u << k))) continue;
                     int r = $ctx.grid.neighbour_raw(i, k)$;
                     float slope = ((z[i] - z[r]) + (h[i] - h[r]))
-                                / $ctx.grid.dist_from_k(k)$;
+                                / $ctx.grid.dist(i, k)$;
                     if (slope > best) {{
                         best = slope;
                         control[i] = (unsigned char)k;
@@ -231,7 +232,8 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
                                 $ctx.CARVE_SLOPE.get(u)$, 1.0e-12f);
                         }} else {{
                             int r = $ctx.grid.neighbour_raw(u, k)$;
-                            float width = $ctx.grid.dist_from_k(k)$;
+                            float width = $ctx.grid.flow_width(u, k)$;
+                            float length = $ctx.grid.dist(u, k)$;
                             bool cut = hydraulic_cut[u] != 0u;
                             float inherited_slope = fmaxf(
                                 solved_slope[r],
@@ -245,7 +247,7 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
                             float lo = cut ? 0.0f
                                 : fmaxf(receiver_h - bed_drop, 0.0f);
                             float old_slope = cut ? inherited_slope : fmaxf(
-                                (bed_drop + old_h - receiver_h) / width,
+                                (bed_drop + old_h - receiver_h) / length,
                                 1.0e-12f);
                             float guess = target_q > 0.0f
                                 ? powf(target_q * manning
@@ -257,7 +259,7 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
                             #pragma unroll
                             for (int it = 0; it < 32; ++it) {{
                                 float slope = cut ? inherited_slope : fmaxf(
-                                    (bed_drop + hi - receiver_h) / width,
+                                    (bed_drop + hi - receiver_h) / length,
                                     0.0f);
                                 float qhi = width / manning * powf(hi, alpha)
                                           * sqrtf(slope);
@@ -269,7 +271,7 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
                             #pragma unroll
                             for (int it = 0; it < 16; ++it) {{
                                 float slope = cut ? inherited_slope : fmaxf(
-                                    (bed_drop + x - receiver_h) / width,
+                                    (bed_drop + x - receiver_h) / length,
                                     0.0f);
                                 float q = width / manning * powf(x, alpha)
                                         * sqrtf(slope);
@@ -278,7 +280,7 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
                                 float derivative = q * alpha
                                     / fmaxf(x, 1.0e-12f);
                                 if (!cut && slope > 0.0f)
-                                    derivative += q * 0.5f / (slope * width);
+                                    derivative += q * 0.5f / (slope * length);
                                 float trial = x - (q - target_q)
                                     / fmaxf(derivative, 1.0e-20f);
                                 if (!(trial > lo && trial < hi)
@@ -290,7 +292,7 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
                                 ? x : lo;
                             candidate[u] = solved_h;
                             solved_slope[u] = cut ? inherited_slope : fmaxf(
-                                (bed_drop + solved_h - receiver_h) / width,
+                                (bed_drop + solved_h - receiver_h) / length,
                                 0.0f);
                         }}
                     }}
@@ -377,9 +379,9 @@ def _bottom_up_analytical_update_factory(be, bundles, config):
             int k = (int)control[i];
             if (k >= {nk}) {{ Qo[i] = 0.0f; return; }}
             int r = $ctx.grid.neighbour_raw(i, k)$;
-            float width = $ctx.grid.dist_from_k(k)$;
+            float width = $ctx.grid.flow_width(i, k)$;
             float slope = hydraulic_cut[i] ? solved_slope[i] : fmaxf(
-                ((z[i] - z[r]) + (h[i] - h[r])) / width, 0.0f);
+                ((z[i] - z[r]) + (h[i] - h[r])) / $ctx.grid.dist(i, k)$, 0.0f);
             float depth = fmaxf(h[i], 0.0f);
             float manning = fmaxf($ctx.MANNING.get(i)$, 1.0e-9f);
             float alpha = fmaxf(1.0f + $ctx.EXPO.get(i)$, 1.0e-3f);

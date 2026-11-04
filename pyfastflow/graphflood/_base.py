@@ -16,6 +16,10 @@ GraphFlood programs have in common:
   topology, ``prepare_frontier`` and ``accumulate`` (rain accumulated into
   Qi). ``TOPOLOGY`` is that chain in pipeline order.
 
+``graphflood_builder(name, supports_tree=True)`` adds the ``tree`` config: a D4
+quadtree replaces the grid bundle, every array has ``tree.capacity`` entries on
+one row, and ``dx``, ``boundary``, ``outlet`` and ``nodata`` belong to the tree.
+
 ``add_warmup(b)`` adds the analytical hillslope warm-up: ``warmup_relaxation``
 and ``depth_cap`` params and the private pipeline ``_warmup_pass`` (TOPOLOGY
 then a local analytical update with target and depth capped at depth_cap).
@@ -27,6 +31,7 @@ Author: B.G (10/2026)
 """
 
 from pyfastflow.core.context.program import Dim, ProgramBuilder
+from pyfastflow.core.context.slot import ProgramError
 from pyfastflow.flow._program_cupy import (
     _cupy_only, _grid_leaf_plan, _noop_factory, _reconstruct_epsilon_factory,
 )
@@ -68,9 +73,11 @@ def _minima_cases(cordonnier, reconstruct):
     return cases
 
 
-def graphflood_builder(name):
+def graphflood_builder(name, *, supports_tree=False):
     """ProgramBuilder with the shared GraphFlood recipe (see module doc)."""
     b = ProgramBuilder(name)
+    if supports_tree:
+        b.config("tree", default=None)
     b.dim("ny").dim("nx")
     b.config("ny").config("nx").config("dx", default=1.0)
     b.config("topology", choices=("D4", "D8"), default="D8")
@@ -121,19 +128,33 @@ def graphflood_builder(name):
         b.data(data, "f32", (FLAT,), lifetime="temp")
     b.data("fill_frontier", "i32", (2 * FLAT,), lifetime="temp")
 
-    def grid_structure(be, *, topology, boundary, outlet, nodata, **_):
+    def grid_structure(be, *, nx, ny, dx, topology, boundary, outlet, nodata,
+                       tree=None):
         _cupy_only(be)
+        if tree is not None:
+            if (nx, ny) != (tree.capacity, 1):
+                raise ProgramError(f"tree: dims must be tree.dims {tree.dims}, got nx={nx}, ny={ny}")
+            if tree.n_neighbours > 8:
+                raise ProgramError("tree: GraphFlood stores 8 slots per cell, use a D4 tree")
+            if topology != tree.topology:
+                raise ProgramError(f"tree: topology {topology!r} differs from the tree's {tree.topology!r}")
+            if (dx, boundary, outlet, nodata) != (1.0, "normal", "edge", False):
+                raise ProgramError("tree: dx, boundary, outlet and nodata belong to the tree")
+            return tree.group
         return make_grid_group(be, topology=topology, boundary=boundary,
                                outlet=outlet, nodata=nodata)
 
     def grid_params(be, pool, *, nx, ny, dx, topology, boundary, outlet,
-                    nodata):
+                    nodata, tree=None):
         del boundary
+        if tree is not None:
+            return tree.parameters
         return make_grid_parameters(be, pool, nx, ny, dx, topology=topology,
                                     outlet=outlet, nodata=nodata)
 
     b.bundle("grid", grid_structure, grid_params, dims=("nx", "ny"),
-             config=("dx", "topology", "boundary", "outlet", "nodata"))
+             config=("dx", "topology", "boundary", "outlet", "nodata")
+             + (("tree",) if supports_tree else ()))
 
     # Initial surfaces.
     b.add("reset_h", _reset_h_factory, bind={"h": "h"})

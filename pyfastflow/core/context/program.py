@@ -85,6 +85,10 @@ def _spec_shape(spec, config, dims):
     return tuple(_resolve_axis(axis, dims) for axis in shape)
 
 
+class BorrowedParams(dict):
+    """Bundle parameters owned by the caller: a Program binds them but never destroys them."""
+
+
 @dataclass(frozen=True)
 class _ParamSpec:
     name: str; mode: str; dtype: str; value: Any; shape: tuple; shape_source: bool; when: Any = None
@@ -375,8 +379,9 @@ class _Program:
             selected = {x:self._dim_vals[x] for x in spec.dims}; selected.update({x:self._config[x] for x in spec.config})
             node = spec.structure(self._be, **selected)
             if not isinstance(node, Node): raise ProgramError(f"bundle {name!r} structure returned {type(node).__name__}, not Node")
-            params = dict(spec.params(self._be, self._pool, **selected))
-            self._bundles[name], self._bundle_params[name] = node, params; self._owned_params.extend(params.values())
+            supplied = spec.params(self._be, self._pool, **selected); params = dict(supplied)
+            self._bundles[name], self._bundle_params[name] = node, params
+            if not isinstance(supplied, BorrowedParams): self._owned_params.extend(params.values())
         for name, spec in self._pspecs.items():
             mode = self._param_modes[name]
             logical_shape = _resolve_shape(spec.shape, self._dim_vals) if mode == "field" else ()

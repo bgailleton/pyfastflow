@@ -27,6 +27,10 @@ Typical use::
     gf.warmup()
     gf.run(100)
 
+On a D4 quadtree, ``GraphFloodRelax(be, tree=tree, topology="D4", **tree.dims)``
+runs the same passes; ``reconstruct_epsilon`` and ``fill_topography`` need the
+raster and are unavailable there.
+
 Author: B.G (10/2026)
 """
 
@@ -42,7 +46,7 @@ from ._relax import (
 
 def build_graphflood_relax() -> type:
     """Build the GraphFloodRelax class."""
-    b = add_convergence(add_warmup(graphflood_builder("GraphFloodRelax")))
+    b = add_convergence(add_warmup(graphflood_builder("GraphFloodRelax", supports_tree=True)))
     b.config("analytical_solver", choices=("local", "bottom_up"),
              default="bottom_up")
     b.param("relaxation", "auto", "f32", value=0.1, shape=SHAPE)

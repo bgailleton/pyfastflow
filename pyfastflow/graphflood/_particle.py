@@ -105,7 +105,7 @@ extern "C" __global__ void gfp_reach_sweep(
             float best = 0.0f;
             for (int k = 0; k < nk; ++k) {
                 if (!(mask & (1u << k))) continue;
-                float slope = weights[u * nk + k] / $ctx.grid.dist_from_k(k)$;
+                float slope = weights[u * nk + k] / $ctx.grid.dist(u, k)$;
                 if (steepest < 0 || slope > best) {
                     steepest = k;
                     best = slope;
@@ -354,7 +354,7 @@ extern "C" __global__ void gfp_walk(
                         ? (double)z[nb[k]] + (double)__ldcg(&h[nb[k]]) : 1.0e300;
                     if (heads[k] < low_head) {
                         low_head = heads[k];
-                        low_length = $ctx.grid.dist_from_k(k)$;
+                        low_length = $ctx.grid.dist(i, k)$;
                     }
                 }
                 float h_old = fmaxf(__ldcg(&h[i]), 0.0f);
@@ -371,7 +371,7 @@ extern "C" __global__ void gfp_walk(
                 double q = (double)rain;
                 for (int k = 0; k < nk; ++k)
                     if (nb[k] >= 0 && heads[k] - head > drop_min)
-                        q += (double)__ldcg(&pushed[nb[k] * nk + (nk - 1 - k)]);
+                        q += (double)__ldcg(&pushed[nb[k] * nk + $ctx.grid.reverse(k)$]);
                 Qacc[i] = q;
 
                 // Rewrite the sends from that discharge.
@@ -386,7 +386,7 @@ extern "C" __global__ void gfp_walk(
                     if (!(drop > drop_min)) continue;
                     w[k] = (float)drop;
                     w_sum += w[k];
-                    float dist = $ctx.grid.dist_from_k(k)$;
+                    float dist = $ctx.grid.dist(i, k)$;
                     if ((float)(drop / dist) > best_slope) {
                         best_slope = (float)(drop / dist);
                         width = dist;
@@ -511,7 +511,7 @@ extern "C" __global__ void gfp_outflow(
         if (j < 0 || $ctx.grid.nodata(j)$) continue;
         double drop = head - ((double)z[j] + (double)h[j]);
         if (drop <= 0.0) continue;
-        float dist = $ctx.grid.dist_from_k(k)$;
+        float dist = $ctx.grid.dist(i, k)$;
         float slope = (float)(drop / (double)dist);
         if (slope > best_slope) {
             best_slope = slope;

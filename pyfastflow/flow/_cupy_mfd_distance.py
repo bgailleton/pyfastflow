@@ -37,7 +37,7 @@ def build_mfd_distance(*, grid, n_flat: int, n_neighbours: int,
                 for (int k = 0; k < {nn}; ++k) {{
                     int donor = $ctx.grid.neighbour(i, k)$;
                     if (donor == -1) continue;
-                    int reverse = {nn - 1} - k;
+                    int reverse = $ctx.grid.reverse(k)$;
                     if (dirs[donor] & (1u << reverse)) ++degree;
                 }}
             }}
@@ -74,7 +74,7 @@ def build_mfd_distance(*, grid, n_flat: int, n_neighbours: int,
                     if (v == -1) continue;
                     int rk = {nn - 1} - k;
                     if (!(dirs[v] & (1u << rk))) continue;
-                    float candidate = distance[u] + $ctx.grid.dist_from_k(k)$;
+                    float candidate = distance[u] + $ctx.grid.dist(u, k)$;
                     atomicMax((unsigned int*)&distance[v],
                               __float_as_uint(candidate));
                     __threadfence();
@@ -89,7 +89,7 @@ def build_mfd_distance(*, grid, n_flat: int, n_neighbours: int,
                 for (int k = 0; k < {nn}; ++k) {{
                     if (!(dirs[u] & (1u << k))) continue;
                     int v = $ctx.grid.neighbour_raw(u, k)$;
-                    float candidate = distance[u] + $ctx.grid.dist_from_k(k)$;
+                    float candidate = distance[u] + $ctx.grid.dist(u, k)$;
                     atomicMax((unsigned int*)&distance[v],
                               __float_as_uint(candidate));
                     __threadfence();

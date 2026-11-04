@@ -9,6 +9,8 @@ _SQRT2 = math.sqrt(2.0)
 
 def build_group(group, *, topology, boundary, nodata, outlet):
     """Compose the selected CuPy grid helpers onto ``group``."""
+    periodic_x = boundary in ("periodic_EW", "periodic_EW_NS")
+    periodic_y = boundary in ("periodic_NS", "periodic_EW_NS")
     t = f"pf{new_uid()}"
     d8 = topology == "D8"
 
@@ -42,7 +44,7 @@ __device__ void {t}_delta(int k, int* dr, int* dc) {{
 
     row_wrap = (
         _helper(f"__device__ int {t}_row_wrap(int row) {{ return row; }}")
-        if boundary != "periodic_NS"
+        if not periodic_y
         else _helper(
             f"""
 __device__ int {t}_row_wrap(int row) {{
@@ -56,7 +58,7 @@ __device__ int {t}_row_wrap(int row) {{
     )
     col_wrap = (
         _helper(f"__device__ int {t}_col_wrap(int col) {{ return col; }}")
-        if boundary != "periodic_EW"
+        if not periodic_x
         else _helper(
             f"""
 __device__ int {t}_col_wrap(int col) {{
@@ -80,12 +82,12 @@ __device__ void {t}_wrap(int row, int col, int* wrow, int* wcol) {{
 
     row_edge_ok = (
         _helper(f"__device__ int {t}_row_edge_ok(int row) {{ return 1; }}")
-        if boundary == "periodic_NS"
+        if periodic_y
         else _helper(f"__device__ int {t}_row_edge_ok(int row) {{ return (row >= 0 && row < $ctx.NY.get(0)$) ? 1 : 0; }}")
     )
     col_edge_ok = (
         _helper(f"__device__ int {t}_col_edge_ok(int col) {{ return 1; }}")
-        if boundary == "periodic_EW"
+        if periodic_x
         else _helper(f"__device__ int {t}_col_edge_ok(int col) {{ return (col >= 0 && col < $ctx.NX.get(0)$) ? 1 : 0; }}")
     )
 
@@ -167,12 +169,12 @@ __device__ int {t}_neighbour(int i, int k) {{
 
     row_is_edge = (
         _helper(f"__device__ int {t}_row_is_edge(int row) {{ return 0; }}")
-        if boundary == "periodic_NS"
+        if periodic_y
         else _helper(f"__device__ int {t}_row_is_edge(int row) {{ return (row == 0 || row == $ctx.NY.get(0)$ - 1) ? 1 : 0; }}")
     )
     col_is_edge = (
         _helper(f"__device__ int {t}_col_is_edge(int col) {{ return 0; }}")
-        if boundary == "periodic_EW"
+        if periodic_x
         else _helper(f"__device__ int {t}_col_is_edge(int col) {{ return (col == 0 || col == $ctx.NX.get(0)$ - 1) ? 1 : 0; }}")
     )
     is_on_edge = _helper(
@@ -188,7 +190,7 @@ __device__ int {t}_is_on_edge(int i) {{
 
     row_edge_code = (
         _helper(f"__device__ int {t}_row_edge_code(int row) {{ return -1; }}")
-        if boundary == "periodic_NS"
+        if periodic_y
         else _helper(
             f"""
 __device__ int {t}_row_edge_code(int row) {{
@@ -201,7 +203,7 @@ __device__ int {t}_row_edge_code(int row) {{
     )
     col_edge_code = (
         _helper(f"__device__ int {t}_col_edge_code(int col) {{ return -1; }}")
-        if boundary == "periodic_EW"
+        if periodic_x
         else _helper(
             f"""
 __device__ int {t}_col_edge_code(int col) {{
@@ -233,22 +235,42 @@ __device__ int {t}_which_edge(int i) {{
             helpers={"is_on_edge": is_on_edge},
         )
 
+    n_cells = _helper(f"__device__ int {t}_n() {{ return $ctx.NX.get(0)$ * $ctx.NY.get(0)$; }}")
+    dx = _helper(f"__device__ float {t}_dx(int i) {{ return $ctx.DX.get(i)$; }}")
+    area = _helper(
+        f"""
+__device__ float {t}_area(int i) {{
+    float d = $ctx.DX.get(i)$;
+    return d * d;
+}}
+"""
+    )
+    reverse = _helper(f"__device__ int {t}_reverse(int k) {{ return $ctx.N_NEIGHBOURS.get(0)$ - 1 - k; }}")
     if d8:
-        dist_from_k = _helper(
+        dist = _helper(
             f"""
-__device__ float {t}_dist_from_k(int k) {{
-    float d = $ctx.DX.get(0)$;
-    if (k == 0 || k == 2 || k == 5 || k == 7) d = $ctx.DX.get(0)$ * {_SQRT2}f;
+__device__ float {t}_dist(int i, int k) {{
+    float d = $ctx.DX.get(i)$;
+    if (k == 0 || k == 2 || k == 5 || k == 7) d *= {_SQRT2}f;
     return d;
 }}
 """
         )
     else:
-        dist_from_k = _helper(f"__device__ float {t}_dist_from_k(int k) {{ return $ctx.DX.get(0)$; }}")
+        dist = _helper(f"__device__ float {t}_dist(int i, int k) {{ return $ctx.DX.get(i)$; }}")
+    width = _helper(
+        f"__device__ float {t}_width(int i, int k) {{ return $ctx.dist(i, k)$; }}",
+        helpers={"dist": dist},
+    )
+
+    flow_width = _helper(
+        f"__device__ float {t}_flow_width(int i, int k) {{ return $ctx.dist(i, k)$; }}",
+        helpers={"dist": dist},
+    )
 
     row_dist = (
         _helper(f"__device__ int {t}_row_dist(int raw) {{ return abs(raw); }}")
-        if boundary != "periodic_NS"
+        if not periodic_y
         else _helper(
             f"""
 __device__ int {t}_row_dist(int raw) {{
@@ -261,7 +283,7 @@ __device__ int {t}_row_dist(int raw) {{
     )
     col_dist = (
         _helper(f"__device__ int {t}_col_dist(int raw) {{ return abs(raw); }}")
-        if boundary != "periodic_EW"
+        if not periodic_x
         else _helper(
             f"""
 __device__ int {t}_col_dist(int raw) {{
@@ -273,7 +295,7 @@ __device__ int {t}_col_dist(int raw) {{
         )
     )
 
-    diag_line = f"        else if (dr == 1 && dc == 1) out = $ctx.DX.get(0)$ * {_SQRT2}f;\n" if d8 else ""
+    diag_line = f"        else if (dr == 1 && dc == 1) out = $ctx.DX.get(i)$ * {_SQRT2}f;\n" if d8 else ""
     dist_between = _helper(
         f"""
 __device__ float {t}_dist_between(int i, int j) {{
@@ -285,8 +307,8 @@ __device__ float {t}_dist_between(int i, int j) {{
         int cj = $ctx.col(j)$;
         int dr = $ctx.row_dist(rj - ri)$;
         int dc = $ctx.col_dist(cj - ci)$;
-        if (dr == 0 && dc == 1) out = $ctx.DX.get(0)$;
-        else if (dr == 1 && dc == 0) out = $ctx.DX.get(0)$;
+        if (dr == 0 && dc == 1) out = $ctx.DX.get(i)$;
+        else if (dr == 1 && dc == 0) out = $ctx.DX.get(i)$;
 {diag_line}    }}
     return out;
 }}
@@ -299,12 +321,12 @@ __device__ float {t}_dist_between(int i, int j) {{
 __device__ void {t}_neighbour_and_distance(int i, int k, int* j_out, float* d_out) {{
     int j = $ctx.neighbour(i, k)$;
     float d = -1.0f;
-    if (j != -1) d = $ctx.dist_from_k(k)$;
+    if (j != -1) d = $ctx.dist(i, k)$;
     *j_out = j;
     *d_out = d;
 }}
 """,
-        helpers={"neighbour": neighbour, "dist_from_k": dist_from_k},
+        helpers={"neighbour": neighbour, "dist": dist},
     )
 
     group.compose("delta", delta)
@@ -313,7 +335,13 @@ __device__ void {t}_neighbour_and_distance(int i, int k, int* j_out, float* d_ou
     group.compose("nodata", nodata_fn)
     group.compose("is_active", is_active)
     group.compose("can_out", can_out)
-    group.compose("dist_from_k", dist_from_k)
+    group.compose("n", n_cells)
+    group.compose("dx", dx)
+    group.compose("area", area)
+    group.compose("dist", dist)
+    group.compose("width", width)
+    group.compose("flow_width", flow_width)
+    group.compose("reverse", reverse)
     group.compose("dist_between_nodes", dist_between)
     group.compose("is_on_edge", is_on_edge)
     group.compose("which_edge", which_edge)
@@ -324,9 +352,9 @@ __device__ void {t}_neighbour_and_distance(int i, int k, int* j_out, float* d_ou
         # array, y faces (k 0 N, 3 S) a (ny + 1, nx) one; on a periodic axis
         # the last face wraps onto the first (the extra slot is unused).
         ew = "c == $ctx.NX.get(0)$ - 1 ? r * ($ctx.NX.get(0)$ + 1) : " \
-            if boundary == "periodic_EW" else ""
+            if periodic_x else ""
         ns = "r == $ctx.NY.get(0)$ - 1 ? c : " \
-            if boundary == "periodic_NS" else ""
+            if periodic_y else ""
         face = _helper(
             f"""
 __device__ int {t}_face(int i, int k) {{

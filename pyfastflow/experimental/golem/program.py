@@ -194,7 +194,7 @@ def build_golem_nosed_program() -> type:
                 int i = blockIdx.x * blockDim.x + threadIdx.x;
                 if (i >= {n_cells}) return;
                 if (!$ctx.grid.is_active(i)$) {{ area[i] = 0.0f; return; }}
-                float dx = $ctx.grid.DX.get(0)$;
+                float dx = $ctx.grid.dx(i)$;
                 area[i] *= dx * dx;
             }}''', domain=n_cells,
         ).compose("grid", bundles["grid"]).freeze()

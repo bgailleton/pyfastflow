@@ -73,7 +73,7 @@ extern "C" __global__ void {tag}_dirs_weights(
             int j = $ctx.grid.neighbour(i, k)$;
             float s = 0.0f;
             if (j != -1) {{
-                s = $ctx.slope(filled[i], dist[i], filled[j], dist[j], k)$;
+                s = $ctx.slope(i, filled[i], dist[i], filled[j], dist[j], k)$;
                 if (s < 0.0f) s = 0.0f;
             }}
             slopes[k] = s;
@@ -236,7 +236,7 @@ extern "C" __global__ void {tag}_dirs_weights(
             }} else if (zi == filled[j] && rank[i] > rank[j]) {{
                 drop = ulp * (float)(rank[i] - rank[j]);
             }}
-            float s = drop > 0.0f ? drop / $ctx.distance(k)$ : 0.0f;
+            float s = drop > 0.0f ? drop / $ctx.distance(i, k)$ : 0.0f;
             slopes[k] = s;
             if (s > 0.0f) {{ mask |= (1 << k); sum_s += s; {best_update} }}
         }}
@@ -321,7 +321,7 @@ extern "C" __global__ void {tag}_dirs_weights(
                 int j = $ctx.grid.neighbour(i, k)$;
                 float s = 0.0f;
                 if (j != -1 && rank[j] < rank[i]) {{
-                    s = $ctx.slope(z[i], 0.0f, z[j], 0.0f, k)$;
+                    s = $ctx.slope(i, z[i], 0.0f, z[j], 0.0f, k)$;
                     if (s < 0.0f) s = 0.0f;
                 }}
                 slopes[k] = s;
